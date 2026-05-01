@@ -6,9 +6,11 @@ from .ui_styles import state_badge_classes, state_card_classes, state_strip_styl
 from .ui_timeline import timeline_html, timeline_scale_html
 
 
-def render_overview_ui(ctx, service: MonitoringService):
-    monitors = service.list_monitors()
-    histories = service.get_histories([m["monitor_id"] for m in monitors], limit_hours=24)
+def render_overview_ui(ctx, service: MonitoringService, *, monitors=None, histories=None):
+    if monitors is None:
+        monitors = service.list_monitors()
+    if histories is None:
+        histories = service.get_histories([m["monitor_id"] for m in monitors], limit_hours=24)
     grouped_sites = build_grouped_overview(monitors, histories)
 
     if not grouped_sites:

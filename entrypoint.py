@@ -6,6 +6,8 @@ own files.  This file only glues them together and satisfies the
 lyndrix-core plugin API.
 """
 
+import asyncio
+
 from nicegui import app as nicegui_app
 from nicegui import ui
 
@@ -36,7 +38,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="0.0.2",
+    version="0.0.3",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -151,6 +153,13 @@ def setup(ctx):
     async def monitoring_page():
         svc = plugin_state["service"]
 
+        # Pre-fetch all DB data off the event loop so the UI never hangs.
+        stats_map = await asyncio.to_thread(svc.stats)
+        monitors_data = await asyncio.to_thread(svc.list_monitors)
+        histories_data = await asyncio.to_thread(
+            svc.get_histories, [m["monitor_id"] for m in monitors_data], 24
+        )
+
         with ui.column().classes(
             "w-full max-w-[calc(100vw-2.5rem)] 2xl:max-w-[calc(100vw-3rem)] mx-auto gap-6 px-2"
         ):
@@ -168,41 +177,53 @@ def setup(ctx):
                         "timelines and optional IaC inventory sync."
                     ).classes("text-sm text-zinc-400")
 
-                    stats_map = svc.stats()
                     stat_labels: dict = {}
-                    stats_grid = ui.grid(columns=5).classes("w-full gap-4")
-                    for label, key, cls in [
-                        ("Monitors", "monitor_count", "text-cyan-300"),
-                        ("Up", "up_count", "text-emerald-300"),
-                        ("Down", "down_count", "text-rose-300"),
-                        ("Paused", "paused_count", "text-amber-300"),
-                        ("Uptime", "uptime_all", "text-sky-300"),
-                    ]:
-                        with stats_grid:
+                    # Responsive grid: 2 cols on mobile → 3 on sm → 5 on lg
+                    with ui.element("div").classes(
+                        "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 w-full gap-3"
+                    ):
+                        for label, key, cls in [
+                            ("Monitors", "monitor_count", "text-cyan-300"),
+                            ("Up", "up_count", "text-emerald-300"),
+                            ("Down", "down_count", "text-rose-300"),
+                            ("Paused", "paused_count", "text-amber-300"),
+                            ("Uptime", "uptime_all", "text-sky-300"),
+                        ]:
                             with ui.card().classes(
-                                "p-4 bg-zinc-950/70 border border-zinc-800 rounded-full aspect-square "
-                                "flex flex-col items-center justify-center text-center min-h-[112px]"
+                                "p-4 bg-zinc-950/70 border border-zinc-800 rounded-xl "
+                                "flex flex-col items-center justify-center text-center gap-1"
                             ):
                                 ui.label(label).classes("text-xs uppercase tracking-widest text-zinc-500")
                                 value = (
                                     f"{stats_map[key]:.1f}%" if key == "uptime_all" else str(stats_map[key])
                                 )
-                                stat_labels[key] = ui.label(value).classes(f"text-3xl font-black {cls}")
+                                stat_labels[key] = ui.label(value).classes(
+                                    f"text-3xl font-black {cls} leading-none"
+                                )
 
             overview_container = ui.column().classes("w-full gap-6")
 
-            def refresh_dashboard():
-                latest = svc.stats()
+            async def refresh_dashboard():
+                # All DB work runs in threads — the event loop stays free.
+                latest, new_monitors = await asyncio.gather(
+                    asyncio.to_thread(svc.stats),
+                    asyncio.to_thread(svc.list_monitors),
+                )
+                new_histories = await asyncio.to_thread(
+                    svc.get_histories, [m["monitor_id"] for m in new_monitors], 24
+                )
                 for key, lbl in stat_labels.items():
                     v = latest.get(key, 0)
                     lbl.set_text(f"{v:.1f}%" if key == "uptime_all" else str(v))
                 overview_container.clear()
                 with overview_container:
-                    render_overview_ui(ctx)
+                    _render_overview_ui(ctx, svc, monitors=new_monitors, histories=new_histories)
 
             with overview_container:
-                render_overview_ui(ctx)
+                _render_overview_ui(ctx, svc, monitors=monitors_data, histories=histories_data)
 
-            ui.timer(5.0, refresh_dashboard)
+            # 15 s refresh keeps the UI responsive; monitoring runs independently.
+            ui.timer(15.0, refresh_dashboard)
 
     ctx.log.info("State Monitoring: setup complete.")
+

@@ -40,8 +40,8 @@ class MonitoringService:
         self._scheduler_started = False
         self._probe_semaphore = asyncio.Semaphore(24)
         self._initial_probe_delay_seconds = 8
-        self._initial_probe_worker_limit = 3
-        self._initial_probe_batch_limit = 48
+        self._initial_probe_worker_limit = 8
+        self._initial_probe_batch_limit = 0
         self._inflight_probes: set = set()
         self._background_probe_task: Optional[asyncio.Task] = None
         self._bootstrap_task: Optional[asyncio.Task] = None
@@ -64,6 +64,90 @@ class MonitoringService:
         self.scheduler.add_daily_job(self.refresh_rollups, hour=0, minute=5, id="monitoring:rollups")
         self.scheduler.start()
         self._scheduler_started = True
+
+    # ------------------------------------------------------------------
+    # Async-safe probe lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def _load_probe_record(self, monitor_id: str) -> Optional[Dict[str, Any]]:
+        """Read the record fields needed for a probe from the DB (runs in a thread)."""
+        session = self._session()
+        if not session:
+            return None
+        try:
+            record = self._get_monitor(session, monitor_id)
+            if not record or not record.enabled:
+                return None
+            target = record.target or record.address
+            if not target:
+                return None
+            return {
+                "monitor_id": record.monitor_id,
+                "monitor_type": record.monitor_type,
+                "target": target,
+                "address": record.address,
+                "service_name": record.service_name,
+                "timeout_seconds": record.timeout_seconds,
+                "metadata": _safe_json_load(record.metadata_json),
+            }
+        finally:
+            session.close()
+
+    async def _dispatch_probe(self, rd: Dict[str, Any]) -> tuple:
+        """Run the appropriate probe strategy and return (state, latency_ms, error_message)."""
+        target = rd["target"]
+        monitor_type = rd["monitor_type"]
+        timeout_seconds = rd["timeout_seconds"]
+        address = rd["address"]
+        service_name = rd["service_name"]
+        metadata = rd["metadata"]
+
+        if monitor_type in {MonitorType.PING.value, MonitorType.SERVER.value}:
+            result = await run_icmp_probe(target, timeout_seconds)
+            state = result["state"]
+            latency_ms = result["latency_ms"]
+            error_message = result["error_message"]
+            if state != MonitorState.UP and monitor_type == MonitorType.SERVER.value and looks_like_network_target(target):
+                fallback_host = address or target.split(":", 1)[0]
+                for port in tcp_fallback_ports(metadata, target):
+                    tcp_result = await run_tcp_probe(fallback_host, port, timeout_seconds)
+                    if tcp_result["state"] == MonitorState.UP:
+                        return tcp_result["state"], tcp_result["latency_ms"], None
+            return state, latency_ms, error_message
+
+        if metadata.get("deploy_type") == "docker_compose" and address and service_name:
+            result = await run_docker_service_probe(self.http_client, address, service_name, timeout_seconds)
+            return result["state"], result["latency_ms"], result["error_message"]
+
+        if is_http_target(target):
+            result = await run_http_probe(self.http_client, target, timeout_seconds)
+            return result["state"], result["latency_ms"], result["error_message"]
+
+        if looks_like_network_target(target):
+            result = await run_icmp_probe(target, timeout_seconds)
+            return result["state"], result["latency_ms"], result["error_message"]
+
+        return MonitorState.UNKNOWN, None, f"No supported probe strategy for target '{target}'"
+
+    def _save_probe_result(
+        self,
+        monitor_id: str,
+        state: "MonitorState",
+        latency_ms: Optional[float],
+        error_message: Optional[str],
+    ):
+        """Persist probe result to the DB (runs in a thread)."""
+        session = self._session()
+        if not session:
+            return
+        try:
+            record = self._get_monitor(session, monitor_id)
+            if not record:
+                return
+            self._store_heartbeat(session, record, state, latency_ms, error_message, "active_probe")
+            session.commit()
+        finally:
+            session.close()
 
     async def stop(self):
         """Cancel all background tasks and release resources for clean reload."""
@@ -138,10 +222,13 @@ class MonitoringService:
             await asyncio.to_thread(self.ensure_tables)
         await asyncio.sleep(0)
         with suppress(Exception):
+            # sync_scheduler_jobs does DB reads + asyncio.create_task; run the
+            # DB portion first in a thread, then the task-creation inline.
+            await asyncio.to_thread(self._load_all_records_for_scheduler)
             self.sync_scheduler_jobs()
         await asyncio.sleep(0)
         with suppress(Exception):
-            await asyncio.to_thread(self.refresh_rollups)
+            await self.refresh_rollups()
         await asyncio.sleep(0)
         self.enqueue_background_probe_refresh()
 
@@ -173,10 +260,23 @@ class MonitoringService:
             return
         try:
             records = session.query(MonitorRecord).filter(MonitorRecord.enabled.is_(True)).all()
+
+            def _is_stale(r: MonitorRecord) -> bool:
+                if r.last_checked_at is None:
+                    return True
+                from datetime import timezone as _tz
+                ts = r.last_checked_at
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=_tz.utc)
+                return (_utc_now() - ts).total_seconds() > r.interval_seconds * 2
+
             candidates = [
                 r for r in records
                 if (r.target or r.address)
-                and r.latest_state in {MonitorState.UNKNOWN.value, MonitorState.DOWN.value}
+                and (
+                    r.latest_state in {MonitorState.UNKNOWN.value, MonitorState.DOWN.value}
+                    or _is_stale(r)
+                )
             ]
             candidates.sort(key=lambda r: (self._probe_priority(r), r.updated_at or _utc_now()))
             if self._initial_probe_batch_limit > 0:
@@ -220,6 +320,7 @@ class MonitoringService:
             try:
                 await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
                 await asyncio.sleep(0)
+                # sync_scheduler_jobs does asyncio.create_task; run it on the event loop.
                 self.sync_scheduler_jobs()
                 await asyncio.sleep(0)
                 self.enqueue_background_probe_refresh()
@@ -613,7 +714,10 @@ class MonitoringService:
     # Maintenance
     # ------------------------------------------------------------------
 
-    def prune_heartbeats(self):
+    async def prune_heartbeats(self):
+        await asyncio.to_thread(self._prune_heartbeats_sync)
+
+    def _prune_heartbeats_sync(self):
         session = self._session()
         if not session:
             return
@@ -624,7 +728,10 @@ class MonitoringService:
         finally:
             session.close()
 
-    def refresh_rollups(self):
+    async def refresh_rollups(self):
+        await asyncio.to_thread(self._refresh_rollups_sync)
+
+    def _refresh_rollups_sync(self):
         session = self._session()
         if not session:
             return
@@ -635,74 +742,50 @@ class MonitoringService:
         finally:
             session.close()
 
+    def _load_all_records_for_scheduler(self):
+        """Warm the DB connection pool; actual task creation happens in sync code."""
+        session = self._session()
+        if not session:
+            return
+        try:
+            _ = session.query(MonitorRecord).count()
+        finally:
+            session.close()
+
     # ------------------------------------------------------------------
     # Active probe
     # ------------------------------------------------------------------
 
     async def run_scheduled_probe(self, monitor_id: str):
+        """Run a single probe without blocking the event loop.
+
+        Phase 1 – DB read  (thread): load record fields.
+        Phase 2 – Probe    (async):  network I/O via semaphore.
+        Phase 3 – DB write (thread): persist heartbeat + aggregates.
+        """
         if monitor_id in self._inflight_probes:
             return
         self._inflight_probes.add(monitor_id)
-        session = self._session()
-        if not session:
-            self._inflight_probes.discard(monitor_id)
-            return
         try:
-            record = self._get_monitor(session, monitor_id)
-            if not record or not record.enabled:
-                return
-            target = record.target or record.address
-            if not target:
+            # Phase 1: read from DB in a worker thread so the event loop stays free.
+            record_data = await asyncio.to_thread(self._load_probe_record, monitor_id)
+            if not record_data:
                 return
 
+            # Phase 2: async network probe (already non-blocking).
             state = MonitorState.UNKNOWN
             latency_ms = None
             error_message = None
-            metadata = _safe_json_load(record.metadata_json)
-
             try:
                 async with self._probe_semaphore:
-                    if record.monitor_type in {MonitorType.PING.value, MonitorType.SERVER.value}:
-                        result = await run_icmp_probe(target, record.timeout_seconds)
-                        state = result["state"]
-                        latency_ms = result["latency_ms"]
-                        error_message = result["error_message"]
-                        if state != MonitorState.UP and record.monitor_type == MonitorType.SERVER.value and looks_like_network_target(target):
-                            fallback_host = record.address or target.split(":", 1)[0]
-                            for port in tcp_fallback_ports(metadata, target):
-                                tcp_result = await run_tcp_probe(fallback_host, port, record.timeout_seconds)
-                                if tcp_result["state"] == MonitorState.UP:
-                                    state = tcp_result["state"]
-                                    latency_ms = tcp_result["latency_ms"]
-                                    error_message = None
-                                    break
-                    elif metadata.get("deploy_type") == "docker_compose" and record.address and record.service_name:
-                        result = await run_docker_service_probe(
-                            self.http_client, record.address, record.service_name, record.timeout_seconds
-                        )
-                        state = result["state"]
-                        latency_ms = result["latency_ms"]
-                        error_message = result["error_message"]
-                    elif is_http_target(target):
-                        result = await run_http_probe(self.http_client, target, record.timeout_seconds)
-                        state = result["state"]
-                        latency_ms = result["latency_ms"]
-                        error_message = result["error_message"]
-                    elif looks_like_network_target(target):
-                        result = await run_icmp_probe(target, record.timeout_seconds)
-                        state = result["state"]
-                        latency_ms = result["latency_ms"]
-                        error_message = result["error_message"]
-                    else:
-                        error_message = f"No supported probe strategy for target '{target}'"
+                    state, latency_ms, error_message = await self._dispatch_probe(record_data)
             except Exception as exc:
                 state = MonitorState.DOWN
                 error_message = str(exc)
 
-            self._store_heartbeat(session, record, state, latency_ms, error_message, "active_probe")
-            session.commit()
+            # Phase 3: write result + aggregates in a worker thread.
+            await asyncio.to_thread(self._save_probe_result, monitor_id, state, latency_ms, error_message)
         finally:
-            session.close()
             self._inflight_probes.discard(monitor_id)
 
     # ------------------------------------------------------------------
