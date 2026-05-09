@@ -728,6 +728,27 @@ class MonitoringService:
         finally:
             session.close()
 
+    def clear_states_db(self) -> int:
+        """Delete ALL heartbeat + aggregate records and reset every monitor to UNKNOWN.
+        Returns the number of heartbeat rows deleted."""
+        session = self._session()
+        if not session:
+            return 0
+        try:
+            deleted = session.query(MonitorHeartbeat).delete(synchronize_session=False)
+            session.query(MonitorDailyAggregate).delete(synchronize_session=False)
+            for record in session.query(MonitorRecord).all():
+                record.latest_state = MonitorState.UNKNOWN.value
+                record.uptime_24h = 100.0
+                record.uptime_7d = 100.0
+                record.uptime_30d = 100.0
+                record.last_checked_at = None
+                record.latest_error = None
+            session.commit()
+            return deleted
+        finally:
+            session.close()
+
     async def refresh_rollups(self):
         await asyncio.to_thread(self._refresh_rollups_sync)
 

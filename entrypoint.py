@@ -38,7 +38,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="0.0.3",
+    version="0.0.4",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -153,17 +153,10 @@ def setup(ctx):
     async def monitoring_page():
         svc = plugin_state["service"]
 
-        # Pre-fetch all DB data off the event loop so the UI never hangs.
-        stats_map = await asyncio.to_thread(svc.stats)
-        monitors_data = await asyncio.to_thread(svc.list_monitors)
-        histories_data = await asyncio.to_thread(
-            svc.get_histories, [m["monitor_id"] for m in monitors_data], 24
-        )
-
         with ui.column().classes(
             "w-full max-w-[calc(100vw-2.5rem)] 2xl:max-w-[calc(100vw-3rem)] mx-auto gap-6 px-2"
         ):
-            # Header card with live stats
+            # ── Header card (skeleton stats shown immediately) ──────────────
             with ui.card().classes(
                 "w-full p-0 overflow-hidden bg-gradient-to-br from-zinc-950 via-zinc-900 to-slate-950 border border-zinc-800"
             ):
@@ -178,7 +171,6 @@ def setup(ctx):
                     ).classes("text-sm text-zinc-400")
 
                     stat_labels: dict = {}
-                    # Responsive grid: 2 cols on mobile → 3 on sm → 5 on lg
                     with ui.element("div").classes(
                         "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 w-full gap-3"
                     ):
@@ -194,17 +186,35 @@ def setup(ctx):
                                 "flex flex-col items-center justify-center text-center gap-1"
                             ):
                                 ui.label(label).classes("text-xs uppercase tracking-widest text-zinc-500")
-                                value = (
-                                    f"{stats_map[key]:.1f}%" if key == "uptime_all" else str(stats_map[key])
-                                )
-                                stat_labels[key] = ui.label(value).classes(
+                                stat_labels[key] = ui.label("—").classes(
                                     f"text-3xl font-black {cls} leading-none"
                                 )
 
+            # ── Overview area — spinner until data loads ────────────────────
             overview_container = ui.column().classes("w-full gap-6")
 
+            with overview_container:
+                with ui.column().classes("w-full items-center justify-center py-24 gap-4"):
+                    ui.spinner("dots", size="xl").classes("text-cyan-400")
+                    ui.label("Loading monitors…").classes("text-sm text-zinc-400")
+
+            # ── Load data off the event loop, then populate the UI ──────────
+            async def _initial_load():
+                stats_map, monitors_data = await asyncio.gather(
+                    asyncio.to_thread(svc.stats),
+                    asyncio.to_thread(svc.list_monitors),
+                )
+                histories_data = await asyncio.to_thread(
+                    svc.get_histories, [m["monitor_id"] for m in monitors_data], 24
+                )
+                for key, lbl in stat_labels.items():
+                    v = stats_map.get(key, 0)
+                    lbl.set_text(f"{v:.1f}%" if key == "uptime_all" else str(v))
+                overview_container.clear()
+                with overview_container:
+                    _render_overview_ui(ctx, svc, monitors=monitors_data, histories=histories_data)
+
             async def refresh_dashboard():
-                # All DB work runs in threads — the event loop stays free.
                 latest, new_monitors = await asyncio.gather(
                     asyncio.to_thread(svc.stats),
                     asyncio.to_thread(svc.list_monitors),
@@ -219,10 +229,9 @@ def setup(ctx):
                 with overview_container:
                     _render_overview_ui(ctx, svc, monitors=new_monitors, histories=new_histories)
 
-            with overview_container:
-                _render_overview_ui(ctx, svc, monitors=monitors_data, histories=histories_data)
-
-            # 15 s refresh keeps the UI responsive; monitoring runs independently.
+            # First load runs immediately after page is delivered to browser.
+            ui.timer(0.05, _initial_load, once=True)
+            # Periodic refresh every 15 s.
             ui.timer(15.0, refresh_dashboard)
 
     ctx.log.info("State Monitoring: setup complete.")

@@ -145,3 +145,53 @@ def render_settings_ui(ctx, service: MonitoringService):
                     '<q-td :props="props"><q-btn flat round size="sm" icon="edit" color="primary" @click="() => $parent.$emit(&quot;edit&quot;, props.row)" /></q-td>',
                 )
                 table.on("edit", lambda event: load_monitor(event.args))
+
+        # ── Danger Zone ────────────────────────────────────────────────────
+        with ui.card().classes("w-full p-0 overflow-hidden bg-gradient-to-br from-zinc-950 to-zinc-900 border border-rose-900/40"):
+            ui.element("div").classes("h-1 w-full bg-gradient-to-r from-rose-500 via-red-500 to-orange-500")
+            with ui.column().classes("w-full p-6 gap-4"):
+                with ui.row().classes("w-full items-center gap-3"):
+                    ui.icon("warning", size="22px").classes("text-rose-400")
+                    with ui.column().classes("gap-0"):
+                        ui.label("Danger Zone").classes("text-lg font-black text-zinc-50")
+                        ui.label("Irreversible actions — proceed with caution.").classes("text-sm text-zinc-400")
+
+                with ui.row().classes("w-full items-center justify-between gap-4 flex-wrap "
+                                      "p-4 bg-rose-950/20 border border-rose-900/30 rounded-xl"):
+                    with ui.column().classes("gap-0.5"):
+                        ui.label("Clear states database").classes("text-sm font-semibold text-zinc-200")
+                        ui.label(
+                            "Deletes all heartbeat records and daily aggregates. "
+                            "Resets every monitor back to UNKNOWN state. "
+                            "New probe results will repopulate the history."
+                        ).classes("text-xs text-zinc-400 max-w-lg")
+
+                    with ui.dialog() as confirm_dialog, ui.card().classes(
+                        "w-full max-w-md p-0 overflow-hidden bg-zinc-950 border border-rose-900/60"
+                    ):
+                        ui.element("div").classes("h-1 w-full bg-gradient-to-r from-rose-500 to-red-500")
+                        with ui.column().classes("w-full p-6 gap-4"):
+                            with ui.row().classes("items-center gap-3"):
+                                ui.icon("delete_forever", size="28px").classes("text-rose-400")
+                                ui.label("Confirm: Clear Database").classes("text-lg font-black text-zinc-50")
+                            ui.label(
+                                "This will permanently delete ALL heartbeat records, daily aggregates, "
+                                "and reset every monitor to UNKNOWN. This cannot be undone."
+                            ).classes("text-sm text-zinc-400")
+                            with ui.row().classes("w-full justify-end gap-2 pt-2"):
+                                ui.button("Cancel", on_click=confirm_dialog.close).props("flat").classes("text-zinc-400")
+                                def _do_clear(d=confirm_dialog):
+                                    try:
+                                        deleted = service.clear_states_db()
+                                        ui.notify(f"Cleared {deleted} heartbeat records. All monitors reset to UNKNOWN.", type="positive", timeout=5000)
+                                    except Exception as exc:
+                                        ui.notify(f"Error: {exc}", type="negative")
+                                    d.close()
+                                ui.button("Clear Database", on_click=_do_clear, icon="delete_forever").props("unelevated color=negative")
+
+                    ui.button(
+                        "Clear States Database",
+                        icon="delete_sweep",
+                        on_click=confirm_dialog.open,
+                    ).props("outline color=negative")
+
