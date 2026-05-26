@@ -1,6 +1,6 @@
 from typing import List
 
-from .models import MonitorState
+from ..model.models import MonitorState
 
 STATE_STYLES = {
     MonitorState.UP.value: {

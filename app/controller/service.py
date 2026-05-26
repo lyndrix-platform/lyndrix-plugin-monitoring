@@ -8,7 +8,7 @@ import httpx
 
 from core.api import db_instance
 
-from .models import (
+from ..model.models import (
     AdminOverride,
     InventorySyncPayload,
     MonitorDailyAggregate,

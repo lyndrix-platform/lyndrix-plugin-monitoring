@@ -1,7 +1,7 @@
 from nicegui import ui
 
-from .service import MonitoringService
-from .models import MonitorState
+from ..controller.service import MonitoringService
+from ..model.models import MonitorState
 
 
 def render_dashboard_widget(ctx, service: MonitoringService | None):

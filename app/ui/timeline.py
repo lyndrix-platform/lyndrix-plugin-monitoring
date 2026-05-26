@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-from .models import MonitorState, _utc_now
-from .ui_styles import aggregate_state, state_color
+from ..model.models import MonitorState, _utc_now
+from .styles import aggregate_state, state_color
 
 # ------------------------------------------------------------------
 # Size configuration — gap MUST be identical between bars and scale

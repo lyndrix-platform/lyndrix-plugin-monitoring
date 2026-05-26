@@ -3,7 +3,7 @@ import ipaddress
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
-from ..models import MonitorState, _utc_now
+from ...model.models import MonitorState, _utc_now
 
 
 def looks_like_network_target(value: Optional[str]) -> bool:

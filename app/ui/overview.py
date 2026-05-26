@@ -1,9 +1,9 @@
 from nicegui import ui
 
-from .service import MonitoringService
-from .ui_helpers import build_grouped_overview, host_tile_span_classes, service_grid_classes
-from .ui_styles import state_badge_classes, state_card_classes, state_strip_style
-from .ui_timeline import timeline_html, timeline_scale_html
+from ..controller.service import MonitoringService
+from .helpers import build_grouped_overview, host_tile_span_classes, service_grid_classes
+from .styles import state_badge_classes, state_card_classes, state_strip_style
+from .timeline import timeline_html, timeline_scale_html
 
 
 def render_overview_ui(ctx, service: MonitoringService, *, monitors=None, histories=None):

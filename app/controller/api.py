@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
-from .models import AdminOverride, InventorySyncPayload, MonitorUpsert, PassiveResult
+from ..model.models import AdminOverride, InventorySyncPayload, MonitorUpsert, PassiveResult
 from .service import MonitoringService
 
 
