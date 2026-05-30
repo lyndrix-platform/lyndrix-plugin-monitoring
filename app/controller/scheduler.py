@@ -4,7 +4,7 @@ from datetime import timedelta
 from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
-from .models import _utc_now
+from ..model.models import _utc_now
 
 
 @dataclass

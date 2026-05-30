@@ -1,7 +1,7 @@
 from nicegui import ui
 
-from .models import MonitorType, MonitorUpsert
-from .service import MonitoringService
+from ..model.models import MonitorType, MonitorUpsert
+from ..controller.service import MonitoringService
 from typing import Dict, Any
 
 

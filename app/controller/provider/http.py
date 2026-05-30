@@ -1,7 +1,7 @@
 import httpx
 from typing import Any, Dict, Optional
 
-from ..models import MonitorState
+from ...model.models import MonitorState
 
 
 def is_http_target(value: Optional[str]) -> bool:

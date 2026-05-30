@@ -1,7 +1,7 @@
 import asyncio
 from typing import Any, Dict
 
-from ..models import MonitorState
+from ...model.models import MonitorState
 
 
 async def run_icmp_probe(target: str, timeout_seconds: int) -> Dict[str, Any]:

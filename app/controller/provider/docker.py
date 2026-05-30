@@ -1,7 +1,7 @@
 import httpx
 from typing import Any, Dict, List, Optional
 
-from ..models import MonitorState
+from ...model.models import MonitorState
 
 
 def is_docker_host(metadata: Dict[str, Any]) -> bool:

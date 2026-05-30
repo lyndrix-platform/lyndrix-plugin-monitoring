@@ -1,8 +1,8 @@
 from typing import Any, Dict, List, Optional, Tuple
 
-from .models import MonitorType, _aggregate_uptime_percent, _timeline_uptime_percent
-from .ui_styles import aggregate_state
-from .ui_timeline import merge_timelines, timeline_from_history
+from ..model.models import MonitorType, _aggregate_uptime_percent, _timeline_uptime_percent
+from .styles import aggregate_state
+from .timeline import merge_timelines, timeline_from_history
 
 
 def humanize_label(value: Optional[str]) -> str:
