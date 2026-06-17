@@ -104,7 +104,7 @@ def timeline_scale_html(hours: int = 24, size: str = "full") -> str:
     labels = []
     for i in range(hours):
         is_tick = i in tick_positions
-        tick_color = "rgba(161,161,170,0.7)" if is_tick else "rgba(82,82,91,0.25)"
+        tick_color = "rgba(var(--lx-text-muted-raw,161,161,170),0.7)" if is_tick else "rgba(82,82,91,0.25)"
         ticks.append(
             f'<div style="'
             f'width:1px;'
@@ -124,7 +124,7 @@ def timeline_scale_html(hours: int = 24, size: str = "full") -> str:
             labels.append(
                 f'<div style="'
                 f'font-size:{font};'
-                f'color:#71717a;'
+                f'color:var(--lx-text-muted);'
                 f'letter-spacing:0.1em;'
                 f'white-space:nowrap;'
                 f'transform:{transform};'
