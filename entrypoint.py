@@ -23,7 +23,7 @@ try:
     from ui.layout import main_layout
 except ImportError:
 
-    def main_layout(title):  # type: ignore
+    def main_layout(title, *, wide: bool = False):  # type: ignore
         def decorator(fn):
             return fn
 
@@ -37,12 +37,12 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="0.1.0",
+    version="0.0.5",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
     type="PLUGIN",
-    min_core_version="0.0.6",
+    min_core_version="0.1.1",
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-monitoring",
     ui_route="/monitoring",
@@ -54,7 +54,7 @@ manifest = ModuleManifest(
             "monitoring:passive_result",
             "monitoring:admin_override",
         ],
-        "emit": ["monitoring:state_changed"],
+        "emit": ["monitoring:state_changed", "messaging:outbound"],
     },
 )
 
@@ -148,7 +148,7 @@ def setup(ctx):
             ctx.log.error(f"State Monitoring: inventory sync failed: {exc}")
 
     @ui.page("/monitoring")
-    @main_layout("State Monitoring")
+    @main_layout("State Monitoring", wide=True)
     async def _page():
         svc = plugin_state.get("service")
         if svc is None:

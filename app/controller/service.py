@@ -820,25 +820,29 @@ class MonitoringService:
             address = host.get("address") or host.get("ansible_host")
             if not host_name:
                 continue
-            self.upsert_monitor(MonitorUpsert(
-                monitor_id=f"host:{host_name}",
-                name=host_name,
-                monitor_type=MonitorType.SERVER,
-                owner_source=payload.owner_source,
-                target=address,
-                address=address,
-                host_name=host_name,
-                logical_group=host.get("site") or host.get("stage") or "iac",
-                source_hash=payload.source_revision,
-                metadata={
-                    "stage": host.get("stage"),
-                    "groups": host.get("groups") or host.get("ansible_groups") or [],
-                    "baseline_roles": host.get("baseline_roles") or [],
-                    "profiles": host.get("profiles") or [],
-                    "terraform": host.get("terraform") or {},
-                },
-            ), sync_scheduler=False)
-            upserts += 1
+            try:
+                self.upsert_monitor(MonitorUpsert(
+                    monitor_id=f"host:{host_name}",
+                    name=host_name,
+                    monitor_type=MonitorType.SERVER,
+                    owner_source=payload.owner_source,
+                    target=address,
+                    address=address,
+                    host_name=host_name,
+                    logical_group=host.get("site") or host.get("stage") or "iac",
+                    source_hash=payload.source_revision,
+                    metadata={
+                        "stage": host.get("stage"),
+                        "groups": host.get("groups") or host.get("ansible_groups") or [],
+                        "baseline_roles": host.get("baseline_roles") or [],
+                        "profiles": host.get("profiles") or [],
+                        "terraform": host.get("terraform") or {},
+                    },
+                ), sync_scheduler=False)
+                upserts += 1
+            except Exception as exc:
+                if self.ctx:
+                    self.ctx.log.warning(f"Inventory sync: skipping host {host_name!r}: {exc}")
 
         for svc in payload.services:
             host_name = svc.get("host_name") or svc.get("hostname")
@@ -847,30 +851,34 @@ class MonitoringService:
                 continue
             target = svc.get("url") or svc.get("target") or svc.get("address")
             monitor_type = MonitorType.HTTP if target and str(target).startswith(("http://", "https://")) else MonitorType.SERVICE
-            self.upsert_monitor(MonitorUpsert(
-                monitor_id=f"service:{host_name}:{service_name}",
-                name=f"{host_name}:{service_name}",
-                monitor_type=monitor_type,
-                owner_source=payload.owner_source,
-                target=target,
-                address=svc.get("address"),
-                host_name=host_name,
-                service_name=service_name,
-                logical_group=svc.get("site") or svc.get("stage") or "iac",
-                source_hash=payload.source_revision,
-                enabled=bool(target),
-                metadata={
-                    "site": svc.get("site"),
-                    "stage": svc.get("stage"),
-                    "groups": svc.get("groups") or svc.get("ansible_groups") or [],
-                    "deploy_type": svc.get("deploy_type"),
-                    "desired_state": svc.get("desired_state") or svc.get("state"),
-                    "git_repo": svc.get("git_repo"),
-                    "git_version": svc.get("git_version"),
-                    "config": svc.get("config") or {},
-                },
-            ), sync_scheduler=False)
-            upserts += 1
+            try:
+                self.upsert_monitor(MonitorUpsert(
+                    monitor_id=f"service:{host_name}:{service_name}",
+                    name=f"{host_name}:{service_name}",
+                    monitor_type=monitor_type,
+                    owner_source=payload.owner_source,
+                    target=target,
+                    address=svc.get("address"),
+                    host_name=host_name,
+                    service_name=service_name,
+                    logical_group=svc.get("site") or svc.get("stage") or "iac",
+                    source_hash=payload.source_revision,
+                    enabled=bool(target),
+                    metadata={
+                        "site": svc.get("site"),
+                        "stage": svc.get("stage"),
+                        "groups": svc.get("groups") or svc.get("ansible_groups") or [],
+                        "deploy_type": svc.get("deploy_type"),
+                        "desired_state": svc.get("desired_state") or svc.get("state"),
+                        "git_repo": svc.get("git_repo"),
+                        "git_version": svc.get("git_version"),
+                        "config": svc.get("config") or {},
+                    },
+                ), sync_scheduler=False)
+                upserts += 1
+            except Exception as exc:
+                if self.ctx:
+                    self.ctx.log.warning(f"Inventory sync: skipping service {host_name!r}:{service_name!r}: {exc}")
 
         # Delete monitors that were previously owned by this source but are no
         # longer present in the current payload (host/service removed upstream).
