@@ -1,0 +1,28 @@
+site_name: Lyndrix State Monitoring
+site_description: Documentation for the Lyndrix State Monitoring plugin
+site_url: https://monitoring.docs.lyndrix.eu
+site_dir: .cache/site
+repo_url: https://github.com/lyndrix-platform/lyndrix-plugin-monitoring
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: emerald
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: emerald
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+
+nav:
+  - Home: index.md
+  - Usage: usage.md
+  - Configuration: configuration.md

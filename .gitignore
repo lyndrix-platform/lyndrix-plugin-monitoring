@@ -208,3 +208,6 @@ __marimo__/
 
 # Vendor directory
 vendor/
+
+# Generated docs build output
+.cache/
