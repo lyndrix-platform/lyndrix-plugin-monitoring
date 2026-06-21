@@ -1,3 +1,5 @@
+import asyncio
+
 from nicegui import ui
 from core.api import UIStyles
 
@@ -57,11 +59,13 @@ def render_settings_ui(ctx, service: MonitoringService):
         mode_label.set_text("Edit")
         dialog.open()
 
-    def refresh_rows():
-        table.rows = service.list_monitors()
+    async def refresh_rows():
+        # list_monitors() aggregates uptime over heartbeats for all monitors;
+        # run it off the event loop so opening Settings never stalls the UI.
+        table.rows = await asyncio.to_thread(service.list_monitors)
         table.update()
 
-    def save_form():
+    async def save_form():
         try:
             payload = MonitorUpsert(
                 monitor_id=form_state["monitor_id"],
@@ -78,8 +82,8 @@ def render_settings_ui(ctx, service: MonitoringService):
                 enabled=bool(form_state["enabled"]),
                 force=bool(form_state["force"]),
             )
-            service.upsert_monitor(payload)
-            refresh_rows()
+            await asyncio.to_thread(service.upsert_monitor, payload)
+            await refresh_rows()
             ui.notify("Monitor saved.", type="positive")
             dialog.close()
             reset_form()
@@ -171,7 +175,7 @@ def render_settings_ui(ctx, service: MonitoringService):
                         {"name": "uptime_24h",    "label": "24h %",  "field": "uptime_24h"},
                         {"name": "action",        "label": "",       "field": "action"},
                     ],
-                    rows=service.list_monitors(),
+                    rows=[],
                     row_key="monitor_id",
                 ).classes("w-full bg-transparent")
                 table.add_slot(
@@ -190,6 +194,10 @@ def render_settings_ui(ctx, service: MonitoringService):
                     "</q-td>",
                 )
                 table.on("edit", lambda event: load_monitor(event.args))
+
+                # Populate the table off the event loop right after render so
+                # opening Settings does not block the UI for ~248 monitors.
+                ui.timer(0.1, refresh_rows, once=True)
 
         # ── Danger Zone ──────────────────────────────────────────────────────
         with ui.card().classes(UIStyles.CARD_BASE + " w-full").style(

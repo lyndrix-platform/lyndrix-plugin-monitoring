@@ -1,24 +1,29 @@
+import asyncio
+
 from nicegui import ui
 
 from core.api import UIStyles
 
 from ..controller.service import MonitoringService
-from ..model.models import MonitorState
 from .styles import state_badge_classes, state_color
 
 
-def render_dashboard_widget(ctx, service: MonitoringService | None):
+async def render_dashboard_widget(ctx, service: MonitoringService | None):
     if service is None:
         ui.label("State Monitoring").classes(UIStyles.TITLE_H3)
         ui.label("Unavailable").classes(UIStyles.TEXT_MUTED)
         return
 
-    monitors = service.list_monitors()
-    total   = len(monitors)
-    up      = sum(1 for m in monitors if m.get("latest_state") == MonitorState.UP.value)
-    down    = sum(1 for m in monitors if m.get("latest_state") == MonitorState.DOWN.value)
-    paused  = sum(1 for m in monitors if m.get("latest_state") == MonitorState.PAUSED.value)
-    unknown = total - up - down - paused
+    # Cheap by-state counts (single GROUP BY on MonitorRecord — no heartbeat
+    # aggregation) run off the event loop. The core dashboard renders plugin
+    # widgets inline on the single asyncio loop, so a heavy/sync data fetch here
+    # freezes every connected client (NiceGUI "connection lost").
+    data = await asyncio.to_thread(service.status_counts)
+    total   = int(data.get("monitor_count", 0))
+    up      = int(data.get("up_count", 0))
+    down    = int(data.get("down_count", 0))
+    paused  = int(data.get("paused_count", 0))
+    unknown = max(0, total - up - down - paused)
 
     overall     = "DOWN" if down else ("UP" if up else ("PAUSED" if paused else "UNKNOWN"))
     pulse_color = state_color(overall)

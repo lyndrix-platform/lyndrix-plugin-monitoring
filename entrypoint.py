@@ -6,6 +6,8 @@ setup() lifecycle hook, and teardown() lifecycle hook.
 All business logic, models, and UI code live under app/.
 """
 
+import asyncio
+
 from nicegui import app as nicegui_app
 from nicegui import ui
 
@@ -37,7 +39,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="0.0.6",
+    version="0.0.7",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -85,8 +87,8 @@ def render_settings_ui(ctx):
     _render_settings_ui(ctx, svc)
 
 
-def render_dashboard_widget(ctx):
-    _render_dashboard_widget(ctx, plugin_state.get("service"))
+async def render_dashboard_widget(ctx):
+    await _render_dashboard_widget(ctx, plugin_state.get("service"))
 
 
 # ---------------------------------------------------------------------------
@@ -122,21 +124,21 @@ def setup(ctx):
     @ctx.subscribe("monitoring:config_upsert")
     async def on_config_upsert(payload):
         try:
-            service.upsert_monitor(MonitorUpsert(**payload))
+            await asyncio.to_thread(service.upsert_monitor, MonitorUpsert(**payload))
         except Exception as exc:
             ctx.log.error(f"State Monitoring: config upsert failed: {exc}")
 
     @ctx.subscribe("monitoring:passive_result")
     async def on_passive_result(payload):
         try:
-            service.ingest_passive_result(PassiveResult(**payload))
+            await asyncio.to_thread(service.ingest_passive_result, PassiveResult(**payload))
         except Exception as exc:
             ctx.log.error(f"State Monitoring: passive result failed: {exc}")
 
     @ctx.subscribe("monitoring:admin_override")
     async def on_admin_override(payload):
         try:
-            service.apply_admin_override(AdminOverride(**payload))
+            await asyncio.to_thread(service.apply_admin_override, AdminOverride(**payload))
         except Exception as exc:
             ctx.log.error(f"State Monitoring: admin override failed: {exc}")
 

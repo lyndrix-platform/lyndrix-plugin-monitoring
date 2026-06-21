@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from contextlib import suppress
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
@@ -48,6 +49,17 @@ class MonitoringService:
         self._inventory_sync_task: Optional[asyncio.Task] = None
         self._pending_inventory_payload: Optional[InventorySyncPayload] = None
 
+        # --- Backend-failure resilience (keeps a slow/broken backend from
+        # flooding the single event loop with probes + state_changed events;
+        # critical when prod+test are monitored together = hundreds of monitors) ---
+        self._consec_failures: Dict[str, int] = {}        # monitor_id -> consecutive failures
+        self._host_failures: Dict[str, int] = {}          # host_key  -> consecutive failures
+        self._host_circuit_until: Dict[str, float] = {}   # host_key  -> monotonic deadline while paused
+        self._flap_threshold = 3                          # consecutive fails before a monitor flips to DOWN
+        self._host_circuit_threshold = 8                  # consecutive host fails before the host is paused
+        self._host_circuit_base = 30.0                    # circuit backoff base (seconds)
+        self._host_circuit_max = 1800.0                   # circuit backoff cap (seconds)
+
     def _session(self):
         if not db_instance.is_connected or not db_instance.SessionLocal:
             return None
@@ -87,6 +99,8 @@ class MonitoringService:
                 "target": target,
                 "address": record.address,
                 "service_name": record.service_name,
+                "host_name": record.host_name,
+                "latest_state": record.latest_state,
                 "timeout_seconds": record.timeout_seconds,
                 "metadata": _safe_json_load(record.metadata_json),
             }
@@ -222,10 +236,9 @@ class MonitoringService:
             await asyncio.to_thread(self.ensure_tables)
         await asyncio.sleep(0)
         with suppress(Exception):
-            # sync_scheduler_jobs does DB reads + asyncio.create_task; run the
-            # DB portion first in a thread, then the task-creation inline.
-            await asyncio.to_thread(self._load_all_records_for_scheduler)
-            self.sync_scheduler_jobs()
+            # DB read off the loop; scheduler task-creation stays on the loop.
+            records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
+            self.sync_scheduler_jobs_from(records)
         await asyncio.sleep(0)
         with suppress(Exception):
             await self.refresh_rollups()
@@ -320,8 +333,9 @@ class MonitoringService:
             try:
                 await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
                 await asyncio.sleep(0)
-                # sync_scheduler_jobs does asyncio.create_task; run it on the event loop.
-                self.sync_scheduler_jobs()
+                # DB read off the loop; scheduler task-creation stays on the loop.
+                records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
+                self.sync_scheduler_jobs_from(records)
                 await asyncio.sleep(0)
                 self.enqueue_background_probe_refresh()
             except Exception as exc:
@@ -396,6 +410,34 @@ class MonitoringService:
     # ------------------------------------------------------------------
     # Public read API
     # ------------------------------------------------------------------
+
+    def status_counts(self) -> Dict[str, int]:
+        """Cheap by-state counts from MonitorRecord only — a single GROUP BY, no
+        heartbeat aggregation. Used by the dashboard widget, which must stay light
+        (unlike stats(), which also computes uptime over MonitorHeartbeat)."""
+        from sqlalchemy import func
+        session = self._session()
+        result = {"monitor_count": 0, "up_count": 0, "down_count": 0, "paused_count": 0}
+        if not session:
+            return result
+        try:
+            rows = (
+                session.query(MonitorRecord.latest_state, func.count(MonitorRecord.monitor_id))
+                .group_by(MonitorRecord.latest_state)
+                .all()
+            )
+            for state, count in rows:
+                count = int(count or 0)
+                result["monitor_count"] += count
+                if state == MonitorState.UP.value:
+                    result["up_count"] = count
+                elif state == MonitorState.DOWN.value:
+                    result["down_count"] = count
+                elif state == MonitorState.PAUSED.value:
+                    result["paused_count"] = count
+            return result
+        finally:
+            session.close()
 
     def stats(self) -> Dict[str, Any]:
         from sqlalchemy import func
@@ -585,6 +627,44 @@ class MonitoringService:
                     self.scheduler.remove_job(job.id)
         finally:
             session.close()
+
+    def _snapshot_records_for_scheduler(self) -> Optional[List[Any]]:
+        """Read scheduler-relevant fields off the event loop and return detached
+        snapshots. Lets sync_scheduler_jobs_from() create the (loop-only) probe
+        tasks without doing any DB I/O on the loop — for a few hundred monitors a
+        full MonitorRecord scan on the loop is enough to stall NiceGUI."""
+        from types import SimpleNamespace
+        session = self._session()
+        if not session:
+            return None
+        try:
+            return [
+                SimpleNamespace(
+                    monitor_id=r.monitor_id,
+                    enabled=r.enabled,
+                    latest_state=r.latest_state,
+                    monitor_type=r.monitor_type,
+                    target=r.target,
+                    address=r.address,
+                    interval_seconds=r.interval_seconds,
+                )
+                for r in session.query(MonitorRecord).all()
+            ]
+        finally:
+            session.close()
+
+    def sync_scheduler_jobs_from(self, records: Optional[List[Any]]):
+        """Create/remove scheduler jobs from pre-loaded snapshots. MUST run on the
+        event loop thread (the scheduler uses asyncio.create_task)."""
+        if records is None or not self._scheduler_started:
+            return
+        active_ids = set()
+        for record in records:
+            active_ids.add(f"monitor:{record.monitor_id}")
+            self._sync_job_for_monitor(record)
+        for job in self.scheduler.get_jobs():
+            if job.id.startswith("monitor:") and job.id not in active_ids:
+                self.scheduler.remove_job(job.id)
 
     # ------------------------------------------------------------------
     # Write API
@@ -777,12 +857,27 @@ class MonitoringService:
     # Active probe
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _host_key_for(monitor_id: str, host_name: Optional[str]) -> str:
+        """Group monitors by their backing host so one dead host/backend opens a
+        single circuit. Falls back to parsing the monitor_id (``host:<h>`` /
+        ``service:<h>:<svc>``)."""
+        if host_name:
+            return host_name
+        parts = monitor_id.split(":")
+        return parts[1] if len(parts) >= 2 and parts[1] else monitor_id
+
     async def run_scheduled_probe(self, monitor_id: str):
         """Run a single probe without blocking the event loop.
 
         Phase 1 – DB read  (thread): load record fields.
         Phase 2 – Probe    (async):  network I/O via semaphore.
         Phase 3 – DB write (thread): persist heartbeat + aggregates.
+
+        Resilience: a per-host circuit-breaker skips probing a host that keeps
+        failing (so a broken backend can't flood the loop), and flap dampening
+        suppresses a single transient failure (no DB write / no state_changed
+        emit) until ``_flap_threshold`` consecutive failures are seen.
         """
         if monitor_id in self._inflight_probes:
             return
@@ -791,6 +886,14 @@ class MonitoringService:
             # Phase 1: read from DB in a worker thread so the event loop stays free.
             record_data = await asyncio.to_thread(self._load_probe_record, monitor_id)
             if not record_data:
+                return
+
+            host_key = self._host_key_for(monitor_id, record_data.get("host_name"))
+            now = time.monotonic()
+
+            # Circuit breaker: while a host is in backoff, skip the probe entirely.
+            deadline = self._host_circuit_until.get(host_key, 0.0)
+            if deadline and now < deadline:
                 return
 
             # Phase 2: async network probe (already non-blocking).
@@ -803,6 +906,31 @@ class MonitoringService:
             except Exception as exc:
                 state = MonitorState.DOWN
                 error_message = str(exc)
+
+            if state != MonitorState.DOWN:
+                # Recovery: clear this monitor's and its host's failure state.
+                self._consec_failures.pop(monitor_id, None)
+                self._host_failures.pop(host_key, None)
+                self._host_circuit_until.pop(host_key, None)
+            else:
+                self._consec_failures[monitor_id] = self._consec_failures.get(monitor_id, 0) + 1
+                self._host_failures[host_key] = self._host_failures.get(host_key, 0) + 1
+
+                # Open/extend the host circuit (exponential backoff) once the whole
+                # host has failed repeatedly without any interspersed success.
+                host_fails = self._host_failures[host_key]
+                if host_fails >= self._host_circuit_threshold:
+                    n = host_fails - self._host_circuit_threshold
+                    delay = min(self._host_circuit_max, self._host_circuit_base * (2 ** min(n, 16)))
+                    self._host_circuit_until[host_key] = now + delay
+
+                # Flap dampening: suppress a transient DOWN until confirmed. Never
+                # suppress a monitor that is already DOWN (keep persistent state).
+                if (
+                    self._consec_failures[monitor_id] < self._flap_threshold
+                    and record_data.get("latest_state") in (MonitorState.UP.value, None)
+                ):
+                    return
 
             # Phase 3: write result + aggregates in a worker thread.
             await asyncio.to_thread(self._save_probe_result, monitor_id, state, latency_ms, error_message)
