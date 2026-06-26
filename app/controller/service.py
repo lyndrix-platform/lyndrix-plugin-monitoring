@@ -266,11 +266,11 @@ class MonitoringService:
             return 2
         return 3
 
-    async def _run_probe_refresh_batch(self):
-        await asyncio.sleep(self._initial_probe_delay_seconds)
+    def _load_probe_candidates(self) -> list:
+        """Sync helper — run via asyncio.to_thread to avoid blocking the event loop."""
         session = self._session()
         if not session:
-            return
+            return []
         try:
             records = session.query(MonitorRecord).filter(MonitorRecord.enabled.is_(True)).all()
 
@@ -294,24 +294,29 @@ class MonitoringService:
             candidates.sort(key=lambda r: (self._probe_priority(r), r.updated_at or _utc_now()))
             if self._initial_probe_batch_limit > 0:
                 candidates = candidates[: self._initial_probe_batch_limit]
-            pending_ids = [r.monitor_id for r in candidates]
-            worker_count = max(1, min(self._initial_probe_worker_limit, len(pending_ids)))
-
-            if pending_ids:
-                self.ctx.log.info(
-                    f"State Monitoring: starting initial probe refresh for {len(pending_ids)} monitors with {worker_count} workers."
-                )
-
-            async def worker():
-                while pending_ids:
-                    mid = pending_ids.pop(0)
-                    with suppress(Exception):
-                        await self.run_scheduled_probe(mid)
-
-            if worker_count:
-                await asyncio.gather(*(worker() for _ in range(worker_count)), return_exceptions=True)
+            return [r.monitor_id for r in candidates]
         finally:
             session.close()
+
+    async def _run_probe_refresh_batch(self):
+        await asyncio.sleep(self._initial_probe_delay_seconds)
+
+        pending_ids = await asyncio.to_thread(self._load_probe_candidates)
+        if not pending_ids:
+            return
+
+        worker_count = max(1, min(self._initial_probe_worker_limit, len(pending_ids)))
+        self.ctx.log.info(
+            f"State Monitoring: starting initial probe refresh for {len(pending_ids)} monitors with {worker_count} workers."
+        )
+
+        async def worker():
+            while pending_ids:
+                mid = pending_ids.pop(0)
+                with suppress(Exception):
+                    await self.run_scheduled_probe(mid)
+
+        await asyncio.gather(*(worker() for _ in range(worker_count)), return_exceptions=True)
 
     # ------------------------------------------------------------------
     # Inventory sync queue

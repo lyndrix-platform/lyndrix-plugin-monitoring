@@ -52,6 +52,44 @@ def build_router(service: MonitoringService) -> APIRouter:
     return router
 
 
+def build_plugin_router(service: MonitoringService) -> APIRouter:
+    """Standard router — no prefix; core mounts at /api/plugins/<id>/"""
+    router = APIRouter(tags=["State Monitoring"])
+
+    @router.get("/dashboard")
+    async def dashboard_data():
+        return {"monitors": service.list_monitors(), "stats": service.stats()}
+
+    @router.get("/monitors/{monitor_id}")
+    async def get_monitor(monitor_id: str):
+        item = service.get_monitor(monitor_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail=f"Unknown monitor: {monitor_id}")
+        return item
+
+    @router.get("/history/{monitor_id}")
+    async def get_history(monitor_id: str):
+        return service.get_history(monitor_id)
+
+    @router.post("/monitors")
+    async def upsert_monitor(payload: MonitorUpsert):
+        try:
+            return service.upsert_monitor(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @router.post("/admin-override")
+    async def admin_override(payload: AdminOverride):
+        try:
+            return service.apply_admin_override(payload)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown monitor: {payload.monitor_id}") from exc
+
+    return router
+
+
 def register_api_routes(fastapi_app, router: APIRouter):
     api_prefix = "/api/monitoring"
     routes = list(fastapi_app.router.routes)

@@ -13,7 +13,7 @@ from nicegui import ui
 
 from core.api import ModuleManifest
 
-from .app.controller.api import build_router, register_api_routes
+from .app.controller.api import build_router, build_plugin_router, register_api_routes
 from .app.model.models import AdminOverride, InventorySyncPayload, MonitorUpsert, PassiveResult
 from .app.controller.service import MonitoringService
 from .app.ui.overview import render_overview_ui as _render_overview_ui
@@ -39,7 +39,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="0.0.7",
+    version="0.0.8",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -48,6 +48,15 @@ manifest = ModuleManifest(
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-monitoring",
     ui_route="/monitoring",
+    react_ui=True,
+    react_routes=[
+        {
+            "path": "/monitoring",
+            "label": "State Monitoring",
+            "icon": "monitor_heart",
+            "sidebar_visible": True,
+        }
+    ],
     permissions={
         "subscribe": [
             "db:connected",
@@ -107,6 +116,7 @@ def setup(ctx):
 
     router = build_router(service)
     register_api_routes(fastapi_app, router)
+    ctx.register_routes(build_plugin_router(service))
     service.queue_bootstrap()
 
     @nicegui_app.on_shutdown

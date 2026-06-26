@@ -211,3 +211,6 @@ vendor/
 
 # Generated docs build output
 .cache/
+
+# Plugin React UI build toolchain
+node_modules/
