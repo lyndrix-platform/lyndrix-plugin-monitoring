@@ -13,7 +13,7 @@ from nicegui import ui
 
 from core.api import ModuleManifest
 
-from .app.controller.api import build_router, build_plugin_router, register_api_routes
+from .app.controller.api import build_plugin_router
 from .app.model.models import AdminOverride, InventorySyncPayload, MonitorUpsert, PassiveResult
 from .app.controller.service import MonitoringService
 from .app.ui.overview import render_overview_ui as _render_overview_ui
@@ -21,6 +21,12 @@ from .app.ui.settings import render_settings_ui as _render_settings_ui
 from .app.ui.widget import render_dashboard_widget as _render_dashboard_widget
 from .app.ui.page import render_monitoring_page
 
+# TODO(agent): canonical-anatomy move deferred to a dedicated refactor PR
+#   (PLUGIN-MONITORING-007): src/ui -> app/ui/react, app/ui/*.py -> app/ui/nicegui,
+#   app/controller -> app/logic, Vite outDir -> app/ui/static. Large mechanical
+#   change requiring a bundle rebuild; staged separately to keep this diff reviewable.
+# TODO(agent): main_layout is not yet exported from core.api (PLUGIN-MONITORING-012);
+#   switch to the stable surface once it exists. Fallback below keeps the plugin loadable.
 try:
     from ui.layout import main_layout
 except ImportError:
@@ -39,7 +45,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="0.0.8",
+    version="0.1.0",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -80,12 +86,12 @@ plugin_state: dict = {"service": None}
 # ---------------------------------------------------------------------------
 
 
-def render_overview_ui(ctx):
+async def render_overview_ui(ctx):
     svc = plugin_state.get("service")
     if svc is None:
         ui.label("Monitoring service not ready.").classes("text-xs text-red-400")
         return
-    _render_overview_ui(ctx, svc)
+    await _render_overview_ui(ctx, svc)
 
 
 def render_settings_ui(ctx):
@@ -112,10 +118,11 @@ def setup(ctx):
     service.start()
     plugin_state["service"] = service
 
-    from main import app as fastapi_app  # noqa: PLC0415 — runtime import like original
-
-    router = build_router(service)
-    register_api_routes(fastapi_app, router)
+    # Mount the single authenticated router through core's registry so every
+    # route inherits require_api_auth (and the per-route api:read/api:write
+    # permission checks). The previous anonymous /api/monitoring mount via
+    # `from main import app` has been removed — it exposed mutating routes
+    # unauthenticated.
     ctx.register_routes(build_plugin_router(service))
     service.queue_bootstrap()
 

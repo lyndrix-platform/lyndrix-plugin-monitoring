@@ -2,6 +2,7 @@ import httpx
 from typing import Any, Dict, List, Optional
 
 from ...model.models import MonitorState
+from ._ssrf import ProbeTargetError, assert_host_allowed
 
 
 def is_docker_host(metadata: Dict[str, Any]) -> bool:
@@ -72,6 +73,12 @@ def docker_container_score(container: Dict[str, Any], service_name: str) -> int:
 async def run_docker_service_probe(
     client: httpx.AsyncClient, host: str, service_name: str, timeout_seconds: int
 ) -> Dict[str, Any]:
+    # SSRF guard: the Docker API (plaintext :2375) requires a trusted endpoint;
+    # reject link-local/metadata hosts before forging the request.
+    try:
+        assert_host_allowed(host)
+    except ProbeTargetError as exc:
+        return {"state": MonitorState.DOWN, "latency_ms": None, "error_message": str(exc)}
     endpoint = f"http://{host}:2375/containers/json"
     response = await client.get(endpoint, params={"all": 1}, timeout=httpx.Timeout(timeout_seconds))
     latency_ms = round(response.elapsed.total_seconds() * 1000.0, 2)

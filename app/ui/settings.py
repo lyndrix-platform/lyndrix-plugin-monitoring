@@ -249,9 +249,12 @@ def render_settings_ui(ctx, service: MonitoringService):
                             with ui.row().classes("w-full justify-end gap-2 pt-2 flex-wrap"):
                                 ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
 
-                                def _do_clear(d=confirm_dialog):
+                                async def _do_clear(d=confirm_dialog):
                                     try:
-                                        deleted = service.clear_states_db()
+                                        # Full DELETE of heartbeats/aggregates +
+                                        # UPDATE over every monitor — keep it off
+                                        # the event loop so it never freezes clients.
+                                        deleted = await asyncio.to_thread(service.clear_states_db)
                                         ui.notify(
                                             f"Cleared {deleted} heartbeat records. "
                                             "All monitors reset to UNKNOWN.",

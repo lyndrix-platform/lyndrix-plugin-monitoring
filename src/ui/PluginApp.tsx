@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { pluginApi } from './lib/api'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -240,7 +240,14 @@ export default function PluginApp() {
   const [error, setError] = useState<string | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
 
+  const inFlight = useRef(false)
+
   const fetchDashboard = useCallback(async () => {
+    // Skip if a request is still running (no overlapping fetches) or the tab is
+    // backgrounded (don't poll a hidden tab forever).
+    if (inFlight.current) return
+    if (typeof document !== 'undefined' && document.hidden) return
+    inFlight.current = true
     try {
       const result = await pluginApi.get<DashboardData>('dashboard')
       setData(result)
@@ -248,6 +255,8 @@ export default function PluginApp() {
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Fehler beim Laden')
+    } finally {
+      inFlight.current = false
     }
   }, [])
 
