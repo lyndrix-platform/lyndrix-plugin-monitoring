@@ -1,0 +1,103 @@
+{
+  "app": {
+    "title": "State Monitoring",
+    "updated": "Aktualisiert: {{time}}",
+    "refresh": "Aktualisieren",
+    "loading": "Lade Monitore…",
+    "empty": "Keine Monitore konfiguriert.",
+    "load_error": "Fehler beim Laden"
+  },
+  "header": {
+    "title": "State Monitoring",
+    "description": "Dauerhafte Überwachung von Servern und Diensten mit gruppierten Status-Zeitleisten und optionaler IaC-Inventar-Synchronisation."
+  },
+  "stats": {
+    "total": "Gesamt",
+    "online": "Online",
+    "offline": "Offline",
+    "paused": "Pausiert",
+    "uptime_avg": "Uptime ø"
+  },
+  "hstat": {
+    "monitors": "Monitore",
+    "up": "Online",
+    "down": "Offline",
+    "paused": "Pausiert",
+    "uptime": "Uptime"
+  },
+  "state": {
+    "up": "Online",
+    "down": "Offline",
+    "paused": "Pausiert",
+    "unknown": "Unbekannt"
+  },
+  "monitor": {
+    "manual_override": "manuell",
+    "uptime_window_24h": "24h"
+  },
+  "toolbar": {
+    "view_cards": "Karten",
+    "view_table": "Tabelle",
+    "view_split": "Geteilt",
+    "group_by": "Gruppieren nach",
+    "density": "Dichte",
+    "group_site": "Standort",
+    "group_stage": "Stufe",
+    "group_location": "Ort",
+    "group_status": "Status",
+    "group_flat": "Flach (keine Gruppierung)",
+    "density_compact": "Kompakt",
+    "density_cozy": "Normal",
+    "density_spacious": "Großzügig",
+    "visibility": "Bereiche ein-/ausblenden",
+    "visibility_title": "Spalten & Bereiche anzeigen",
+    "toggle_timelines": "Zeitleisten",
+    "toggle_uptime_24h": "Uptime 24h",
+    "toggle_uptime_all": "Uptime gesamt",
+    "toggle_services": "Dienste im Host",
+    "toggle_paused": "Pausierte Monitore",
+    "toggle_unknown": "Unbekannte Monitore",
+    "refresh": "Jetzt aktualisieren"
+  },
+  "host": {
+    "standalone": "Eigenständiger Host",
+    "service_one": "{{count}} Dienst",
+    "service_other": "{{count}} Dienste",
+    "uptime_24h": "24h {{value}}%",
+    "uptime_all": "gesamt {{value}}%",
+    "host_monitor": "Host-Monitor"
+  },
+  "group": {
+    "offline_count_one": "{{count}} offline",
+    "offline_count_other": "{{count}} offline",
+    "summary": "{{hosts}} Hosts · {{services}} Dienste"
+  },
+  "table": {
+    "name": "Name",
+    "type": "Typ",
+    "location": "Ort",
+    "host": "Host",
+    "status": "Status",
+    "uptime_24h": "24h",
+    "uptime_all": "Gesamt",
+    "timeline": "Zeitleiste"
+  },
+  "split": {
+    "select_title": "Zeile auswählen",
+    "select_hint": "Wähle links einen Eintrag, um Zeitleiste und Dienste zu sehen."
+  },
+  "empty": {
+    "title": "Keine Monitore entsprechen den aktuellen Filtern.",
+    "hint": "Aktiviere pausierte/unbekannte Einträge oder prüfe die Monitor-Registry."
+  },
+  "timeline": {
+    "now": "jetzt"
+  },
+  "time": {
+    "seconds_ago": "vor {{value}} s",
+    "minutes_ago": "vor {{value}} min",
+    "hours_ago": "vor {{value}} h",
+    "days_ago_one": "vor {{count}} Tag",
+    "days_ago_other": "vor {{count}} Tagen"
+  }
+}

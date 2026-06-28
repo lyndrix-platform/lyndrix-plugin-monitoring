@@ -1,0 +1,103 @@
+{
+  "app": {
+    "title": "State Monitoring",
+    "updated": "Updated: {{time}}",
+    "refresh": "Refresh",
+    "loading": "Loading monitors…",
+    "empty": "No monitors configured.",
+    "load_error": "Failed to load"
+  },
+  "header": {
+    "title": "State Monitoring",
+    "description": "Persistent monitoring for servers and services with grouped status timelines and optional IaC inventory sync."
+  },
+  "stats": {
+    "total": "Total",
+    "online": "Online",
+    "offline": "Offline",
+    "paused": "Paused",
+    "uptime_avg": "Uptime ø"
+  },
+  "hstat": {
+    "monitors": "Monitors",
+    "up": "Up",
+    "down": "Down",
+    "paused": "Paused",
+    "uptime": "Uptime"
+  },
+  "state": {
+    "up": "Online",
+    "down": "Offline",
+    "paused": "Paused",
+    "unknown": "Unknown"
+  },
+  "monitor": {
+    "manual_override": "manual",
+    "uptime_window_24h": "24h"
+  },
+  "toolbar": {
+    "view_cards": "Cards",
+    "view_table": "Table",
+    "view_split": "Split",
+    "group_by": "Group by",
+    "density": "Density",
+    "group_site": "Site",
+    "group_stage": "Stage",
+    "group_location": "Location",
+    "group_status": "Status",
+    "group_flat": "Flat (no grouping)",
+    "density_compact": "Compact",
+    "density_cozy": "Cozy",
+    "density_spacious": "Spacious",
+    "visibility": "Show / hide sections",
+    "visibility_title": "Show columns & sections",
+    "toggle_timelines": "Timelines",
+    "toggle_uptime_24h": "24h uptime",
+    "toggle_uptime_all": "All-time uptime",
+    "toggle_services": "Services in host",
+    "toggle_paused": "Paused monitors",
+    "toggle_unknown": "Unknown monitors",
+    "refresh": "Refresh now"
+  },
+  "host": {
+    "standalone": "Standalone host",
+    "service_one": "{{count}} service",
+    "service_other": "{{count}} services",
+    "uptime_24h": "24h {{value}}%",
+    "uptime_all": "all-time {{value}}%",
+    "host_monitor": "Host monitor"
+  },
+  "group": {
+    "offline_count_one": "{{count}} offline",
+    "offline_count_other": "{{count}} offline",
+    "summary": "{{hosts}} hosts · {{services}} services"
+  },
+  "table": {
+    "name": "Name",
+    "type": "Type",
+    "location": "Location",
+    "host": "Host",
+    "status": "Status",
+    "uptime_24h": "24h",
+    "uptime_all": "All-time",
+    "timeline": "Timeline"
+  },
+  "split": {
+    "select_title": "Select a row",
+    "select_hint": "Click an entry on the left to see its timeline + services."
+  },
+  "empty": {
+    "title": "No monitors match the current filters.",
+    "hint": "Try enabling paused/unknown items or check the monitor registry."
+  },
+  "timeline": {
+    "now": "now"
+  },
+  "time": {
+    "seconds_ago": "{{value}}s ago",
+    "minutes_ago": "{{value}}min ago",
+    "hours_ago": "{{value}}h ago",
+    "days_ago_one": "{{count}} day ago",
+    "days_ago_other": "{{count}} days ago"
+  }
+}
