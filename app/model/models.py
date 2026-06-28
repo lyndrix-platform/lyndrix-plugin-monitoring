@@ -25,6 +25,9 @@ class MonitorType(str, Enum):
 
 class MonitorRecord(Base):
     __tablename__ = "monitoring_monitors"
+    # Tolerate the model module being imported via more than one path during
+    # plugin load (shared Base.metadata) instead of aborting load_module.
+    __table_args__ = {"extend_existing": True}
 
     monitor_id = Column(String(191), primary_key=True)
     name = Column(String(255), nullable=False)
@@ -55,6 +58,7 @@ class MonitorRecord(Base):
 
 class MonitorHeartbeat(Base):
     __tablename__ = "monitoring_heartbeats"
+    __table_args__ = {"extend_existing": True}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     monitor_id = Column(String(191), nullable=False, index=True)
@@ -67,6 +71,7 @@ class MonitorHeartbeat(Base):
 
 class MonitorDailyAggregate(Base):
     __tablename__ = "monitoring_daily_aggregates"
+    __table_args__ = {"extend_existing": True}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     monitor_id = Column(String(191), nullable=False, index=True)

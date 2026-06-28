@@ -21,6 +21,40 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
     async def dashboard_data(identity: ApiIdentity = Depends(require_permission("api:read"))):
         return {"monitors": service.list_monitors(), "stats": service.stats()}
 
+    @router.get("/overview")
+    async def overview(
+        group_by: str = "site",
+        hours: int = 24,
+        include_paused: bool = True,
+        include_unknown: bool = True,
+        identity: ApiIdentity = Depends(require_permission("api:read")),
+    ):
+        """Computed overview for the React UI.
+
+        Reuses the pure NiceGUI helpers (``build_grouped_overview`` /
+        ``flatten_monitors``) so the React client renders the SAME grouped
+        and flattened data the in-process NiceGUI dashboard does — no
+        business logic lives in the frontend.
+        """
+        from .helpers import build_grouped_overview, flatten_monitors
+
+        monitors = service.list_monitors()
+        histories = service.get_histories([m["monitor_id"] for m in monitors], hours)
+        groups = build_grouped_overview(
+            monitors,
+            histories,
+            group_by=group_by,
+            include_paused=include_paused,
+            include_unknown=include_unknown,
+        )
+        rows = flatten_monitors(
+            monitors,
+            histories,
+            include_paused=include_paused,
+            include_unknown=include_unknown,
+        )
+        return {"groups": groups, "rows": rows, "stats": service.stats(), "hours": hours}
+
     @router.get("/monitors/{monitor_id}")
     async def get_monitor(
         monitor_id: str,

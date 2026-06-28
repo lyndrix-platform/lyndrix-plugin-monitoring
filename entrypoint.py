@@ -45,7 +45,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="0.1.0",
+    version="0.2.0",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -53,6 +53,7 @@ manifest = ModuleManifest(
     min_core_version="0.1.1",
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-monitoring",
+    i18n_namespace="monitoring",
     ui_route="/monitoring",
     react_ui=True,
     react_routes=[
