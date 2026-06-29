@@ -481,8 +481,8 @@ function HostCard({ host, prefs }: { host: Host; prefs: Prefs }) {
   const pad = DENSITY_PAD[prefs.density]
   return (
     <div
+      className="lx-card"
       style={{
-        ...GLASS,
         borderRadius: 'var(--lx-radius-md)',
         overflow: 'hidden',
         display: 'flex',
@@ -512,7 +512,8 @@ function HostCardDetail({ host, prefs }: { host: Host; prefs: Prefs }) {
   return (
     <div
       id="lx-mon-detail"
-      style={{ ...GLASS, borderRadius: 'var(--lx-radius-md)', overflow: 'hidden', display: 'flex', flexDirection: 'column', width: '100%' }}
+      className="lx-card"
+      style={{ borderRadius: 'var(--lx-radius-md)', overflow: 'hidden', display: 'flex', flexDirection: 'column', width: '100%' }}
     >
       <div style={{ height: 4, width: '100%', background: color, boxShadow: `0 0 18px ${color}66` }} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16, padding: 20, width: '100%' }}>
@@ -592,7 +593,7 @@ function GroupHeader({ group, prefs }: { group: Group; prefs: Prefs }) {
 
 function EmptyCard({ title, hint }: { title: string; hint?: string }) {
   return (
-    <div style={{ ...GLASS, borderRadius: 'var(--lx-radius-md)', padding: '2rem', textAlign: 'center', width: '100%' }}>
+    <div className="lx-card" style={{ borderRadius: 'var(--lx-radius-md)', padding: '2rem', textAlign: 'center', width: '100%' }}>
       <div style={{ fontSize: '2.5rem', opacity: 0.4, marginBottom: 8 }}>📡</div>
       <div style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--lx-text)' }}>{title}</div>
       {hint && <div style={{ fontSize: '0.85rem', color: 'var(--lx-text-muted)', marginTop: 4 }}>{hint}</div>}
@@ -691,7 +692,7 @@ function TableView({ rows, prefs }: { rows: Row[]; prefs: Prefs }) {
   const arrow = (key: SortKey) => (key === sortKey ? (sortDir === 1 ? ' ▲' : ' ▼') : '')
 
   return (
-    <div style={{ ...GLASS, borderRadius: 'var(--lx-radius-md)', overflowX: 'auto', width: '100%' }}>
+    <div className="lx-card" style={{ borderRadius: 'var(--lx-radius-md)', overflowX: 'auto', width: '100%' }}>
       <table style={{ width: '100%', minWidth: 720, borderCollapse: 'collapse' }}>
         <thead>
           <tr>
@@ -779,7 +780,7 @@ function SplitView({ rows, groups, prefs }: { rows: Row[]; groups: Group[]; pref
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 420px) 1fr', gap: 16, width: '100%' }} className="lx-mon-split">
       {/* Left pane: compact selectable list */}
-      <div style={{ ...GLASS, borderRadius: 'var(--lx-radius-md)', overflowX: 'auto', alignSelf: 'start' }}>
+      <div className="lx-card" style={{ borderRadius: 'var(--lx-radius-md)', overflowX: 'auto', alignSelf: 'start' }}>
         <table style={{ width: '100%', minWidth: 360, borderCollapse: 'collapse' }}>
           <thead>
             <tr>
@@ -918,7 +919,7 @@ function Toolbar({
   const labelStyle: CSSProperties = { fontSize: '0.62rem', textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--lx-text-muted)', fontWeight: 700 }
 
   return (
-    <div style={{ ...GLASS, borderRadius: 'var(--lx-radius-md)', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+    <div className="lx-card" style={{ borderRadius: 'var(--lx-radius-md)', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
       {/* View-mode segmented control */}
       <div style={{ display: 'inline-flex', gap: 4, padding: 4, borderRadius: 'var(--lx-radius-sm)', background: 'color-mix(in srgb, var(--lx-text-muted) 8%, transparent)', border: '1px solid var(--lx-border-soft)' }}>
         {viewModes.map((vm) => {
@@ -1037,7 +1038,7 @@ function HeaderCard({ stats }: { stats: Stats | null }) {
     { key: 'uptime_all', label: t('hstat.uptime', { defaultValue: 'Uptime' }), color: 'var(--lx-accent-2)', pct: true },
   ]
   return (
-    <div style={{ ...GLASS, borderRadius: 'var(--lx-radius-lg, var(--lx-radius-md))', overflow: 'hidden', width: '100%' }}>
+    <div className="lx-card" style={{ borderRadius: 'var(--lx-radius-lg, var(--lx-radius-md))', overflow: 'hidden', width: '100%' }}>
       <div style={{ height: 4, width: '100%', background: 'linear-gradient(90deg, var(--lx-accent), var(--lx-accent-2), var(--lx-accent-3))' }} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16, padding: '24px' }}>
         <div>
@@ -1054,8 +1055,8 @@ function HeaderCard({ stats }: { stats: Stats | null }) {
           {items.map((it) => (
             <div
               key={it.key}
+              className="lx-card"
               style={{
-                ...GLASS,
                 borderRadius: 'var(--lx-radius-md)',
                 padding: '14px',
                 display: 'flex',
