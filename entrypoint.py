@@ -14,7 +14,7 @@ from nicegui import ui
 from core.api import ModuleManifest
 
 from .app.controller.api import build_plugin_router
-from .app.model.models import AdminOverride, InventorySyncPayload, MonitorUpsert, PassiveResult
+from .app.model.models import AdminOverride, MonitorUpsert, PassiveResult
 from .app.controller.service import MonitoringService
 from .app.ui.overview import render_overview_ui as _render_overview_ui
 from .app.ui.settings import render_settings_ui as _render_settings_ui
@@ -68,7 +68,6 @@ manifest = ModuleManifest(
         "subscribe": [
             "db:connected",
             "monitoring:config_upsert",
-            "monitoring:inventory_sync",
             "monitoring:passive_result",
             "monitoring:admin_override",
         ],
@@ -159,13 +158,6 @@ def setup(ctx):
             await asyncio.to_thread(service.apply_admin_override, AdminOverride(**payload))
         except Exception as exc:
             ctx.log.error(f"State Monitoring: admin override failed: {exc}")
-
-    @ctx.subscribe("monitoring:inventory_sync")
-    async def on_inventory_sync(payload):
-        try:
-            service.queue_inventory_sync(InventorySyncPayload(**payload))
-        except Exception as exc:
-            ctx.log.error(f"State Monitoring: inventory sync failed: {exc}")
 
     @ui.page("/monitoring")
     @main_layout("State Monitoring", wide=True)
