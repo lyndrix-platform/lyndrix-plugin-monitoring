@@ -59,13 +59,17 @@ def timeline_html(timeline: List[str], size: str = "full") -> str:
         hour_label = f"-{total - index}h"
         height = heights.get(state, unknown_height)
         color = state_color(state)
+        # BUG FIX: was `box-shadow:0 0 6px {color}22` — appending a hex-alpha
+        # suffix directly onto a `var(...)` reference is invalid CSS.
+        # color-mix() applies the alpha correctly to the custom-property colour.
+        glow = f"color-mix(in srgb, {color} 13%, transparent)"
         bars.append(
             f'<div title="{hour_label}: {state}" style="'
             f'height:{height}px;'
             f'border-radius:{radius};'
             f'background:{color};'
             f'opacity:0.95;'
-            f'box-shadow:0 0 6px {color}22;'
+            f'box-shadow:0 0 6px {glow};'
             f'align-self:end;'
             f'"></div>'
         )
@@ -104,7 +108,17 @@ def timeline_scale_html(hours: int = 24, size: str = "full") -> str:
     labels = []
     for i in range(hours):
         is_tick = i in tick_positions
-        tick_color = "rgba(var(--lx-text-muted-raw,161,161,170),0.7)" if is_tick else "rgba(82,82,91,0.25)"
+        # BUG FIX: `--lx-text-muted-raw` does not exist anywhere in the token
+        # contract (lyndrix-ui/src/index.css / theme.py), so this always fell
+        # through to the literal (161,161,170) fallback and never themed.
+        # color-mix() lets us apply alpha to the real `--lx-text-muted` token
+        # directly; the non-tick colour is likewise derived from it instead of
+        # a hardcoded grey literal.
+        tick_color = (
+            "color-mix(in srgb, var(--lx-text-muted) 70%, transparent)"
+            if is_tick
+            else "color-mix(in srgb, var(--lx-text-muted) 25%, transparent)"
+        )
         ticks.append(
             f'<div style="'
             f'width:1px;'

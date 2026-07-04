@@ -18,11 +18,11 @@ def render_group_header(group: Dict[str, Any], prefs: MonitoringPrefs) -> None:
     if group.get("name") is None:
         return
     with ui.row().classes(
-        "w-full items-center gap-3 border-b border-slate-200/60 dark:border-zinc-800 pb-2"
+        "w-full items-center gap-3 border-b border-[var(--lx-border-soft)] pb-2"
     ):
-        ui.icon(group.get("icon", "domain"), size="22px").classes("text-slate-400")
+        ui.icon(group.get("icon", "domain"), size="22px").classes("text-[var(--lx-text-muted)]")
         ui.label(str(group["name"])).classes(
-            "text-lg font-black tracking-wider text-slate-800 dark:text-slate-200 truncate"
+            "text-lg font-black tracking-wider text-[var(--lx-text)] truncate"
         )
         ui.label(
             f"{group['host_count']} hosts · {group['service_count']} services"

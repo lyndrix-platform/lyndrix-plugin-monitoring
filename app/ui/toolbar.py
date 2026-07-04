@@ -57,10 +57,15 @@ def render_toolbar(
 
         def _view_btn_cls(value: str) -> str:
             is_active = prefs.view_mode == value
+            # Active: the shared `lx-badge--accent` modifier (colour/background/
+            # border-color off `--lx-accent`, defined once in core's theme.py)
+            # + the `border` utility for width. Inactive: plain muted/full text
+            # tokens — no dark: variant needed since NiceGUI resolves --lx-* per
+            # session (see theme.py _apply_style_overrides).
             return (
                 "px-2.5 py-1 rounded-md text-xs font-bold "
-                + ("bg-cyan-500/15 text-cyan-300 border border-cyan-500/30"
-                   if is_active else "text-slate-500 dark:text-zinc-400 hover:text-slate-800 dark:hover:text-zinc-100")
+                + ("border lx-badge--accent"
+                   if is_active else "text-[var(--lx-text-muted)] hover:text-[var(--lx-text)]")
             )
 
         def _select_view(value: str) -> None:
@@ -71,8 +76,8 @@ def render_toolbar(
                 btn.classes(replace=_view_btn_cls(v))
 
         with ui.row().classes("items-center gap-1 p-1 rounded-lg "
-                              "bg-slate-100 dark:bg-zinc-900/60 "
-                              "border border-slate-200 dark:border-zinc-800"):
+                              "bg-[var(--lx-elevated)] "
+                              "border border-[var(--lx-border-soft)]"):
             for value, label, icon in _VIEW_MODE_LABELS:
                 view_buttons[value] = ui.button(
                     label, icon=icon,
@@ -118,7 +123,7 @@ def render_toolbar(
 
 def _switch_row(label: str, prefs: MonitoringPrefs, field: str, setter: Callable[[str, object], None]) -> None:
     with ui.row().classes("w-full items-center justify-between gap-3"):
-        ui.label(label).classes("text-xs text-slate-700 dark:text-zinc-200")
+        ui.label(label).classes("text-xs text-[var(--lx-text)]")
         ui.switch(value=bool(getattr(prefs, field)),
                   on_change=lambda e, f=field: setter(f, bool(e.value))) \
             .props("dense color=cyan")

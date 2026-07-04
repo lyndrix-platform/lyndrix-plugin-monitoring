@@ -150,8 +150,8 @@ function stateColor(state: string): string {
 
 const GLASS: CSSProperties = {
   background: 'var(--lx-surface-glass, var(--lx-surface))',
-  backdropFilter: 'blur(16px) saturate(160%)',
-  WebkitBackdropFilter: 'blur(16px) saturate(160%)',
+  backdropFilter: 'blur(var(--lx-blur-md)) saturate(var(--lx-glass-saturate))',
+  WebkitBackdropFilter: 'blur(var(--lx-blur-md)) saturate(var(--lx-glass-saturate))',
   border: '1px solid var(--lx-glass-border, var(--lx-border-soft))',
 }
 
@@ -234,7 +234,11 @@ function Timeline({ states, size }: { states: MonitorState[]; size: TimelineSize
               borderRadius: cfg.radius,
               background: color,
               opacity: 0.95,
-              boxShadow: `0 0 6px ${color}22`,
+              // BUG FIX: was `0 0 6px ${color}22` — appending a hex-alpha
+              // suffix directly onto a `var(...)` reference is invalid CSS.
+              // color-mix() is the correct way to apply alpha to a
+              // custom-property colour (mirrors app/ui/timeline.py).
+              boxShadow: `0 0 6px color-mix(in srgb, ${color} 13%, transparent)`,
               alignSelf: 'end',
             }}
           />
@@ -270,9 +274,15 @@ function TimelineScale({ size, hours = 24 }: { size: TimelineSize; hours?: numbe
           width: 1,
           height: cfg.tickHeight,
           margin: '0 auto',
+          // BUG FIX: `--lx-text-muted-raw` does not exist anywhere in the
+          // token contract, so this always fell through to the literal
+          // (161,161,170) fallback and never themed. color-mix() applies
+          // alpha to the real `--lx-text-muted` token directly; the
+          // non-tick colour is likewise derived from it instead of a
+          // hardcoded grey literal (mirrors app/ui/timeline.py).
           background: isTick
-            ? 'rgba(var(--lx-text-muted-raw,161,161,170),0.7)'
-            : 'rgba(82,82,91,0.25)',
+            ? 'color-mix(in srgb, var(--lx-text-muted) 70%, transparent)'
+            : 'color-mix(in srgb, var(--lx-text-muted) 25%, transparent)',
         }}
       />,
     )
@@ -328,7 +338,7 @@ function StateBadge({ state, small }: { state: MonitorState; small?: boolean }) 
         color,
         background: `color-mix(in srgb, ${color} 12%, transparent)`,
         border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
-        borderRadius: '999px',
+        borderRadius: 'var(--lx-radius-full)',
         padding: small ? '1px 6px' : '2px 8px',
         letterSpacing: '0.16em',
         textTransform: 'uppercase',
@@ -345,9 +355,9 @@ function StateBadge({ state, small }: { state: MonitorState; small?: boolean }) 
 // ─── Density tokens ─────────────────────────────────────────────────────────────
 
 const DENSITY_PAD: Record<Density, { padding: string; gap: number }> = {
-  compact: { padding: '8px', gap: 6 },
-  cozy: { padding: '16px', gap: 12 },
-  spacious: { padding: '20px', gap: 16 },
+  compact: { padding: 'calc(var(--lx-space-unit) * 2)', gap: 6 },
+  cozy: { padding: 'calc(var(--lx-space-unit) * 4)', gap: 12 },
+  spacious: { padding: 'calc(var(--lx-space-unit) * 5)', gap: 16 },
 }
 const DENSITY_TITLE: Record<Density, string> = {
   compact: '0.875rem',
@@ -393,7 +403,7 @@ function ServicesInline({ host, prefs }: { host: Host; prefs: Prefs }) {
             {svc.display_name}
           </span>
           {prefs.show_uptime_24h && (
-            <span style={{ fontSize: '0.68rem', fontFamily: 'monospace', color: 'var(--lx-text-muted)', flexShrink: 0 }}>
+            <span style={{ fontSize: '0.68rem', fontFamily: 'var(--lx-font-mono)', color: 'var(--lx-text-muted)', flexShrink: 0 }}>
               {fmtPct(svc.uptime_24h)}%
             </span>
           )}
@@ -425,7 +435,7 @@ function HostHeader({ host, prefs }: { host: Host; prefs: Prefs }) {
             <span
               style={{
                 fontSize: '0.72rem',
-                fontFamily: 'monospace',
+                fontFamily: 'var(--lx-font-mono)',
                 color: 'var(--lx-text-muted)',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
@@ -442,7 +452,7 @@ function HostHeader({ host, prefs }: { host: Host; prefs: Prefs }) {
                 textTransform: 'uppercase',
                 letterSpacing: '0.16em',
                 padding: '1px 7px',
-                borderRadius: '999px',
+                borderRadius: 'var(--lx-radius-full)',
                 background: 'color-mix(in srgb, var(--lx-text-muted) 12%, transparent)',
                 border: '1px solid var(--lx-border-soft)',
                 color: 'var(--lx-text-muted)',
@@ -490,7 +500,7 @@ function HostCard({ host, prefs }: { host: Host; prefs: Prefs }) {
         minWidth: 0,
       }}
     >
-      <div style={{ height: 4, width: '100%', background: color, boxShadow: `0 0 18px ${color}66` }} />
+      <div style={{ height: 4, width: '100%', background: color, boxShadow: `0 0 18px color-mix(in srgb, ${color} 40%, transparent)` }} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: pad.gap, padding: pad.padding, width: '100%' }}>
         <HostHeader host={host} prefs={prefs} />
         <HostMeta host={host} prefs={prefs} />
@@ -515,7 +525,7 @@ function HostCardDetail({ host, prefs }: { host: Host; prefs: Prefs }) {
       className="lx-card"
       style={{ borderRadius: 'var(--lx-radius-md)', overflow: 'hidden', display: 'flex', flexDirection: 'column', width: '100%' }}
     >
-      <div style={{ height: 4, width: '100%', background: color, boxShadow: `0 0 18px ${color}66` }} />
+      <div style={{ height: 4, width: '100%', background: color, boxShadow: `0 0 18px color-mix(in srgb, ${color} 40%, transparent)` }} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16, padding: 20, width: '100%' }}>
         <HostHeader host={host} prefs={prefs} />
         <HostMeta host={host} prefs={prefs} />
@@ -530,7 +540,7 @@ function HostCardDetail({ host, prefs }: { host: Host; prefs: Prefs }) {
             </span>
             <StateBadge state={host.host_monitor.state} small />
             {host.host_monitor.target && (
-              <span style={{ fontSize: '0.72rem', fontFamily: 'monospace', color: 'var(--lx-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <span style={{ fontSize: '0.72rem', fontFamily: 'var(--lx-font-mono)', color: 'var(--lx-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {host.host_monitor.target}
               </span>
             )}
@@ -723,15 +733,15 @@ function TableView({ rows, prefs }: { rows: Row[]; prefs: Prefs }) {
               <td style={{ ...cellStyle, fontWeight: 700 }}>{row.name}</td>
               <td style={{ ...cellStyle, color: 'var(--lx-text-muted)' }}>{row.type}</td>
               <td style={{ ...cellStyle, color: 'var(--lx-text-muted)' }}>{row.location}</td>
-              <td style={{ ...cellStyle, fontFamily: 'monospace', color: 'var(--lx-text-muted)' }}>{row.host}</td>
+              <td style={{ ...cellStyle, fontFamily: 'var(--lx-font-mono)', color: 'var(--lx-text-muted)' }}>{row.host}</td>
               <td style={cellStyle}>
                 <StateBadge state={row.state} small />
               </td>
               {prefs.show_uptime_24h && (
-                <td style={{ ...cellStyle, textAlign: 'right', fontFamily: 'monospace' }}>{fmtPct(row.uptime_24h)}%</td>
+                <td style={{ ...cellStyle, textAlign: 'right', fontFamily: 'var(--lx-font-mono)' }}>{fmtPct(row.uptime_24h)}%</td>
               )}
               {prefs.show_uptime_all && (
-                <td style={{ ...cellStyle, textAlign: 'right', fontFamily: 'monospace' }}>{fmtPct(row.uptime_all)}%</td>
+                <td style={{ ...cellStyle, textAlign: 'right', fontFamily: 'var(--lx-font-mono)' }}>{fmtPct(row.uptime_all)}%</td>
               )}
               {prefs.show_timelines && (
                 <td style={{ ...cellStyle, minWidth: 160 }}>
@@ -827,13 +837,13 @@ function SplitView({ rows, groups, prefs }: { rows: Row[]; groups: Group[]; pref
                   >
                     {row.name}
                   </td>
-                  <td style={{ fontSize: rowCss.fontSize, fontFamily: 'monospace', color: 'var(--lx-text-muted)', padding: rowCss.padding, borderTop: '1px solid var(--lx-border-soft)', whiteSpace: 'nowrap' }}>
+                  <td style={{ fontSize: rowCss.fontSize, fontFamily: 'var(--lx-font-mono)', color: 'var(--lx-text-muted)', padding: rowCss.padding, borderTop: '1px solid var(--lx-border-soft)', whiteSpace: 'nowrap' }}>
                     {row.host}
                   </td>
                   <td style={{ padding: rowCss.padding, borderTop: '1px solid var(--lx-border-soft)' }}>
                     <StateBadge state={row.state} small />
                   </td>
-                  <td style={{ fontSize: rowCss.fontSize, fontFamily: 'monospace', color: 'var(--lx-text-muted)', padding: rowCss.padding, borderTop: '1px solid var(--lx-border-soft)', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                  <td style={{ fontSize: rowCss.fontSize, fontFamily: 'var(--lx-font-mono)', color: 'var(--lx-text-muted)', padding: rowCss.padding, borderTop: '1px solid var(--lx-border-soft)', textAlign: 'right', whiteSpace: 'nowrap' }}>
                     {fmtPct(row.uptime_24h)}%
                   </td>
                 </tr>
@@ -992,8 +1002,8 @@ function Toolbar({
               borderRadius: 'var(--lx-radius-md)',
               background: 'var(--lx-elevated, var(--lx-surface))',
               border: '1px solid var(--lx-glass-border, var(--lx-border-soft))',
-              backdropFilter: 'blur(16px) saturate(160%)',
-              WebkitBackdropFilter: 'blur(16px) saturate(160%)',
+              backdropFilter: 'blur(var(--lx-blur-md)) saturate(var(--lx-glass-saturate))',
+              WebkitBackdropFilter: 'blur(var(--lx-blur-md)) saturate(var(--lx-glass-saturate))',
               boxShadow: 'var(--lx-glow, 0 8px 30px rgba(0,0,0,0.35))',
             }}
           >

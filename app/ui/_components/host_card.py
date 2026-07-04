@@ -19,7 +19,7 @@ from nicegui import ui
 from core.api import UIStyles
 
 from ..prefs import MonitoringPrefs
-from ..styles import state_badge_classes, state_card_classes, state_strip_style
+from ..styles import state_badge_classes, state_card_style, state_strip_style
 from ..timeline import timeline_html, timeline_scale_html
 
 # Density → inner padding/gap classes
@@ -48,7 +48,7 @@ def _header_row(host: Dict[str, Any], prefs: MonitoringPrefs) -> None:
         with ui.column().classes("gap-0 min-w-0 flex-1"):
             ui.label(host["name"]).classes(
                 f"{_title_size(prefs.density)} font-black "
-                "text-slate-900 dark:text-zinc-50 truncate"
+                "text-[var(--lx-text)] truncate"
             )
             with ui.row().classes("items-center gap-2 min-w-0"):
                 if host.get("address"):
@@ -58,8 +58,9 @@ def _header_row(host: Dict[str, Any], prefs: MonitoringPrefs) -> None:
                 if host.get("stage") and host["stage"] != "General":
                     ui.label(host["stage"]).classes(
                         "text-[10px] uppercase tracking-[0.18em] px-1.5 py-0.5 rounded-full "
-                        "bg-slate-500/10 text-slate-500 dark:text-slate-300 "
-                        "border border-slate-500/20 shrink-0"
+                        "bg-[color-mix(in_srgb,var(--lx-text-muted)_12%,transparent)] "
+                        "text-[var(--lx-text-muted)] "
+                        "border border-[var(--lx-border-soft)] shrink-0"
                     )
         ui.label(host["state"]).classes(
             f"text-[10px] uppercase tracking-[0.2em] px-2 py-0.5 rounded-full shrink-0 "
@@ -91,11 +92,10 @@ def _services_inline(host: Dict[str, Any], prefs: MonitoringPrefs) -> None:
     with ui.column().classes("w-full gap-1.5"):
         for svc in host["services"]:
             with ui.row().classes(
-                "w-full items-center gap-2 border-t border-slate-200/40 "
-                "dark:border-zinc-800/60 pt-1.5"
+                "w-full items-center gap-2 border-t border-[var(--lx-border-soft)] pt-1.5"
             ):
                 ui.label(svc["display_name"]).classes(
-                    "text-xs font-bold text-slate-800 dark:text-zinc-100 truncate flex-1"
+                    "text-xs font-bold text-[var(--lx-text)] truncate flex-1"
                 )
                 if prefs.show_uptime_24h:
                     ui.label(f"{svc['uptime_24h']:.1f}%").classes(
@@ -110,10 +110,9 @@ def _services_inline(host: Dict[str, Any], prefs: MonitoringPrefs) -> None:
 def render_host_card(host: Dict[str, Any], prefs: MonitoringPrefs) -> None:
     """Compact host card for the Cards view."""
     with ui.card().classes(
-        f"flex flex-col gap-0 border {state_card_classes(host['state'])} "
-        "bg-white/60 dark:bg-white/[0.03] backdrop-blur-sm "
-        "hover:border-indigo-500/40 transition-all"
-    ).style("padding:0; flex-wrap:nowrap; min-width:0"):
+        "flex flex-col gap-0 lx-card "
+        "hover:border-[color-mix(in_srgb,var(--lx-accent)_40%,transparent)] transition-all"
+    ).style(f"padding:0; flex-wrap:nowrap; min-width:0; {state_card_style(host['state'])}"):
         ui.element("div").style(state_strip_style(host["state"]))
         with ui.column().classes(f"w-full flex-grow {_pad(prefs.density)}"):
             _header_row(host, prefs)
@@ -130,9 +129,8 @@ def render_host_card(host: Dict[str, Any], prefs: MonitoringPrefs) -> None:
 def render_host_card_detail(host: Dict[str, Any], prefs: MonitoringPrefs) -> None:
     """Expanded host card for the Split view's right pane (full-size timeline + services)."""
     with ui.card().props('id="lx-mon-detail"').classes(
-        f"flex flex-col gap-0 border {state_card_classes(host['state'])} "
-        "bg-white/60 dark:bg-white/[0.03] backdrop-blur-sm w-full"
-    ).style("padding:0; flex-wrap:nowrap; min-width:0"):
+        "flex flex-col gap-0 lx-card w-full"
+    ).style(f"padding:0; flex-wrap:nowrap; min-width:0; {state_card_style(host['state'])}"):
         ui.element("div").style(state_strip_style(host["state"]))
         with ui.column().classes("w-full flex-grow p-5 gap-4"):
             _header_row(host, prefs)
@@ -154,5 +152,5 @@ def render_host_card_detail(host: Dict[str, Any], prefs: MonitoringPrefs) -> Non
                             UIStyles.TEXT_MUTED + " text-xs font-mono truncate"
                         )
             if host.get("services"):
-                ui.separator().classes("border-slate-200/60 dark:border-white/5")
+                ui.separator().classes("border-[var(--lx-border-soft)]")
                 _services_inline(host, prefs)
