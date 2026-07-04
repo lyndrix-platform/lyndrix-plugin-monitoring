@@ -41,12 +41,15 @@ async def render_monitoring_page(ctx, svc):
                 with ui.element("div").classes(
                     "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 w-full gap-2 sm:gap-3"
                 ):
+                    # Colour mapping mirrors the React HeaderCard (src/ui/PluginApp.tsx)
+                    # exactly, so both stacks converge on the same --lx-* tokens instead
+                    # of drifting Tailwind literals.
                     for label, key, accent_cls in [
-                        ("Monitors", "monitor_count", "text-cyan-300 dark:text-cyan-300"),
-                        ("Up",       "up_count",      "text-emerald-400"),
-                        ("Down",     "down_count",    "text-rose-400"),
-                        ("Paused",   "paused_count",  "text-amber-400"),
-                        ("Uptime",   "uptime_all",    "text-sky-300 dark:text-sky-300"),
+                        ("Monitors", "monitor_count", "text-[var(--lx-accent)]"),
+                        ("Up",       "up_count",      "text-[var(--lx-state-up)]"),
+                        ("Down",     "down_count",    "text-[var(--lx-state-down)]"),
+                        ("Paused",   "paused_count",  "text-[var(--lx-state-paused)]"),
+                        ("Uptime",   "uptime_all",    "text-[var(--lx-accent-2)]"),
                     ]:
                         with ui.card().classes(
                             UIStyles.CARD_BASE
@@ -70,7 +73,7 @@ async def render_monitoring_page(ctx, svc):
     # Loading spinner placeholder until first fetch resolves.
     with data_container:
         with ui.column().classes("w-full items-center justify-center py-16 sm:py-24 gap-4"):
-            ui.spinner("dots", size="xl").classes("text-cyan-400")
+            ui.spinner("dots", size="xl").classes("text-[var(--lx-accent)]")
             ui.label("Loading monitors…").classes(UIStyles.TEXT_MUTED)
 
     def _rerender() -> None:

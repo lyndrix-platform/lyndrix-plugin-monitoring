@@ -107,30 +107,30 @@ def render_settings_ui(ctx, service: MonitoringService):
                 "grid grid-cols-1 sm:grid-cols-2 w-full gap-3 sm:gap-4"
             ):
                 ui.input("Monitor ID").bind_value(form_state, "monitor_id") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
                 ui.input("Display Name").bind_value(form_state, "name") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
                 ui.select(
                     [t.value for t in MonitorType],
                     value=MonitorType.HTTP.value,
                     label="Probe Type",
-                ).bind_value(form_state, "monitor_type").props("outlined dark").classes("w-full")
+                ).bind_value(form_state, "monitor_type").props("outlined").classes("w-full")
                 ui.input("Logical Group").bind_value(form_state, "logical_group") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
                 ui.input("Target URL / Host").bind_value(form_state, "target") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
                 ui.input("Address / IP").bind_value(form_state, "address") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
                 ui.input("Host Name").bind_value(form_state, "host_name") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
                 ui.input("Service Name").bind_value(form_state, "service_name") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
                 ui.number("Interval (s)", min=10, max=3600, value=60) \
                     .bind_value(form_state, "interval_seconds") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
                 ui.number("Timeout (s)", min=1, max=60, value=10) \
                     .bind_value(form_state, "timeout_seconds") \
-                    .props("outlined dark").classes("w-full")
+                    .props("outlined").classes("w-full")
 
             with ui.row().classes("w-full items-center justify-between gap-3 flex-wrap mt-1"):
                 with ui.row().classes("gap-4 items-center flex-wrap"):
@@ -148,9 +148,11 @@ def render_settings_ui(ctx, service: MonitoringService):
         with ui.card().classes(UIStyles.CARD_GLASS + " w-full").style(
             "padding: 0; flex-wrap: nowrap"
         ):
-            ui.element("div").classes(
-                "h-1 w-full bg-gradient-to-r from-cyan-400 via-sky-400 to-blue-500"
-            )
+            # Shared `.lx-card-accent` header stripe (was a hand-rolled
+            # `bg-gradient-to-r` div, which core's CSS actually hides on
+            # `.q-card` children — see theme.py's "no top gradient stripes"
+            # rule — so this also restores the visible accent bar).
+            ui.element("div").classes(UIStyles.CARD_ACCENT_INFO)
             with ui.column().classes("w-full p-4 sm:p-6 gap-4"):
                 with ui.row().classes(
                     "w-full justify-between items-start gap-3 flex-wrap"
@@ -201,14 +203,13 @@ def render_settings_ui(ctx, service: MonitoringService):
 
         # ── Danger Zone ──────────────────────────────────────────────────────
         with ui.card().classes(UIStyles.CARD_BASE + " w-full").style(
-            "padding: 0; flex-wrap: nowrap; border-color: rgba(244,63,94,0.25)"
+            "padding: 0; flex-wrap: nowrap; "
+            "border-color: color-mix(in srgb, var(--lx-state-down) 25%, transparent)"
         ):
-            ui.element("div").classes(
-                "h-1 w-full bg-gradient-to-r from-rose-500 via-red-500 to-orange-500"
-            )
+            ui.element("div").classes(UIStyles.CARD_ACCENT_DANGER)
             with ui.column().classes("w-full p-4 sm:p-6 gap-4"):
                 with ui.row().classes("items-center gap-3"):
-                    ui.icon("warning", size="22px").classes("text-rose-400 shrink-0")
+                    ui.icon("warning", size="22px").classes("text-[var(--lx-state-down)] shrink-0")
                     with ui.column().classes("gap-0"):
                         ui.label("Danger Zone").classes(UIStyles.TITLE_H3)
                         ui.label("Irreversible actions — proceed with caution.").classes(
@@ -217,11 +218,13 @@ def render_settings_ui(ctx, service: MonitoringService):
 
                 with ui.row().classes(
                     "w-full items-start justify-between gap-4 flex-wrap "
-                    "p-3 sm:p-4 bg-rose-500/5 border border-rose-500/20 rounded-xl"
+                    "p-3 sm:p-4 rounded-xl "
+                    "bg-[color-mix(in_srgb,var(--lx-state-down)_5%,transparent)] "
+                    "border border-[color-mix(in_srgb,var(--lx-state-down)_20%,transparent)]"
                 ):
                     with ui.column().classes("gap-0.5 flex-1 min-w-0"):
                         ui.label("Clear states database").classes(
-                            "text-sm font-semibold text-slate-800 dark:text-zinc-200"
+                            "text-sm font-semibold text-[var(--lx-text)]"
                         )
                         ui.label(
                             "Deletes all heartbeat records and daily aggregates. "
@@ -232,14 +235,13 @@ def render_settings_ui(ctx, service: MonitoringService):
                     with ui.dialog() as confirm_dialog, ui.card().classes(
                         UIStyles.MODAL_CONTAINER
                         + " w-full max-w-md p-0 overflow-hidden"
-                        " !border-rose-500/30"
+                    ).style(
+                        "border-color: color-mix(in srgb, var(--lx-state-down) 30%, transparent)"
                     ):
-                        ui.element("div").classes(
-                            "h-1 w-full bg-gradient-to-r from-rose-500 to-red-500"
-                        )
+                        ui.element("div").classes(UIStyles.CARD_ACCENT_DANGER)
                         with ui.column().classes("w-full p-5 sm:p-6 gap-4"):
                             with ui.row().classes("items-center gap-3"):
-                                ui.icon("delete_forever", size="28px").classes("text-rose-400")
+                                ui.icon("delete_forever", size="28px").classes("text-[var(--lx-state-down)]")
                                 ui.label("Confirm: Clear Database").classes(UIStyles.TITLE_H3)
                             ui.label(
                                 "This will permanently delete ALL heartbeat records, "

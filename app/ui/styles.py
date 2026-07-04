@@ -12,34 +12,33 @@ _STATE_ACCENT_VAR = {
     MonitorState.UNKNOWN.value: "var(--lx-state-unknown)",
 }
 
-STATE_STYLES = {
-    MonitorState.UP.value: {
-        "badge": "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30",
-        "card": "border-emerald-500/25 shadow-[0_0_0_1px_rgba(16,185,129,0.08)]",
-    },
-    MonitorState.DOWN.value: {
-        "badge": "bg-rose-500/15 text-rose-300 border border-rose-500/30",
-        "card": "border-rose-500/25 shadow-[0_0_0_1px_rgba(244,63,94,0.08)]",
-    },
-    MonitorState.PAUSED.value: {
-        "badge": "bg-amber-500/15 text-amber-300 border border-amber-500/30",
-        "card": "border-amber-500/25 shadow-[0_0_0_1px_rgba(245,158,11,0.08)]",
-    },
-    MonitorState.UNKNOWN.value: {
-        "badge": "bg-sky-500/15 text-sky-300 border border-sky-500/30",
-        "card": "border-sky-500/25 shadow-[0_0_0_1px_rgba(14,165,233,0.08)]",
-    },
+# Maps MonitorState values to the shared `.lx-badge--{state}` modifier suffix
+# (lowercase), defined once in lyndrix-core's theme.py <style> block and
+# mirrored verbatim in lyndrix-ui/src/index.css, so BOTH GUI stacks resolve
+# state colour off the SAME class family instead of each hand-rolling its own
+# Tailwind palette (the old ``STATE_STYLES`` map this replaces contradicted
+# ``state_color()`` above — a real drift bug, not just a style nit).
+_STATE_CLASS_SUFFIX = {
+    MonitorState.UP.value: "up",
+    MonitorState.DOWN.value: "down",
+    MonitorState.PAUSED.value: "paused",
+    MonitorState.UNKNOWN.value: "unknown",
 }
-
-_DEFAULT_STYLE = STATE_STYLES[MonitorState.UNKNOWN.value]
+_DEFAULT_SUFFIX = _STATE_CLASS_SUFFIX[MonitorState.UNKNOWN.value]
 
 
 def state_badge_classes(state: str) -> str:
-    return STATE_STYLES.get(state, _DEFAULT_STYLE)["badge"]
+    """Tailwind classes for a state pill.
 
-
-def state_card_classes(state: str) -> str:
-    return STATE_STYLES.get(state, _DEFAULT_STYLE)["card"]
+    Combines the shared ``lx-badge--{state}`` modifier (colour/background/
+    border-color driven by ``--lx-state-*`` + ``color-mix()``, defined once
+    in core's theme.py / lyndrix-ui's index.css) with the ``border`` utility
+    for border-width (the modifier itself only sets border-*colour*). Layout
+    (padding/font-size/rounding) stays at the call site so existing pill
+    chrome is unaffected.
+    """
+    suffix = _STATE_CLASS_SUFFIX.get(state, _DEFAULT_SUFFIX)
+    return f"border lx-badge--{suffix}"
 
 
 def state_color(state: str) -> str:
@@ -51,9 +50,29 @@ def state_color(state: str) -> str:
     return _STATE_ACCENT_VAR.get(state, _STATE_ACCENT_VAR[MonitorState.UNKNOWN.value])
 
 
+def state_card_style(state: str) -> str:
+    """Inline style for a state-tinted card border + subtle glow.
+
+    Derived from the same ``--lx-state-*`` token as ``state_color()`` via
+    ``color-mix()`` (replaces the old hardcoded per-state Tailwind
+    ``border-*-500/25`` + literal ``rgba()`` glow in ``STATE_STYLES``, which
+    could never react to a theme change). Apply via ``.style()`` alongside
+    the ``lx-card`` class so it wins over that class's default border-colour.
+    """
+    color = state_color(state)
+    border = f"color-mix(in srgb, {color} 25%, transparent)"
+    glow = f"color-mix(in srgb, {color} 8%, transparent)"
+    return f"border-color:{border};box-shadow:0 0 0 1px {glow}"
+
+
 def state_strip_style(state: str) -> str:
     color = state_color(state)
-    return f"height:4px;width:100%;background:{color};box-shadow:0 0 18px {color}66"
+    # BUG FIX: was `box-shadow:0 0 18px {color}66` — appending a hex-alpha
+    # suffix directly onto a `var(...)` reference is invalid CSS (var() can't
+    # take a suffix). color-mix() is the correct way to apply alpha to a
+    # custom-property colour.
+    glow = f"color-mix(in srgb, {color} 40%, transparent)"
+    return f"height:4px;width:100%;background:{color};box-shadow:0 0 18px {glow}"
 
 
 def aggregate_state(states: List[str]) -> str:
