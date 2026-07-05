@@ -1,10 +1,13 @@
 """SSRF guard for active probers.
 
 Monitors legitimately target internal/private infrastructure, so we do NOT
-block RFC1918 ranges. We do block link-local and cloud-metadata addresses
-(169.254.0.0/16, incl. 169.254.169.254 / fd00:ec2::254) which a monitor target
-should never need to reach, and we restrict outbound HTTP probes to the
-http/https schemes.
+block RFC1918 ranges. We DO block loopback: this plugin runs IN-PROCESS
+inside lyndrix-core, so loopback resolves to the core/Vault/DB process
+itself, never to a legitimate monitored host. We also block link-local and
+cloud-metadata addresses (169.254.0.0/16, incl. 169.254.169.254 /
+fd00:ec2::254), multicast/reserved ranges, and unspecified addresses
+(0.0.0.0 / ::), and we restrict outbound HTTP probes to the http/https
+schemes.
 """
 from __future__ import annotations
 
@@ -20,8 +23,19 @@ class ProbeTargetError(ValueError):
 
 
 def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
-    # Link-local covers the 169.254.0.0/16 IMDS range; also block multicast/reserved.
-    return bool(ip.is_link_local or ip.is_multicast or ip.is_reserved)
+    # Link-local covers the 169.254.0.0/16 IMDS range; also block
+    # multicast/reserved, loopback (the core process itself, since this
+    # plugin runs in-process), and unspecified (0.0.0.0 / ::).
+    # Deliberate trade-off: private ranges stay ALLOWED because monitors
+    # target internal RFC1918 infra; core services on the docker network
+    # remain reachable to monitoring operators — accepted risk.
+    return bool(
+        ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_loopback
+        or ip.is_unspecified
+    )
 
 
 def assert_host_allowed(host: str) -> None:

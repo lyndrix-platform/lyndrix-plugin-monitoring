@@ -24,7 +24,9 @@ async def run_icmp_probe(target: str, timeout_seconds: int) -> Dict[str, Any]:
         return {"state": MonitorState.DOWN, "latency_ms": None, "error_message": "ICMP probe failed"}
     except ModuleNotFoundError:
         process = await asyncio.create_subprocess_exec(
-            "ping", "-c", "1", "-W", str(max(1, timeout_seconds)), target,
+            # "--" stops option parsing so a target like "-I eth0" can't be
+            # interpreted as extra ping flags (argument injection).
+            "ping", "-c", "1", "-W", str(max(1, timeout_seconds)), "--", target,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )

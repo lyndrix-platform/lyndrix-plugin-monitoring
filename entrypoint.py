@@ -74,6 +74,44 @@ manifest = ModuleManifest(
         ],
         "emit": ["monitoring:state_changed", "messaging:outbound"],
     },
+    # Identity 2.0: roles auto-mapped onto groups. Permissions are written
+    # FULLY QUALIFIED (plugin:<id>:api:read / :api:write) rather than the bare
+    # "api:read" / "api:write" strings the router itself checks — a bare
+    # entry here would be passed through verbatim by the role registry's
+    # ``_qualify`` (anything already prefixed with "api:" is treated as
+    # already-qualified) and land as the GLOBAL api:read/write permission,
+    # granting access to every other plugin's bare-permission-gated routes
+    # too. This plugin has no custom_permissions, so operator and admin share
+    # the same permission set; only auto_map_groups differs.
+    roles=[
+        {
+            "id": "viewer",
+            "label": "State Monitoring Viewer",
+            "permissions": ["plugin:lyndrix.plugin.state_monitoring:api:read"],
+            "auto_map_groups": [],
+            "description": "Read-only access to monitors, history, and dashboards.",
+        },
+        {
+            "id": "operator",
+            "label": "State Monitoring Operator",
+            "permissions": [
+                "plugin:lyndrix.plugin.state_monitoring:api:read",
+                "plugin:lyndrix.plugin.state_monitoring:api:write",
+            ],
+            "auto_map_groups": [],
+            "description": "Read/write access: configure monitors, submit results, apply overrides.",
+        },
+        {
+            "id": "admin",
+            "label": "State Monitoring Administrator",
+            "permissions": [
+                "plugin:lyndrix.plugin.state_monitoring:api:read",
+                "plugin:lyndrix.plugin.state_monitoring:api:write",
+            ],
+            "auto_map_groups": ["INT_ADMIN"],
+            "description": "Full control, auto-granted to internal administrators.",
+        },
+    ],
 )
 
 # ---------------------------------------------------------------------------

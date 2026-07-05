@@ -37,7 +37,11 @@ class MonitoringService:
     def __init__(self, ctx):
         self.ctx = ctx
         self.scheduler = SimpleAsyncScheduler()
-        self.http_client = httpx.AsyncClient(follow_redirects=True)
+        # Redirects are followed manually by the http provider (run_http_probe)
+        # so every hop can be re-validated against the SSRF guard — a client
+        # with follow_redirects=True would chase a monitored host's
+        # 302 -> internal/metadata target without ever checking it.
+        self.http_client = httpx.AsyncClient(follow_redirects=False)
         self._scheduler_started = False
         self._probe_semaphore = asyncio.Semaphore(24)
         self._initial_probe_delay_seconds = 8
