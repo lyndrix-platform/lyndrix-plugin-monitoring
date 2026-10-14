@@ -142,6 +142,8 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
         service.reset_probe_state()
         records = await asyncio.to_thread(service._snapshot_records_for_scheduler)
         service.sync_scheduler_jobs_from(records)
+        # The prober may be another instance — it reloads its jobs on this event.
+        service._notify_monitors_changed("maintenance", count=len(records or []))
 
     @router.post("/maintenance/prune")
     async def maintenance_prune(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from sqlalchemy import case, func, text
+from sqlalchemy.exc import OperationalError
 
 from core.api import db_instance
 
@@ -65,6 +66,11 @@ class MonitoringService:
         self._overview_cache_seconds = 10
         # Set by stop(): sweep workers stop taking monitors, housekeeping stops.
         self._stopping = False
+        # Cluster placement: True only on the instance holding the
+        # "monitoring:prober" lease (always True in single mode). Every instance
+        # serves the API; only the prober runs scheduler, sweeps and housekeeping.
+        self._probing = False
+        self._resync_task: Optional[asyncio.Task] = None
         # Decided by _load_probe_candidates(): the sweep only blocks the UI when it
         # has monitors we know nothing about (UNKNOWN or stale) — re-probing a set
         # of persistently DOWN monitors after every restart is not a warm-up.
@@ -113,6 +119,70 @@ class MonitoringService:
         )
         self.scheduler.start()
         self._scheduler_started = True
+
+    # ------------------------------------------------------------------
+    # Cluster placement — exactly one prober (lease "monitoring:prober")
+    # ------------------------------------------------------------------
+
+    @property
+    def is_prober(self) -> bool:
+        return self._probing
+
+    def start_probing(self):
+        """Lease acquired (or single mode / old core): this instance runs the
+        scheduler, the housekeeping jobs and the probe sweeps."""
+        if self._probing:
+            return
+        self._probing = True
+        self._stopping = False
+        if getattr(self.http_client, "is_closed", False):
+            self.http_client = httpx.AsyncClient(follow_redirects=False)
+        self.start()
+        self.queue_bootstrap()
+        self.ctx.log.info("State Monitoring: this instance holds the prober lease — probing here.")
+
+    async def stop_probing(self):
+        """Lease lost (peer took over) — stop every background writer. The API
+        keeps serving reads from the shared DB on this instance."""
+        if not self._probing:
+            return
+        self._probing = False
+        self.ctx.log.warning("State Monitoring: prober lease lost — stopping probes on this instance.")
+        await self.stop()
+
+    def request_resync(self):
+        """A peer changed the monitor set (cluster event): reload scheduler jobs
+        and sweep the new/changed monitors — only meaningful on the prober."""
+        if not self._probing:
+            return
+        if self._resync_task and not self._resync_task.done():
+            return
+        self._resync_task = asyncio.create_task(self._resync_async(), name="monitoring:resync")
+
+    async def _resync_async(self):
+        await asyncio.sleep(0.2)
+        try:
+            records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
+            self.sync_scheduler_jobs_from(records)
+            self._view_cache.clear()
+            self.enqueue_background_probe_refresh()
+        except Exception as exc:
+            self.ctx.log.error(f"State Monitoring: resync after cluster event failed: {exc}")
+
+    def _notify_monitors_changed(self, reason: str, count: Optional[int] = None) -> None:
+        """Tell the other core instances the monitor set changed (``cluster=True``
+        reaches every instance; peers receive it with ``_origin`` set)."""
+        payload = {"reason": reason, "count": count, "instance_id": getattr(self.ctx, "instance_id", None)}
+        try:
+            self.ctx.emit("monitoring:monitors_changed", payload, cluster=True)
+        except TypeError:
+            # Core < 1.7: no cluster flag — local emit only (single instance anyway).
+            try:
+                self.ctx.emit("monitoring:monitors_changed", payload)
+            except Exception:
+                pass
+        except Exception as exc:
+            self.ctx.log.debug(f"State Monitoring: monitors_changed emit failed: {exc}")
 
     # ------------------------------------------------------------------
     # Async-safe probe lifecycle helpers
@@ -266,6 +336,16 @@ class MonitoringService:
             Base.metadata.create_all(bind=db_instance.engine, checkfirst=True)
             self._ensure_schema(db_instance.engine)
 
+    def _ensure_tables_locked(self):
+        """``ensure_tables`` under the core's cross-instance bootstrap lock (core
+        ≥ 1.7) so N instances booting together do not race the DDL."""
+        lock = getattr(db_instance, "advisory_lock", None)
+        if callable(lock):
+            with lock("lyndrix_bootstrap", timeout=60):
+                self.ensure_tables()
+        else:
+            self.ensure_tables()
+
     @staticmethod
     def _ensure_schema(engine) -> None:
         """Hand-rolled, idempotent migration: the composite index that turns the
@@ -299,7 +379,11 @@ class MonitoringService:
     async def _bootstrap_async(self):
         await asyncio.sleep(0.1)
         with suppress(Exception):
-            await asyncio.to_thread(self.ensure_tables)
+            await asyncio.to_thread(self._ensure_tables_locked)
+        if not self._probing:
+            # Standby instance: tables are there, routes serve reads; the prober
+            # (lease holder) owns scheduler, sweeps and housekeeping.
+            return
         await asyncio.sleep(0)
         with suppress(Exception):
             # DB read off the loop; scheduler task-creation stays on the loop.
@@ -312,6 +396,8 @@ class MonitoringService:
         self.enqueue_background_probe_refresh()
 
     def enqueue_background_probe_refresh(self):
+        if not self._probing:
+            return  # only the prober sweeps
         if self._background_probe_task and not self._background_probe_task.done():
             return
         self._background_probe_task = asyncio.create_task(
@@ -478,13 +564,17 @@ class MonitoringService:
             self._pending_inventory_payload = None
             try:
                 async with self.maintenance_window("Importing inventory"):
-                    await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
+                    stats = await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
                 await asyncio.sleep(0)
                 # DB read off the loop; scheduler task-creation stays on the loop.
                 records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
                 self.sync_scheduler_jobs_from(records)
                 await asyncio.sleep(0)
                 self.enqueue_background_probe_refresh()
+                # The prober may be another instance (inventory arrives where the
+                # orchestrator runs) — tell it to reload its jobs.
+                self._notify_monitors_changed("inventory", count=len(records or []))
+                del stats
             except Exception as exc:
                 self.ctx.log.error(f"State Monitoring: inventory sync processing failed: {exc}")
 
@@ -1026,6 +1116,7 @@ class MonitoringService:
             session.refresh(record)
             if sync_scheduler:
                 self._sync_job_for_monitor(record)
+                self._notify_monitors_changed("upsert", count=1)
             return _serialize_monitor(record)
         finally:
             session.close()
@@ -1428,7 +1519,17 @@ class MonitoringService:
                     return
 
             # Phase 3: write result + aggregates in a worker thread.
-            await asyncio.to_thread(self._save_probe_result, monitor_id, state, latency_ms, error_message)
+            try:
+                await asyncio.to_thread(self._save_probe_result, monitor_id, state, latency_ms, error_message)
+            except OperationalError as exc:
+                # 1020 (snapshot isolation: row changed by a concurrent writer —
+                # maintenance on another instance, a lease handover), 1205 lock
+                # wait, 1213 deadlock: drop this sample, the next interval
+                # re-probes. Never let one lost write kill the scheduler job.
+                code = getattr(getattr(exc, "orig", None), "args", [None])[0]
+                if code not in (1020, 1205, 1213):
+                    raise
+                self.ctx.log.debug(f"State Monitoring: probe write for '{monitor_id}' skipped (MariaDB {code}).")
         finally:
             self._inflight_probes.discard(monitor_id)
 

@@ -46,7 +46,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="1.3.0",
+    version="1.4.0",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -109,8 +109,10 @@ manifest = ModuleManifest(
             "monitoring:config_upsert",
             "monitoring:passive_result",
             "monitoring:admin_override",
+            # Cluster: a peer changed the monitor set → the prober reloads its jobs.
+            "monitoring:monitors_changed",
         ],
-        "emit": ["monitoring:state_changed", "messaging:outbound"],
+        "emit": ["monitoring:state_changed", "monitoring:monitors_changed", "messaging:outbound"],
     },
     # Identity 2.0: roles auto-mapped onto groups. Permissions are written
     # FULLY QUALIFIED (plugin:<id>:api:read / :api:write) rather than the bare
@@ -211,22 +213,27 @@ async def health(ctx) -> PluginHealthStatus:
     if svc is None:
         return PluginHealthStatus(status="error", details={"reason": "service_not_initialized"})
 
-    if not getattr(svc, "_scheduler_started", False):
-        return PluginHealthStatus(status="error", details={"reason": "scheduler_not_started"})
+    prober = bool(getattr(svc, "is_prober", True))
+    jobs: list = []
+    if prober:
+        if not getattr(svc, "_scheduler_started", False):
+            return PluginHealthStatus(status="error", details={"reason": "scheduler_not_started"})
 
-    try:
-        jobs = list(svc.scheduler.get_jobs())
-    except Exception as exc:
-        return PluginHealthStatus(
-            status="error",
-            details={"reason": "scheduler_unavailable", "error": str(exc)},
-        )
-    if not jobs:
-        # Started but no jobs at all → the scheduler loop is not alive.
-        return PluginHealthStatus(
-            status="error",
-            details={"reason": "scheduler_no_jobs", "scheduler_started": True},
-        )
+        try:
+            jobs = list(svc.scheduler.get_jobs())
+        except Exception as exc:
+            return PluginHealthStatus(
+                status="error",
+                details={"reason": "scheduler_unavailable", "error": str(exc)},
+            )
+        if not jobs:
+            # Started but no jobs at all → the scheduler loop is not alive.
+            return PluginHealthStatus(
+                status="error",
+                details={"reason": "scheduler_no_jobs", "scheduler_started": True},
+            )
+    # Standby instance (cluster): no scheduler by design — another instance holds
+    # the prober lease. Serving the API from the shared DB is this instance's job.
 
     if not db_instance.is_connected:
         return PluginHealthStatus(
@@ -246,7 +253,8 @@ async def health(ctx) -> PluginHealthStatus:
     latency = round((time.perf_counter() - start) * 1000, 1)
     details = {
         "db_connected": True,
-        "scheduler_started": True,
+        "prober": prober,
+        "scheduler_started": bool(getattr(svc, "_scheduler_started", False)),
         "scheduler_jobs": len(jobs),
         "monitors_configured": counts.get("monitor_count", 0),
         "monitors_up": counts.get("up_count", 0),
@@ -271,16 +279,24 @@ def setup(ctx):
     ctx.log.info("State Monitoring: starting setup...")
 
     service = MonitoringService(ctx)
-    service.start()
     plugin_state["service"] = service
 
     # Mount the single authenticated router through core's registry so every
     # route inherits require_api_auth (and the per-route api:read/api:write
     # permission checks). The previous anonymous /api/monitoring mount via
     # `from main import app` has been removed — it exposed mutating routes
-    # unauthenticated.
+    # unauthenticated. Routes run on EVERY instance (reads from the shared DB).
     ctx.register_routes(build_plugin_router(service))
-    service.queue_bootstrap()
+
+    # Cluster placement (core API ≥ 1.7): exactly one instance probes. The lease
+    # is granted immediately in single mode; on a cluster the holder's death
+    # hands it over within the lease TTL. Older cores: start probing directly.
+    on_lease = getattr(ctx, "on_lease", None)
+    if callable(on_lease):
+        on_lease("monitoring:prober", acquired=service.start_probing, lost=service.stop_probing)
+        service.queue_bootstrap()  # tables for the API; sweeps wait for the lease
+    else:
+        service.start_probing()
 
     @nicegui_app.on_shutdown
     async def _on_shutdown():
@@ -293,6 +309,13 @@ def setup(ctx):
     @ctx.subscribe("db:connected")
     async def on_db_connected(payload):
         service.queue_bootstrap()
+
+    @ctx.subscribe("monitoring:monitors_changed")
+    async def on_monitors_changed(payload):
+        # Our own changes already resynced locally; a peer's change (bridged
+        # event, ``_origin`` set) means the prober must reload its jobs.
+        if (payload or {}).get("_origin"):
+            service.request_resync()
 
     @ctx.subscribe("vault:ready_for_data")
     async def on_vault_ready(payload):

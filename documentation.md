@@ -111,6 +111,32 @@ läuft alles unverändert, nur ohne Anzeige.
 
 ---
 
+## Cluster-Betrieb (Core-API ≥ 1.7)
+
+Laufen mehrere Core-Instanzen hinter einem Load Balancer (`LYNDRIX_CLUSTER_MODE=cluster`, siehe
+Core-Doku *High Availability*), gilt für dieses Plugin:
+
+- **Jede Instanz bedient die API** (`/overview`, `/dashboard`, Wartungsaktionen …) aus der
+  gemeinsamen Datenbank. Das Plugin hat `placement: any`.
+- **Genau eine Instanz probt.** In `setup()` meldet das Plugin `ctx.on_lease("monitoring:prober",
+  acquired=start_probing, lost=stop_probing)`. Nur der Lease-Halter startet Scheduler, Startup-Sweep
+  und Housekeeping (Prune, Rollups, Uptime-Fenster). Stirbt er, übernimmt eine andere Instanz
+  innerhalb der Lease-TTL (Standard 30 s). Im Single-Modus wird die Lease sofort gewährt — ein
+  Code-Pfad für beide Betriebsarten. Auf einem älteren Core ohne `on_lease` startet das Plugin
+  wie bisher direkt.
+- **Standby-Instanzen** melden in `health()` `prober: false` und keinen Scheduler-Fehler; sie
+  legen nur die Tabellen an (unter dem Core-Bootstrap-Lock, damit N Instanzen das DDL nicht
+  gegeneinander fahren).
+- **Änderungen am Monitor-Satz wandern als Cluster-Event.** Inventar-Import (kommt dort an, wo
+  der Orchestrator läuft), Einzel-Upserts und die Wartungsaktionen senden
+  `monitoring:monitors_changed` mit `cluster=True`; der Prober lädt daraufhin seine Jobs neu und
+  probt die neuen Monitore.
+- **Verlorene Schreibvorgänge sind kein Fehler.** Schlägt das Speichern eines Probe-Ergebnisses
+  mit MariaDB 1020/1205/1213 fehl (Wartung auf einer anderen Instanz, Lease-Übergabe), wird die
+  Stichprobe verworfen und der nächste Intervall-Lauf probt erneut — der Scheduler-Job lebt weiter.
+
+---
+
 ## Events
 
 | Richtung | Topic | Beschreibung |
@@ -118,6 +144,7 @@ läuft alles unverändert, nur ohne Anzeige.
 | subscribe | `db:connected` | Datenbank bereit — Tabellen initialisieren |
 | subscribe | `vault:ready_for_data` | Plugin-Einstellungen (Retention, Worker, Cache) aus Vault anwenden |
 | subscribe | `monitoring:inventory_sync` | Inventar-Sync vom IaC Orchestrator empfangen |
+| subscribe / emit | `monitoring:monitors_changed` | Monitor-Satz geändert (Inventar, Upsert, Wartung) — mit `cluster=True` an alle Instanzen; der Prober lädt seine Jobs neu |
 | emit | `monitoring:status_changed` | Statusänderung eines Monitors |
 | emit | `system:notify` | Plattform-Benachrichtigung bei Statusänderungen |
 
