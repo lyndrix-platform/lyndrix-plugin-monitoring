@@ -23,7 +23,7 @@ def test_monitoring_service_importable():
 
 def test_plugin_state_initial_value():
     """plugin_state['service'] must be None before setup() is called."""
-    import entrypoint
+    from monitoring_plugin import entrypoint
 
     assert entrypoint.plugin_state.get("service") is None, (
         "plugin_state['service'] should be None before setup() is called"
@@ -32,11 +32,11 @@ def test_plugin_state_initial_value():
 
 def test_manifest_fields():
     """Manifest must carry the correct version, repo_url, and id."""
-    import entrypoint
+    from monitoring_plugin import entrypoint
 
     m = entrypoint.manifest
     # Keep these in sync with the manifest in entrypoint.py / the git tag.
-    assert m.version == "0.0.8"
+    assert m.version == "1.2.0"
     assert m.repo_url == "https://github.com/lyndrix-platform/lyndrix-plugin-monitoring"
     assert m.id == "lyndrix.plugin.state_monitoring"
     assert m.min_core_version == "0.1.1"

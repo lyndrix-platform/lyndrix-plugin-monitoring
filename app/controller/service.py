@@ -1,11 +1,12 @@
 import asyncio
 import json
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 import httpx
+from sqlalchemy import case, func, text
 
 from core.api import db_instance
 
@@ -20,12 +21,14 @@ from ..model.models import (
     MonitorUpsert,
     PassiveResult,
     _aggregate_uptime_percent,
-    _calculate_uptime_percentages,
     _day_start,
+    _hourly_state_counts,
     _safe_json_load,
     _serialize_monitor,
+    _uptime_from_aggregates,
     _utc_now,
 )
+from ..ui.styles import aggregate_state
 from .scheduler import SimpleAsyncScheduler
 from .provider.http import is_http_target, run_http_probe
 from .provider.icmp import run_icmp_probe
@@ -34,6 +37,11 @@ from .provider.docker import is_docker_host, run_docker_service_probe
 
 
 class MonitoringService:
+    # "uptime_all" is a rolling window over the daily aggregates — raw heartbeats
+    # only live for the retention period, so an all-time scan was never all-time.
+    UPTIME_ALL_DAYS = 30
+    PRUNE_BATCH = 20_000
+
     def __init__(self, ctx):
         self.ctx = ctx
         self.scheduler = SimpleAsyncScheduler()
@@ -51,6 +59,20 @@ class MonitoringService:
         self._background_probe_task: Optional[asyncio.Task] = None
         self._bootstrap_task: Optional[asyncio.Task] = None
         self._inventory_sync_task: Optional[asyncio.Task] = None
+        self._startup_prune_task: Optional[asyncio.Task] = None
+        # Operator settings (manifest settings_schema, applied on vault:ready_for_data).
+        self._heartbeat_retention_days = 7
+        self._overview_cache_seconds = 10
+        # Set by stop(): sweep workers stop taking monitors, housekeeping stops.
+        self._stopping = False
+        # Decided by _load_probe_candidates(): the sweep only blocks the UI when it
+        # has monitors we know nothing about (UNKNOWN or stale) — re-probing a set
+        # of persistently DOWN monitors after every restart is not a warm-up.
+        self._sweep_blocking = True
+        # Single-flight cache for the computed views (see _cached()): N pollers
+        # share one computation and re-use it for _overview_cache_seconds.
+        self._view_cache: Dict[str, tuple] = {}
+        self._view_inflight: Dict[str, asyncio.Future] = {}
         self._pending_inventory_payload: Optional[InventorySyncPayload] = None
 
         # --- Backend-failure resilience (keeps a slow/broken backend from
@@ -78,6 +100,16 @@ class MonitoringService:
             return
         self.scheduler.add_daily_job(self.prune_heartbeats, hour=0, minute=0, id="monitoring:prune")
         self.scheduler.add_daily_job(self.refresh_rollups, hour=0, minute=5, id="monitoring:rollups")
+        # Housekeeping that must not depend on the process surviving until
+        # midnight (every restart used to reset the daily jobs → heartbeats grew
+        # for months). First runs are delayed so they never compete with the
+        # startup sweep; the sweep itself schedules the first prune.
+        self.scheduler.add_interval_job(
+            self.prune_heartbeats, seconds=3600, id="monitoring:prune_hourly", initial_delay=3600
+        )
+        self.scheduler.add_interval_job(
+            self.refresh_uptime_windows, seconds=3600, id="monitoring:uptime_hourly", initial_delay=1800
+        )
         self.scheduler.start()
         self._scheduler_started = True
 
@@ -173,11 +205,12 @@ class MonitoringService:
         # its first event-loop step.  Without this, tasks cancelled before they
         # ever run trigger Python's "coroutine was never awaited" RuntimeWarning
         # during GC at process shutdown.
+        self._stopping = True  # sweep workers stop taking monitors, housekeeping stops
         await asyncio.sleep(0)
 
         # Collect explicitly tracked one-off tasks
         tasks_to_cancel: list = []
-        for attr in ("_bootstrap_task", "_background_probe_task", "_inventory_sync_task"):
+        for attr in ("_bootstrap_task", "_background_probe_task", "_inventory_sync_task", "_startup_prune_task"):
             t = getattr(self, attr, None)
             if t and not t.done():
                 tasks_to_cancel.append(t)
@@ -212,16 +245,44 @@ class MonitoringService:
             with suppress(Exception):
                 await asyncio.wait(tasks_to_cancel, timeout=0.5)
 
+        # Probes running in worker threads cannot be cancelled — give them up to
+        # 5 s to drain so a reload does not run two sweeps against the DB.
+        for _ in range(50):
+            if not self._inflight_probes:
+                break
+            await asyncio.sleep(0.1)
+
         # Release the shared HTTP client
         with suppress(Exception):
             await self.http_client.aclose()
 
+        self._set_status("ready")
         self.ctx.log.info("State Monitoring: stopped cleanly.")
 
     def ensure_tables(self):
         from core.api import Base
         if db_instance.is_connected and db_instance.engine:
             Base.metadata.create_all(bind=db_instance.engine, checkfirst=True)
+            self._ensure_schema(db_instance.engine)
+
+    @staticmethod
+    def _ensure_schema(engine) -> None:
+        """Hand-rolled, idempotent migration: the composite index that turns the
+        24 h window queries into an index range scan, and the latency_samples
+        counter on daily aggregates. A dialect without IF NOT EXISTS for ALTER
+        (SQLite in tests — the column already comes from create_all) just skips."""
+        statements = [
+            "CREATE INDEX IF NOT EXISTS ix_monitoring_heartbeats_monitor_created "
+            "ON monitoring_heartbeats (monitor_id, created_at)",
+            "ALTER TABLE monitoring_daily_aggregates "
+            "ADD COLUMN IF NOT EXISTS latency_samples INTEGER NOT NULL DEFAULT 0",
+        ]
+        for stmt in statements:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(stmt))
+            except Exception:
+                pass
 
     def bootstrap(self):
         self.ensure_tables()
@@ -298,29 +359,100 @@ class MonitoringService:
             candidates.sort(key=lambda r: (self._probe_priority(r), r.updated_at or _utc_now()))
             if self._initial_probe_batch_limit > 0:
                 candidates = candidates[: self._initial_probe_batch_limit]
+            self._sweep_blocking = any(
+                r.latest_state == MonitorState.UNKNOWN.value or _is_stale(r) for r in candidates
+            )
             return [r.monitor_id for r in candidates]
         finally:
             session.close()
 
     async def _run_probe_refresh_batch(self):
         await asyncio.sleep(self._initial_probe_delay_seconds)
-
-        pending_ids = await asyncio.to_thread(self._load_probe_candidates)
-        if not pending_ids:
+        if self._stopping:
             return
 
-        worker_count = max(1, min(self._initial_probe_worker_limit, len(pending_ids)))
+        pending_ids = await asyncio.to_thread(self._load_probe_candidates)
+        total = len(pending_ids)
+        if not pending_ids:
+            self._schedule_startup_prune()
+            return
+
+        worker_count = max(1, min(self._initial_probe_worker_limit, total))
         self.ctx.log.info(
-            f"State Monitoring: starting initial probe refresh for {len(pending_ids)} monitors with {worker_count} workers."
+            f"State Monitoring: starting initial probe refresh for {total} monitors with {worker_count} workers."
         )
+        # Startup sequence (core API >= 1.5): the shell shows a warm-up panel with
+        # progress and the core answers our API with 503 + Retry-After until the
+        # sweep is done. On a warm restart there is nothing stale → no window.
+        message = f"Initial probe sweep: {total} monitors"
+        blocking = self._sweep_blocking
+        done = 0
+        self._set_status("starting", message=message, progress=(0, total), blocking=blocking, retry_after=15)
 
         async def worker():
-            while pending_ids:
+            nonlocal done
+            while pending_ids and not self._stopping:
                 mid = pending_ids.pop(0)
                 with suppress(Exception):
                     await self.run_scheduled_probe(mid)
+                done += 1
+                # The core coalesces progress-only updates to one per second.
+                self._set_status("starting", message=message, progress=(done, total), blocking=blocking, retry_after=15)
 
-        await asyncio.gather(*(worker() for _ in range(worker_count)), return_exceptions=True)
+        try:
+            await asyncio.gather(*(worker() for _ in range(worker_count)), return_exceptions=True)
+        finally:
+            self._set_status("ready")
+            self._view_cache.clear()
+        self.ctx.log.info(f"State Monitoring: initial probe refresh finished ({done}/{total}).")
+        self._schedule_startup_prune()
+
+    # ------------------------------------------------------------------
+    # Runtime status (startup sequence / maintenance window)
+    # ------------------------------------------------------------------
+
+    def _set_status(self, phase: str, **kw) -> None:
+        """Report the runtime phase to the core; a no-op on cores without
+        ``ctx.set_status`` (API < 1.5) so the plugin keeps loading there."""
+        fn = getattr(self.ctx, "set_status", None)
+        if fn is None:
+            return
+        try:
+            fn(phase, **kw)
+        except Exception as exc:
+            self.ctx.log.debug(f"State Monitoring: set_status failed: {exc}")
+
+    def maintenance_window(self, message: str, *, blocking: bool = False):
+        """``async with service.maintenance_window("…")``: a core-visible
+        maintenance status for the duration (banner; ``blocking=True`` → 503s)."""
+        fn = getattr(self.ctx, "maintenance", None)
+        return fn(message, blocking=blocking) if fn else nullcontext()
+
+    def _schedule_startup_prune(self) -> None:
+        """First retention run one minute after the sweep (the daily 00:00 job
+        never fired on a process that was restarted before midnight)."""
+        if self._startup_prune_task and not self._startup_prune_task.done():
+            return
+
+        async def _later():
+            await asyncio.sleep(60)
+            if not self._stopping:
+                await self.prune_heartbeats()
+
+        self._startup_prune_task = asyncio.create_task(_later(), name="monitoring:startup_prune")
+
+    def apply_settings(self, values: Dict[str, Any]) -> None:
+        """Operator settings from the manifest ``settings_schema`` (Vault-backed)."""
+        def _int(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                value = int(values.get(key) or default)
+            except (TypeError, ValueError):
+                return default
+            return max(lo, min(hi, value))
+
+        self._heartbeat_retention_days = _int("heartbeat_retention_days", 7, 1, 365)
+        self._initial_probe_worker_limit = _int("initial_probe_workers", 8, 1, 64)
+        self._overview_cache_seconds = _int("overview_cache_seconds", 10, 0, 300)
 
     # ------------------------------------------------------------------
     # Inventory sync queue
@@ -340,7 +472,8 @@ class MonitoringService:
             payload = self._pending_inventory_payload
             self._pending_inventory_payload = None
             try:
-                await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
+                async with self.maintenance_window("Importing inventory"):
+                    await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
                 await asyncio.sleep(0)
                 # DB read off the loop; scheduler task-creation stays on the loop.
                 records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
@@ -373,26 +506,38 @@ class MonitoringService:
     def _get_monitor(self, session, monitor_id: str) -> Optional[MonitorRecord]:
         return session.query(MonitorRecord).filter(MonitorRecord.monitor_id == monitor_id).first()
 
-    def _update_uptime_windows(self, session, monitor: MonitorRecord):
-        from sqlalchemy import func
-        for days, attr in [(1, "uptime_24h"), (7, "uptime_7d"), (30, "uptime_30d")]:
-            cutoff = _utc_now() - timedelta(days=days)
-            total = session.query(func.count(MonitorHeartbeat.id)).filter(
-                MonitorHeartbeat.monitor_id == monitor.monitor_id,
-                MonitorHeartbeat.created_at >= cutoff,
-                MonitorHeartbeat.state != MonitorState.PAUSED.value,
-            ).scalar() or 0
-            if total == 0:
-                setattr(monitor, attr, 100.0)
-                continue
-            up_total = session.query(func.count(MonitorHeartbeat.id)).filter(
-                MonitorHeartbeat.monitor_id == monitor.monitor_id,
-                MonitorHeartbeat.created_at >= cutoff,
-                MonitorHeartbeat.state == MonitorState.UP.value,
-            ).scalar() or 0
-            setattr(monitor, attr, round((up_total / total) * 100.0, 2))
+    def _bump_daily_aggregate(self, session, monitor: MonitorRecord, state: "MonitorState", latency_ms: Optional[float]):
+        """Incremental per-heartbeat update of today's aggregate — counters and a
+        running latency mean. The old path re-read the whole day and ran six
+        COUNTs per probe; with 200 monitors that alone saturated the database."""
+        day = _day_start(_utc_now())
+        aggregate = session.query(MonitorDailyAggregate).filter(
+            MonitorDailyAggregate.monitor_id == monitor.monitor_id,
+            MonitorDailyAggregate.day == day,
+        ).first()
+        if aggregate is None:
+            aggregate = MonitorDailyAggregate(
+                monitor_id=monitor.monitor_id, day=day, total_samples=0, up_samples=0,
+                down_samples=0, paused_samples=0, latency_samples=0,
+            )
+            session.add(aggregate)
+        aggregate.total_samples = (aggregate.total_samples or 0) + 1
+        if state == MonitorState.UP:
+            aggregate.up_samples = (aggregate.up_samples or 0) + 1
+        elif state == MonitorState.DOWN:
+            aggregate.down_samples = (aggregate.down_samples or 0) + 1
+        elif state == MonitorState.PAUSED:
+            aggregate.paused_samples = (aggregate.paused_samples or 0) + 1
+        if latency_ms is not None:
+            n = aggregate.latency_samples or 0
+            prev = float(aggregate.avg_latency_ms) if n > 0 and aggregate.avg_latency_ms is not None else 0.0
+            aggregate.avg_latency_ms = round((prev * n + float(latency_ms)) / (n + 1), 2)
+            aggregate.latency_samples = n + 1
+        aggregate.updated_at = _utc_now()
 
-    def _update_daily_aggregate(self, session, monitor: MonitorRecord):
+    def _recompute_daily_aggregate(self, session, monitor: MonitorRecord):
+        """Full recompute of today's aggregate from heartbeats (daily rollup job —
+        self-heals the incremental counters)."""
         day = _day_start(_utc_now())
         next_day = day + timedelta(days=1)
         items = session.query(MonitorHeartbeat).filter(
@@ -413,8 +558,45 @@ class MonitoringService:
         aggregate.paused_samples = sum(1 for i in items if i.state == MonitorState.PAUSED.value)
         latencies = [i.latency_ms for i in items if i.latency_ms is not None]
         aggregate.avg_latency_ms = round(sum(latencies) / len(latencies), 2) if latencies else None
+        aggregate.latency_samples = len(latencies)
         aggregate.updated_at = _utc_now()
-        self._update_uptime_windows(session, monitor)
+
+    async def refresh_uptime_windows(self):
+        await asyncio.to_thread(self._refresh_uptime_windows_sync)
+
+    def _refresh_uptime_windows_sync(self):
+        """uptime_24h from the last 24 h of heartbeats (one GROUP BY over the
+        composite index), uptime_7d/30d from daily aggregates — for all monitors
+        in one pass. Runs hourly and after the daily rollup, never per write."""
+        session = self._session()
+        if not session:
+            return
+        try:
+            ids = [r[0] for r in session.query(MonitorRecord.monitor_id).all()]
+            if not ids:
+                return
+            cutoff = (_utc_now() - timedelta(hours=24)).replace(tzinfo=None)
+            rows = session.query(
+                MonitorHeartbeat.monitor_id,
+                func.count(MonitorHeartbeat.id),
+                func.sum(case((MonitorHeartbeat.state == MonitorState.UP.value, 1), else_=0)),
+            ).filter(
+                MonitorHeartbeat.created_at >= cutoff,
+                MonitorHeartbeat.state != MonitorState.PAUSED.value,
+            ).group_by(MonitorHeartbeat.monitor_id).all()
+            day = {
+                mid: (round((int(up or 0) / int(total)) * 100.0, 2) if total else 100.0)
+                for mid, total, up in rows
+            }
+            week = _uptime_from_aggregates(session, ids, days=7)
+            month = _uptime_from_aggregates(session, ids, days=30)
+            for record in session.query(MonitorRecord).all():
+                record.uptime_24h = day.get(record.monitor_id, 100.0)
+                record.uptime_7d = week.get(record.monitor_id, 100.0)
+                record.uptime_30d = month.get(record.monitor_id, 100.0)
+            session.commit()
+        finally:
+            session.close()
 
     # ------------------------------------------------------------------
     # Public read API
@@ -449,15 +631,17 @@ class MonitoringService:
             session.close()
 
     def stats(self) -> Dict[str, Any]:
-        from sqlalchemy import func
+        """Counts by state (one GROUP BY on the monitor table) plus the rolling
+        ``UPTIME_ALL_DAYS`` uptime from daily aggregates. No heartbeat scan."""
         session = self._session()
         if not session:
             return {"monitor_count": 0, "up_count": 0, "down_count": 0, "paused_count": 0, "uptime_all": 100.0}
         try:
             rows = session.query(MonitorRecord.latest_state, func.count(MonitorRecord.monitor_id)).group_by(MonitorRecord.latest_state).all()
-            monitor_count = session.query(func.count(MonitorRecord.monitor_id)).scalar() or 0
-            result = {"monitor_count": monitor_count, "up_count": 0, "down_count": 0, "paused_count": 0, "uptime_all": 100.0}
+            result = {"monitor_count": 0, "up_count": 0, "down_count": 0, "paused_count": 0, "uptime_all": 100.0}
             for state, count in rows:
+                count = int(count or 0)
+                result["monitor_count"] += count
                 if state == MonitorState.UP.value:
                     result["up_count"] = count
                 elif state == MonitorState.DOWN.value:
@@ -465,7 +649,7 @@ class MonitoringService:
                 elif state == MonitorState.PAUSED.value:
                     result["paused_count"] = count
             monitor_ids = [r[0] for r in session.query(MonitorRecord.monitor_id).all()]
-            uptime_map = _calculate_uptime_percentages(session, monitor_ids)
+            uptime_map = _uptime_from_aggregates(session, monitor_ids, days=self.UPTIME_ALL_DAYS)
             if uptime_map:
                 result["uptime_all"] = _aggregate_uptime_percent(list(uptime_map.values()))
             return result
@@ -478,7 +662,7 @@ class MonitoringService:
             return []
         try:
             items = session.query(MonitorRecord).order_by(MonitorRecord.logical_group, MonitorRecord.name).all()
-            uptime_map = _calculate_uptime_percentages(session, [i.monitor_id for i in items])
+            uptime_map = _uptime_from_aggregates(session, [i.monitor_id for i in items], days=self.UPTIME_ALL_DAYS)
             serialized = []
             for item in items:
                 payload = _serialize_monitor(item)
@@ -548,6 +732,91 @@ class MonitoringService:
         finally:
             session.close()
 
+    def get_timelines(self, monitor_ids: List[str], hours: int = 24) -> Dict[str, List[str]]:
+        """Hourly state timeline per monitor, bucketed by the database (at most
+        hours × monitors result rows) — same result as bucketing the raw
+        heartbeats with ``timeline_from_history`` but without loading them."""
+        hours = max(1, int(hours))
+        unknown = [MonitorState.UNKNOWN.value] * hours
+        session = self._session()
+        if not session:
+            return {mid: list(unknown) for mid in monitor_ids}
+        try:
+            counts = _hourly_state_counts(session, monitor_ids, hours)
+        finally:
+            session.close()
+        return {
+            mid: [aggregate_state([s for s, n in bucket.items() if n > 0]) if bucket else MonitorState.UNKNOWN.value
+                  for bucket in buckets]
+            for mid, buckets in counts.items()
+        }
+
+    # ------------------------------------------------------------------
+    # Computed views (React UI) — cached, single-flight
+    # ------------------------------------------------------------------
+
+    async def overview(self, *, group_by: str = "site", hours: int = 24,
+                       include_paused: bool = True, include_unknown: bool = True) -> Dict[str, Any]:
+        """Grouped + flat overview for the React UI. Reuses the pure helpers the
+        NiceGUI dashboard uses, with timelines bucketed in SQL."""
+        from .helpers import build_grouped_overview, flatten_monitors
+
+        key = f"overview|{group_by}|{hours}|{include_paused}|{include_unknown}"
+
+        async def _compute() -> Dict[str, Any]:
+            monitors = await asyncio.to_thread(self.list_monitors)
+            ids = [m["monitor_id"] for m in monitors]
+            timelines = await asyncio.to_thread(self.get_timelines, ids, hours)
+            groups = build_grouped_overview(
+                monitors, {}, group_by=group_by, include_paused=include_paused,
+                include_unknown=include_unknown, timelines=timelines,
+            )
+            rows = flatten_monitors(
+                monitors, {}, include_paused=include_paused, include_unknown=include_unknown,
+                timelines=timelines,
+            )
+            stats = await asyncio.to_thread(self.stats)
+            return {"groups": groups, "rows": rows, "stats": stats, "hours": hours,
+                    "generated_at": _utc_now().isoformat()}
+
+        return await self._cached(key, _compute)
+
+    async def dashboard(self) -> Dict[str, Any]:
+        async def _compute() -> Dict[str, Any]:
+            monitors = await asyncio.to_thread(self.list_monitors)
+            stats = await asyncio.to_thread(self.stats)
+            return {"monitors": monitors, "stats": stats}
+
+        return await self._cached("dashboard", _compute)
+
+    async def _cached(self, key: str, compute):
+        """TTL cache + single flight: concurrent callers of the same view share one
+        computation (20 s polling × N browser tabs used to mean N full scans)."""
+        ttl = max(0, self._overview_cache_seconds)
+        hit = self._view_cache.get(key)
+        if hit and ttl and time.monotonic() - hit[0] < ttl:
+            return hit[1]
+        inflight = self._view_inflight.get(key)
+        if inflight is not None:
+            return await inflight
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        fut.add_done_callback(lambda f: None if f.cancelled() else f.exception())  # mark retrieved
+        self._view_inflight[key] = fut
+        try:
+            result = await compute()
+        except asyncio.CancelledError:
+            fut.cancel()
+            raise
+        except Exception as exc:
+            fut.set_exception(exc)
+            raise
+        else:
+            fut.set_result(result)
+            self._view_cache[key] = (time.monotonic(), result)
+            return result
+        finally:
+            self._view_inflight.pop(key, None)
+
     # ------------------------------------------------------------------
     # State transitions & heartbeats
     # ------------------------------------------------------------------
@@ -555,6 +824,7 @@ class MonitoringService:
     def _emit_transition(self, record: MonitorRecord, previous_state: str, error_message: Optional[str]):
         if previous_state == record.latest_state:
             return
+        self._view_cache.clear()  # a state change must show up on the next poll
         self.ctx.emit(
             "monitoring:state_changed",
             {
@@ -593,7 +863,7 @@ class MonitoringService:
                 created_at=current_time,
             )
         )
-        self._update_daily_aggregate(session, record)
+        self._bump_daily_aggregate(session, record, state, latency_ms)
         self._emit_transition(record, previous_state, error_message)
 
     # ------------------------------------------------------------------
@@ -803,17 +1073,43 @@ class MonitoringService:
     # Maintenance
     # ------------------------------------------------------------------
 
-    async def prune_heartbeats(self):
-        await asyncio.to_thread(self._prune_heartbeats_sync)
+    async def prune_heartbeats(self) -> int:
+        """Delete heartbeats older than the retention in batches of PRUNE_BATCH —
+        every statement stays far below the core's 60 s statement cap even when
+        months of backlog are removed — yielding to the loop between batches."""
+        total = 0
+        for _ in range(500):
+            if self._stopping:
+                break
+            n = await asyncio.to_thread(self._prune_heartbeats_batch)
+            total += n
+            if n < self.PRUNE_BATCH:
+                break
+            await asyncio.sleep(0.2)
+        if total:
+            self.ctx.log.info(
+                f"State Monitoring: pruned {total} heartbeats older than {self._heartbeat_retention_days} days."
+            )
+        return total
 
-    def _prune_heartbeats_sync(self):
+    def _prune_heartbeats_batch(self) -> int:
         session = self._session()
         if not session:
-            return
+            return 0
         try:
-            cutoff = _utc_now() - timedelta(days=7)
-            session.query(MonitorHeartbeat).filter(MonitorHeartbeat.created_at < cutoff).delete(synchronize_session=False)
+            cutoff = (_utc_now() - timedelta(days=self._heartbeat_retention_days)).replace(tzinfo=None)
+            ids = [
+                r[0] for r in session.query(MonitorHeartbeat.id)
+                .filter(MonitorHeartbeat.created_at < cutoff)
+                .order_by(MonitorHeartbeat.id)
+                .limit(self.PRUNE_BATCH)
+                .all()
+            ]
+            if not ids:
+                return 0
+            session.query(MonitorHeartbeat).filter(MonitorHeartbeat.id.in_(ids)).delete(synchronize_session=False)
             session.commit()
+            return len(ids)
         finally:
             session.close()
 
@@ -847,10 +1143,11 @@ class MonitoringService:
             return
         try:
             for record in session.query(MonitorRecord).all():
-                self._update_daily_aggregate(session, record)
+                self._recompute_daily_aggregate(session, record)
             session.commit()
         finally:
             session.close()
+        self._refresh_uptime_windows_sync()
 
     def _load_all_records_for_scheduler(self):
         """Warm the DB connection pool; actual task creation happens in sync code."""

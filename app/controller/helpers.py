@@ -132,6 +132,18 @@ _GROUP_ICONS = {
 }
 
 
+def _timeline_for(
+    monitor_id: str,
+    histories: Dict[str, List[Dict[str, Any]]],
+    timelines: Optional[Dict[str, List[str]]],
+) -> List[str]:
+    """Prefer a timeline bucketed by the database (``service.get_timelines``);
+    fall back to bucketing raw heartbeats in Python (NiceGUI path)."""
+    if timelines is not None and monitor_id in timelines:
+        return timelines[monitor_id]
+    return timeline_from_history(histories.get(monitor_id, []))
+
+
 def build_grouped_overview(
     monitors: List[Dict[str, Any]],
     histories: Dict[str, List[Dict[str, Any]]],
@@ -139,6 +151,7 @@ def build_grouped_overview(
     group_by: str = "site",
     include_paused: bool = True,
     include_unknown: bool = True,
+    timelines: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """Group monitors into ``[{name, hosts:[…]}]`` along the requested axis.
 
@@ -174,8 +187,7 @@ def build_grouped_overview(
             },
         )
 
-        history = histories.get(monitor["monitor_id"], [])
-        timeline = timeline_from_history(history)
+        timeline = _timeline_for(monitor["monitor_id"], histories, timelines)
         state = monitor.get("latest_state") or "UNKNOWN"
         host_entry["states"].append(state)
         host_entry["timelines"].append(timeline)
@@ -262,6 +274,7 @@ def flatten_monitors(
     *,
     include_paused: bool = True,
     include_unknown: bool = True,
+    timelines: Optional[Dict[str, List[str]]] = None,
 ) -> List[Dict[str, Any]]:
     """One row per monitor — feeds table and split views.
 
@@ -275,8 +288,7 @@ def flatten_monitors(
     rows = []
     for m in monitors:
         site, stage = infer_site_and_stage(m)
-        history = histories.get(m["monitor_id"], [])
-        timeline = timeline_from_history(history)
+        timeline = _timeline_for(m["monitor_id"], histories, timelines)
         host_key = m.get("host_name") or m.get("address") or m.get("monitor_id")
         rows.append({
             "monitor_id": m["monitor_id"],

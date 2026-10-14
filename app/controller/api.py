@@ -33,9 +33,7 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
 
     @router.get("/dashboard")
     async def dashboard_data(identity: ApiIdentity = Depends(require_permission(_PERM_READ))):
-        monitors = await asyncio.to_thread(service.list_monitors)
-        stats = await asyncio.to_thread(service.stats)
-        return {"monitors": monitors, "stats": stats}
+        return await service.dashboard()
 
     @router.get("/overview")
     async def overview(
@@ -52,25 +50,11 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
         and flattened data the in-process NiceGUI dashboard does — no
         business logic lives in the frontend.
         """
-        from .helpers import build_grouped_overview, flatten_monitors
-
-        monitors = await asyncio.to_thread(service.list_monitors)
-        histories = await asyncio.to_thread(service.get_histories, [m["monitor_id"] for m in monitors], hours)
-        groups = build_grouped_overview(
-            monitors,
-            histories,
-            group_by=group_by,
-            include_paused=include_paused,
-            include_unknown=include_unknown,
+        hours = max(1, min(int(hours), 168))
+        return await service.overview(
+            group_by=group_by, hours=hours,
+            include_paused=include_paused, include_unknown=include_unknown,
         )
-        rows = flatten_monitors(
-            monitors,
-            histories,
-            include_paused=include_paused,
-            include_unknown=include_unknown,
-        )
-        stats = await asyncio.to_thread(service.stats)
-        return {"groups": groups, "rows": rows, "stats": stats, "hours": hours}
 
     @router.get("/monitors/{monitor_id}")
     async def get_monitor(
@@ -135,7 +119,8 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
         Exposed via the API (not just the NiceGUI Danger Zone) so machine
         clients and the React UI can perform and audit the operation.
         """
-        deleted = await asyncio.to_thread(service.clear_states_db)
+        async with service.maintenance_window("Clearing monitor states"):
+            deleted = await asyncio.to_thread(service.clear_states_db)
         return {"deleted": deleted}
 
     return router

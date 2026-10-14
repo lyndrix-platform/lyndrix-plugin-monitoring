@@ -5,7 +5,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, CSSProperties } from
 // language. Strings come from locales/monitoring.<locale>.json, auto-registered
 // by core and served via the catalog (namespace "monitoring").
 import { useTranslation } from 'react-i18next'
-import { pluginApi } from './lib/api'
+import { ApiError, pluginApi } from './lib/api'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1098,8 +1098,14 @@ export default function PluginApp() {
   const [prefs, setPrefs] = useState<Prefs>(loadPrefs)
   const [data, setData] = useState<Overview | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [lastOk, setLastOk] = useState<number | null>(null)
 
   const inFlight = useRef(false)
+  // Back-off after consecutive failures: 20 s → 40 → 80 → 120 s (max). A manual
+  // refresh ignores it. The 20 s interval keeps ticking; ticks inside the
+  // back-off window are skipped, so a struggling backend is not hammered.
+  const failures = useRef(0)
+  const nextAllowedAt = useRef(0)
 
   const setPref = useCallback(<K extends keyof Prefs>(key: K, value: Prefs[K]) => {
     persistPref(key, value)
@@ -1109,9 +1115,10 @@ export default function PluginApp() {
   // Only group_by / show_paused / show_unknown affect the server query.
   const queryKey = `${prefs.group_by}|${prefs.show_paused}|${prefs.show_unknown}`
 
-  const fetchOverview = useCallback(async () => {
+  const fetchOverview = useCallback(async (force = false) => {
     if (inFlight.current) return
     if (typeof document !== 'undefined' && document.hidden) return
+    if (!force && Date.now() < nextAllowedAt.current) return
     inFlight.current = true
     try {
       const params = new URLSearchParams({
@@ -1123,17 +1130,38 @@ export default function PluginApp() {
       const result = await pluginApi.get<Overview>(`overview?${params.toString()}`)
       setData(result)
       setError(null)
+      setLastOk(Date.now())
+      failures.current = 0
+      nextAllowedAt.current = 0
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('app.load_error', { defaultValue: 'Failed to load' }))
+      failures.current += 1
+      const backoff = Math.min(120_000, 20_000 * 2 ** Math.min(failures.current - 1, 3))
+      nextAllowedAt.current = Date.now() + backoff
+      if (err instanceof ApiError && err.code === 'timeout') {
+        setError(t('app.timeout', { defaultValue: 'The backend did not answer within 30 s.' }))
+      } else if (err instanceof ApiError && err.code === 'runtime' && err.runtime) {
+        // Blocking warm-up: the core shell already shows the progress panel; the
+        // plugin only sees this when polling raced the status change.
+        const p = err.runtime.progress
+        setError(t('app.warming_up', {
+          defaultValue: 'Monitoring is starting up — {{message}}',
+          message: p ? `${err.runtime.message ?? ''} (${p.done}/${p.total})` : (err.runtime.message ?? ''),
+        }))
+        nextAllowedAt.current = Date.now() + 5_000 // the gate lifts soon — retry quickly
+      } else {
+        setError(err instanceof Error ? err.message : t('app.load_error', { defaultValue: 'Failed to load' }))
+      }
     } finally {
       inFlight.current = false
     }
   }, [prefs.group_by, prefs.show_paused, prefs.show_unknown, t])
 
-  // Refetch when the query-affecting prefs change; poll every 20s.
+  // Refetch when the query-affecting prefs change; poll every 20s (subject to
+  // the failure back-off above). A 5 s tick lets a short back-off end promptly.
   useEffect(() => {
-    void fetchOverview()
-    const timer = setInterval(() => void fetchOverview(), 20_000)
+    nextAllowedAt.current = 0
+    void fetchOverview(true)
+    const timer = setInterval(() => void fetchOverview(), 5_000)
     return () => clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queryKey])
@@ -1145,7 +1173,7 @@ export default function PluginApp() {
       {/* Centered control column */}
       <div style={{ maxWidth: 1280, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
         <HeaderCard stats={data?.stats ?? null} />
-        <Toolbar prefs={prefs} setPref={setPref} onRefresh={() => void fetchOverview()} />
+        <Toolbar prefs={prefs} setPref={setPref} onRefresh={() => void fetchOverview(true)} />
         {error && (
           <div
             style={{
@@ -1155,9 +1183,27 @@ export default function PluginApp() {
               border: `1px solid color-mix(in srgb, ${STATE_COLOR.DOWN} 25%, transparent)`,
               color: STATE_COLOR.DOWN,
               fontSize: '0.8rem',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.75rem',
+              flexWrap: 'wrap',
             }}
           >
-            {error}
+            <span style={{ flex: 1 }}>
+              {error}
+              {data && lastOk && (
+                <span style={{ display: 'block', opacity: 0.8, fontSize: '0.72rem', marginTop: 2 }}>
+                  {t('app.stale_since', { defaultValue: 'Showing the last successful data from {{time}}.', time: new Date(lastOk).toLocaleTimeString() })}
+                </span>
+              )}
+            </span>
+            <button
+              onClick={() => void fetchOverview(true)}
+              className="lx-btn lx-btn--secondary lx-btn--sm"
+              style={{ color: 'inherit' }}
+            >
+              {t('app.retry', { defaultValue: 'Retry' })}
+            </button>
           </div>
         )}
       </div>

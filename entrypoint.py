@@ -46,7 +46,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="1.1.0",
+    version="1.2.0",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -65,9 +65,23 @@ manifest = ModuleManifest(
             "sidebar_visible": True,
         }
     ],
+    # Operator settings — core's schema-driven settings dialog, stored in Vault
+    # under plugins/<id>/settings, applied on vault:ready_for_data.
+    settings_schema=[
+        {"key": "heartbeat_retention_days", "label": "Heartbeat retention (days)", "kind": "int",
+         "category": "Storage", "default": "7",
+         "description": "Raw probe results older than this are pruned (hourly, in batches). Uptime beyond this window comes from daily aggregates."},
+        {"key": "initial_probe_workers", "label": "Startup sweep workers", "kind": "int",
+         "category": "Probing", "default": "8",
+         "description": "Concurrent probes during the initial sweep after a (re)start."},
+        {"key": "overview_cache_seconds", "label": "Overview cache (seconds)", "kind": "int",
+         "category": "Dashboard", "default": "10",
+         "description": "How long a computed overview is served to concurrent viewers before it is recomputed (0 = always recompute)."},
+    ],
     permissions={
         "subscribe": [
             "db:connected",
+            "vault:ready_for_data",
             "monitoring:config_upsert",
             "monitoring:passive_result",
             "monitoring:admin_override",
@@ -163,7 +177,9 @@ async def health(ctx) -> PluginHealthStatus:
     * the DB (where probe results are persisted) is reachable, and
     * the monitor table is queryable.
 
-    The sync DB read is offloaded so the probe never blocks the event loop.
+    The sync DB read is offloaded so the probe never blocks the event loop, and
+    it is deliberately cheap (one GROUP BY on the monitor table): the core polls
+    health() from every dashboard, so it must never touch the heartbeat table.
     """
     start = time.perf_counter()
 
@@ -195,7 +211,7 @@ async def health(ctx) -> PluginHealthStatus:
         )
 
     try:
-        monitors = await asyncio.to_thread(svc.list_monitors)
+        counts = await asyncio.to_thread(svc.status_counts)
     except Exception as exc:
         return PluginHealthStatus(
             status="error",
@@ -208,10 +224,12 @@ async def health(ctx) -> PluginHealthStatus:
         "db_connected": True,
         "scheduler_started": True,
         "scheduler_jobs": len(jobs),
-        "monitors_configured": len(monitors),
+        "monitors_configured": counts.get("monitor_count", 0),
+        "monitors_up": counts.get("up_count", 0),
+        "monitors_down": counts.get("down_count", 0),
     }
     # Loop alive + DB reachable, but nothing is being watched yet.
-    if not monitors:
+    if not counts.get("monitor_count"):
         return PluginHealthStatus(
             status="degraded",
             details={**details, "reason": "no_monitors_configured"},
@@ -251,6 +269,14 @@ def setup(ctx):
     @ctx.subscribe("db:connected")
     async def on_db_connected(payload):
         service.queue_bootstrap()
+
+    @ctx.subscribe("vault:ready_for_data")
+    async def on_vault_ready(payload):
+        try:
+            values = await asyncio.to_thread(ctx.get_all_settings)  # Vault I/O is blocking
+            service.apply_settings(values or {})
+        except Exception as exc:
+            ctx.log.warning(f"State Monitoring: could not apply settings — {exc}")
 
     @ctx.subscribe("monitoring:config_upsert")
     async def on_config_upsert(payload):

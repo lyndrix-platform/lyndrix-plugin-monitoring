@@ -81,6 +81,9 @@ class MonitorDailyAggregate(Base):
     down_samples = Column(Integer, nullable=False, default=0)
     paused_samples = Column(Integer, nullable=False, default=0)
     avg_latency_ms = Column(Float, nullable=True)
+    # Number of samples that carried a latency — lets avg_latency_ms be updated
+    # incrementally per heartbeat (running mean) instead of re-reading the day.
+    latency_samples = Column(Integer, nullable=False, default=0)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
@@ -200,6 +203,67 @@ def _calculate_uptime_percentages(session, monitor_ids: List[str]) -> Dict[str, 
         else:
             percentages[mid] = round((values["up"] / values["total"]) * 100.0, 2)
     return percentages
+
+
+def _uptime_from_aggregates(session, monitor_ids: List[str], days: int = 30) -> Dict[str, float]:
+    """Uptime over the last ``days`` from ``monitoring_daily_aggregates`` — one
+    small query over ~days × monitors rows instead of a scan of every heartbeat.
+    Paused samples do not count. Monitors without samples read 100 %.
+    """
+    if not monitor_ids:
+        return {}
+    cutoff = _day_start(_utc_now()) - timedelta(days=max(1, days) - 1)
+    rows = session.query(
+        MonitorDailyAggregate.monitor_id,
+        func.sum(MonitorDailyAggregate.up_samples),
+        func.sum(MonitorDailyAggregate.total_samples - MonitorDailyAggregate.paused_samples),
+    ).filter(
+        MonitorDailyAggregate.monitor_id.in_(monitor_ids),
+        MonitorDailyAggregate.day >= cutoff,
+    ).group_by(MonitorDailyAggregate.monitor_id).all()
+    percentages = {mid: 100.0 for mid in monitor_ids}
+    for mid, up, total in rows:
+        total = int(total or 0)
+        if total > 0:
+            percentages[mid] = round(min(100.0, (int(up or 0) / total) * 100.0), 2)
+    return percentages
+
+
+def _hourly_state_counts(session, monitor_ids: List[str], hours: int = 24) -> Dict[str, List[Dict[str, int]]]:
+    """Per monitor, ``hours`` buckets (oldest first) of heartbeat counts by state,
+    bucketed by the database: ``{monitor_id: [{"UP": n, "DOWN": n, ...}, ...]}``.
+
+    Replaces loading a full day of heartbeat rows per overview request (hundreds
+    of thousands of ORM objects) with at most ``hours × monitors`` result rows.
+    The bucket expression is dialect-specific (MariaDB/MySQL vs SQLite tests).
+    """
+    from sqlalchemy import Integer as _Int, text as _text
+
+    if not monitor_ids:
+        return {}
+    hours = max(1, int(hours))
+    # Heartbeats are stored as naive UTC wall time (see MonitorHeartbeat.created_at
+    # default); compare against a naive UTC start so both dialects agree.
+    start = (_utc_now() - timedelta(hours=hours)).replace(tzinfo=None, microsecond=0)
+    dialect = session.bind.dialect.name if session.bind is not None else "sqlite"
+    if dialect in ("mysql", "mariadb"):
+        bucket = func.floor(func.timestampdiff(_text("SECOND"), start, MonitorHeartbeat.created_at) / 3600)
+    else:
+        start_epoch = int(start.replace(tzinfo=timezone.utc).timestamp())
+        bucket = (func.cast(func.strftime("%s", MonitorHeartbeat.created_at), _Int) - start_epoch) / 3600
+    bucket = func.cast(bucket, _Int).label("bucket")
+    rows = session.query(
+        MonitorHeartbeat.monitor_id, bucket, MonitorHeartbeat.state, func.count(MonitorHeartbeat.id),
+    ).filter(
+        MonitorHeartbeat.monitor_id.in_(monitor_ids),
+        MonitorHeartbeat.created_at >= start,
+    ).group_by(MonitorHeartbeat.monitor_id, bucket, MonitorHeartbeat.state).all()
+    out: Dict[str, List[Dict[str, int]]] = {mid: [dict() for _ in range(hours)] for mid in monitor_ids}
+    for mid, idx, state, n in rows:
+        idx = int(idx or 0)
+        if mid in out and 0 <= idx < hours:
+            out[mid][idx][state] = out[mid][idx].get(state, 0) + int(n or 0)
+    return out
 
 
 def _aggregate_uptime_percent(values: List[float]) -> float:

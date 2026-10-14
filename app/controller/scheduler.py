@@ -54,12 +54,15 @@ class SimpleAsyncScheduler:
         args: Optional[List[Any]] = None,
         id: str,
         replace_existing: bool = True,
+        initial_delay: Optional[int] = None,
     ):
         if replace_existing:
             self.remove_job(id)
 
         interval = max(1, seconds)
-        delay = self._initial_delay(id, interval)
+        # Explicit first-run delay (e.g. "one hour after start" for housekeeping
+        # that must not compete with the startup sweep); default = jittered.
+        delay = max(1, int(initial_delay)) if initial_delay is not None else self._initial_delay(id, interval)
 
         async def runner():
             try:

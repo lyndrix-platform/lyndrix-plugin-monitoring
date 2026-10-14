@@ -5,7 +5,11 @@
     "refresh": "Aktualisieren",
     "loading": "Lade Monitore…",
     "empty": "Keine Monitore konfiguriert.",
-    "load_error": "Fehler beim Laden"
+    "load_error": "Fehler beim Laden",
+    "timeout": "Das Backend hat innerhalb von 30 s nicht geantwortet.",
+    "warming_up": "Monitoring startet — {{message}}",
+    "stale_since": "Zeigt die letzten erfolgreich geladenen Daten von {{time}}.",
+    "retry": "Erneut versuchen"
   },
   "header": {
     "title": "State Monitoring",

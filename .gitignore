@@ -214,3 +214,8 @@ vendor/
 
 # Plugin React UI build toolchain
 node_modules/
+
+# The React client module is source, not a Python build artefact (the generic
+# lib/ rule above hid src/ui/lib/api.ts from the repo).
+!src/ui/lib/
+!src/ui/lib/**
