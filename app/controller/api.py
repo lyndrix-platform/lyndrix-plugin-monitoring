@@ -50,6 +50,15 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
         and flattened data the in-process NiceGUI dashboard does — no
         business logic lives in the frontend.
         """
+        from .helpers import _GROUP_ICONS
+
+        # Cache keys are built from these parameters: reject anything outside
+        # the known axes so an authenticated caller cannot mint unbounded keys.
+        if group_by not in _GROUP_ICONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown group_by '{group_by}' (expected one of {', '.join(sorted(_GROUP_ICONS))})",
+            )
         hours = max(1, min(int(hours), 168))
         return await service.overview(
             group_by=group_by, hours=hours,

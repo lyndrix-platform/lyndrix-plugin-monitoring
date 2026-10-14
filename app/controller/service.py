@@ -789,13 +789,24 @@ class MonitoringService:
 
         return await self._cached("dashboard", _compute)
 
+    # Views are keyed by validated parameters (api.py checks group_by against the
+    # catalog, clamps hours), so the key space is small; the cap is a backstop.
+    VIEW_CACHE_MAX_KEYS = 64
+
     async def _cached(self, key: str, compute):
         """TTL cache + single flight: concurrent callers of the same view share one
         computation (20 s polling × N browser tabs used to mean N full scans)."""
         ttl = max(0, self._overview_cache_seconds)
+        now = time.monotonic()
         hit = self._view_cache.get(key)
-        if hit and ttl and time.monotonic() - hit[0] < ttl:
+        if hit and ttl and now - hit[0] < ttl:
             return hit[1]
+        # Housekeeping: drop expired entries; never let the cache grow unbounded.
+        if len(self._view_cache) >= self.VIEW_CACHE_MAX_KEYS:
+            for k in [k for k, (ts, _) in self._view_cache.items() if not ttl or now - ts >= ttl]:
+                self._view_cache.pop(k, None)
+            while len(self._view_cache) >= self.VIEW_CACHE_MAX_KEYS:
+                self._view_cache.pop(next(iter(self._view_cache)), None)  # oldest insert
         inflight = self._view_inflight.get(key)
         if inflight is not None:
             return await inflight

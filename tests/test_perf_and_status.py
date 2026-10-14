@@ -246,3 +246,16 @@ def test_sweep_blocks_only_for_unknown_or_stale_monitors(svc):
         s.commit()
     svc._load_probe_candidates()
     assert svc._sweep_blocking is True   # something we know nothing about → block
+
+
+def test_view_cache_is_bounded(svc, monkeypatch):
+    _monitor(svc)
+    monkeypatch.setattr(type(svc), "VIEW_CACHE_MAX_KEYS", 4)
+
+    async def run():
+        for i in range(20):
+            await svc._cached(f"k{i}", lambda i=i: asyncio.sleep(0, result=i))
+        assert len(svc._view_cache) <= 4
+        assert "k19" in svc._view_cache  # newest survives, oldest were evicted
+
+    asyncio.run(run())
