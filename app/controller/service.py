@@ -81,6 +81,7 @@ class MonitoringService:
         self._consec_failures: Dict[str, int] = {}        # monitor_id -> consecutive failures
         self._host_failures: Dict[str, int] = {}          # host_key  -> consecutive failures
         self._host_circuit_until: Dict[str, float] = {}   # host_key  -> monotonic deadline while paused
+        self._force_full_sweep = False                    # maintenance: next sweep probes every monitor
         self._flap_threshold = 3                          # consecutive fails before a monitor flips to DOWN
         self._host_circuit_threshold = 8                  # consecutive host fails before the host is paused
         self._host_circuit_base = 30.0                    # circuit backoff base (seconds)
@@ -348,18 +349,22 @@ class MonitoringService:
                     ts = ts.replace(tzinfo=_tz.utc)
                 return (_utc_now() - ts).total_seconds() > r.interval_seconds * 2
 
+            force = self._force_full_sweep
+            self._force_full_sweep = False
             candidates = [
                 r for r in records
                 if (r.target or r.address)
                 and (
-                    r.latest_state in {MonitorState.UNKNOWN.value, MonitorState.DOWN.value}
+                    force
+                    or r.latest_state in {MonitorState.UNKNOWN.value, MonitorState.DOWN.value}
                     or _is_stale(r)
                 )
             ]
             candidates.sort(key=lambda r: (self._probe_priority(r), r.updated_at or _utc_now()))
-            if self._initial_probe_batch_limit > 0:
+            if self._initial_probe_batch_limit > 0 and not force:
                 candidates = candidates[: self._initial_probe_batch_limit]
-            self._sweep_blocking = any(
+            # A forced sweep re-probes known states → banner only, never a 503 window.
+            self._sweep_blocking = (not force) and any(
                 r.latest_state == MonitorState.UNKNOWN.value or _is_stale(r) for r in candidates
             )
             return [r.monitor_id for r in candidates]
@@ -1144,6 +1149,179 @@ class MonitoringService:
             return deleted
         finally:
             session.close()
+
+    # ------------------------------------------------------------------
+    # Maintenance actions (core settings dialog → POST /maintenance/*)
+    # ------------------------------------------------------------------
+
+    MANAGED_OWNER_SOURCES = ("orchestrator_service", "iac_orchestrator")
+    DELETE_CHUNK = 500
+    # MariaDB error codes that mean "another transaction touched these rows":
+    # 1020 record changed since last read (innodb_snapshot_isolation, MariaDB >= 11.6),
+    # 1213 deadlock, 1205 lock wait timeout. Writers (probes, passive results) run
+    # concurrently with maintenance, so every destructive batch retries on them.
+    _RETRY_DB_ERRORS = (1020, 1205, 1213)
+
+    def _maintenance_session(self):
+        """Session for destructive maintenance: READ COMMITTED where the dialect
+        supports it, so a long sequence of batches never trips snapshot-isolation
+        conflicts against the probe writers (SQLite: no-op)."""
+        session = self._session()
+        if session is None:
+            return None
+        try:
+            session.connection(execution_options={"isolation_level": "READ COMMITTED"})
+        except Exception:
+            pass
+        return session
+
+    def _retrying(self, session, fn, attempts: int = 4):
+        """Run ``fn()`` (one short write transaction, committed inside) and retry it
+        on the concurrent-write errors above with a short back-off."""
+        for attempt in range(1, attempts + 1):
+            try:
+                return fn()
+            except Exception as exc:  # sqlalchemy.exc.OperationalError wraps the driver error
+                code = getattr(getattr(exc, "orig", None), "args", (None,))[0]
+                session.rollback()
+                if code not in self._RETRY_DB_ERRORS or attempt == attempts:
+                    raise
+                time.sleep(0.2 * attempt)
+
+    def monitor_ids_for_scope(self, scope: str = "managed") -> List[str]:
+        """Ids ``delete_monitors(scope)`` would remove (``managed`` | ``all``)."""
+        if scope not in ("managed", "all"):
+            raise ValueError(f"unknown delete scope {scope!r}")
+        session = self._session()
+        if not session:
+            return []
+        try:
+            q = session.query(MonitorRecord.monitor_id)
+            if scope == "managed":
+                q = q.filter(MonitorRecord.owner_source.in_(self.MANAGED_OWNER_SOURCES))
+            return [r[0] for r in q.all()]
+        finally:
+            session.close()
+
+    async def quiesce_monitors(self, monitor_ids: List[str], timeout: float = 5.0) -> None:
+        """Stop the probe writers for ``monitor_ids`` before a destructive change:
+        drop their scheduler jobs (loop thread) and wait until none of them is
+        in flight any more. The scheduler is resynced from the DB afterwards."""
+        if self._scheduler_started:
+            for mid in monitor_ids:
+                job_id = f"monitor:{mid}"
+                if self.scheduler.get_job(job_id):
+                    self.scheduler.remove_job(job_id)
+        wanted = set(monitor_ids)
+        deadline = time.monotonic() + timeout
+        while (self._inflight_probes & wanted) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+
+    def _delete_heartbeats_for(self, session, monitor_ids: Optional[List[str]]) -> int:
+        """Delete heartbeats of ``monitor_ids`` (``None`` = all) in PRUNE_BATCH-sized
+        statements so none of them can run into the core's statement cap."""
+        total = 0
+
+        def _batch() -> int:
+            q = session.query(MonitorHeartbeat.id)
+            if monitor_ids is not None:
+                q = q.filter(MonitorHeartbeat.monitor_id.in_(monitor_ids))
+            ids = [r[0] for r in q.order_by(MonitorHeartbeat.id).limit(self.PRUNE_BATCH).all()]
+            if ids:
+                session.query(MonitorHeartbeat).filter(MonitorHeartbeat.id.in_(ids)).delete(synchronize_session=False)
+            session.commit()
+            return len(ids)
+
+        while True:
+            n = self._retrying(session, _batch)
+            total += n
+            if n < self.PRUNE_BATCH:
+                return total
+
+    def delete_monitors(self, scope: str = "managed") -> Dict[str, int]:
+        """Delete monitors together with their heartbeats and daily aggregates.
+
+        ``managed`` → only monitors the IaC orchestrator created from the inventory
+        (``owner_source`` in MANAGED_OWNER_SOURCES); it recreates them on its next
+        inventory publish, manual (``ui_admin``) monitors survive. ``all`` → every
+        monitor. The caller resyncs the scheduler on the loop afterwards
+        (``sync_scheduler_jobs_from``) and calls ``reset_probe_state``.
+        """
+        ids = self.monitor_ids_for_scope(scope)
+        result = {"monitors": 0, "heartbeats": 0, "aggregates": 0}
+        session = self._maintenance_session()
+        if not session:
+            return result
+        try:
+            for i in range(0, len(ids), self.DELETE_CHUNK):
+                chunk = ids[i:i + self.DELETE_CHUNK]
+                result["heartbeats"] += self._delete_heartbeats_for(session, chunk)
+
+                def _rest() -> int:
+                    n = session.query(MonitorDailyAggregate).filter(
+                        MonitorDailyAggregate.monitor_id.in_(chunk)
+                    ).delete(synchronize_session=False)
+                    session.query(MonitorRecord).filter(MonitorRecord.monitor_id.in_(chunk)).delete(
+                        synchronize_session=False
+                    )
+                    session.commit()
+                    return n
+
+                result["aggregates"] += self._retrying(session, _rest)
+            result["monitors"] = len(ids)
+            return result
+        finally:
+            session.close()
+
+    def reset_statistics(self) -> Dict[str, int]:
+        """Delete every heartbeat and daily aggregate and reset the uptime columns —
+        but keep each monitor's current state, latency and last check (unlike
+        ``clear_states_db``, which also resets everything to UNKNOWN)."""
+        result = {"heartbeats": 0, "aggregates": 0}
+        session = self._maintenance_session()
+        if not session:
+            return result
+        try:
+            result["heartbeats"] = self._delete_heartbeats_for(session, None)
+
+            def _rest() -> int:
+                n = session.query(MonitorDailyAggregate).delete(synchronize_session=False)
+                session.query(MonitorRecord).update(
+                    {MonitorRecord.uptime_24h: 100.0, MonitorRecord.uptime_7d: 100.0, MonitorRecord.uptime_30d: 100.0},
+                    synchronize_session=False,
+                )
+                session.commit()
+                return n
+
+            result["aggregates"] = self._retrying(session, _rest)
+            return result
+        finally:
+            session.close()
+
+    def rebuild_statistics(self) -> Dict[str, int]:
+        """Recompute the daily aggregates from the raw heartbeats and refresh the
+        uptime windows — the repair job when counters look wrong."""
+        self._refresh_rollups_sync()
+        self._refresh_uptime_windows_sync()
+        return {"monitors": int(self.status_counts().get("monitor_count", 0))}
+
+    def reset_probe_state(self) -> None:
+        """Forget in-memory probe bookkeeping (flap counters, host circuit breakers,
+        view cache) after monitors were removed or states were reset."""
+        self._consec_failures.clear()
+        self._host_failures.clear()
+        self._host_circuit_until.clear()
+        self._view_cache.clear()
+
+    def request_full_probe(self) -> None:
+        """Queue a sweep that probes EVERY enabled monitor (not just stale/unknown
+        ones). Reported as a non-blocking ``starting`` status with progress."""
+        self._force_full_sweep = True
+        try:
+            self.enqueue_background_probe_refresh()
+        except RuntimeError:
+            # No running loop (tests) — the flag is honoured by the next sweep.
+            pass
 
     async def refresh_rollups(self):
         await asyncio.to_thread(self._refresh_rollups_sync)

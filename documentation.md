@@ -155,6 +155,27 @@ Plugin-Einstellungen (Settings-Dialog des Cores, in Vault gespeichert, angewende
 | `initial_probe_workers` | `8` | parallele Probes während der Startsequenz (1–64) |
 | `overview_cache_seconds` | `10` | Gültigkeit einer berechneten Übersicht für gleichzeitige Betrachter (0 = immer neu) |
 
+### Wartungsaktionen
+
+Im selben Settings-Dialog (Kategorie **Maintenance**, Manifest-Felder mit `kind: "action"`,
+Core-API ≥ 1.6) stehen Aufräum-Jobs als Buttons. Jeder ruft eine schreibgeschützte Route des
+Plugins (`POST /api/plugins/lyndrix.plugin.state_monitoring/maintenance/…`, Berechtigung
+`api:write`) und zeigt die Antwort (`message` + Zähler) an. Destruktive Aktionen fragen nach.
+
+| Aktion | Route | Wirkung |
+|---|---|---|
+| Alte Heartbeats jetzt bereinigen | `/maintenance/prune` | führt den stündlichen Retention-Job sofort aus (Batches à 20 000) |
+| Statistiken neu berechnen | `/maintenance/rebuild-stats` | Tagesaggregate aus den Roh-Heartbeats neu aufbauen + Uptime-Fenster auffrischen (Reparatur bei falschen Zählern) |
+| Alle Monitore jetzt prüfen | `/maintenance/probe-all` | Sweep über **alle** aktiven Monitore (nicht nur stale/unbekannt), nicht blockierend, Fortschritt im Banner |
+| Statistiken löschen | `/maintenance/reset-stats` | alle Heartbeats + Tagesaggregate löschen, Uptime auf 100 % — **Zustände bleiben** |
+| Zustände und Statistiken zurücksetzen | `/clear-states` | wie oben, zusätzlich jeder Monitor auf `UNKNOWN` (nächster Sweep ist blockierend) |
+| IaC-Monitore löschen | `/maintenance/delete-monitors/managed` | alle vom Orchestrator erzeugten Monitore (`owner_source` `orchestrator_service`/`iac_orchestrator`) samt Historie löschen; **der Orchestrator legt sie beim nächsten Inventar-Publish neu an** (Boot des Orchestrators oder Pipeline-Lauf); manuelle Monitore (`ui_admin`) bleiben |
+| ALLE Monitore löschen | `/maintenance/delete-monitors/all` | alles weg, inklusive manueller Monitore |
+
+Nach dem Löschen werden die Scheduler-Jobs auf dem Event-Loop neu synchronisiert und die
+In-Memory-Zähler (Flap-Dämpfung, Host-Circuit-Breaker, View-Cache) verworfen. Heartbeats werden
+auch hier in Batches gelöscht, damit kein Statement in die 60-s-Grenze des Cores läuft.
+
 ---
 
 ## Internationaliserung

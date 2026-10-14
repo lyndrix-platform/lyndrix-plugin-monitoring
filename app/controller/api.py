@@ -132,4 +132,96 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
             deleted = await asyncio.to_thread(service.clear_states_db)
         return {"deleted": deleted}
 
+    # ------------------------------------------------------------------
+    # Maintenance actions — the buttons in the core's plugin settings dialog
+    # (manifest settings_schema, kind="action"). All of them are write-gated and
+    # return a human-readable ``message`` the dialog shows after the run.
+    # ------------------------------------------------------------------
+
+    async def _resync_after_delete():
+        service.reset_probe_state()
+        records = await asyncio.to_thread(service._snapshot_records_for_scheduler)
+        service.sync_scheduler_jobs_from(records)
+
+    @router.post("/maintenance/prune")
+    async def maintenance_prune(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):
+        """Run the heartbeat retention job right now (same as the hourly job)."""
+        deleted = await service.prune_heartbeats()
+        return {
+            "status": "ok",
+            "deleted": deleted,
+            "message": f"Pruned {deleted} heartbeats older than {service._heartbeat_retention_days} days.",
+        }
+
+    @router.post("/maintenance/rebuild-stats")
+    async def maintenance_rebuild_stats(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):
+        """Recompute daily aggregates from raw heartbeats and refresh uptime windows."""
+        async with service.maintenance_window("Rebuilding statistics"):
+            result = await asyncio.to_thread(service.rebuild_statistics)
+        return {
+            "status": "ok",
+            **result,
+            "message": f"Rebuilt daily aggregates and uptime windows for {result['monitors']} monitors.",
+        }
+
+    @router.post("/maintenance/reset-stats")
+    async def maintenance_reset_stats(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):
+        """Destructive: delete all heartbeats + aggregates, keep monitor states."""
+        async with service.maintenance_window("Deleting statistics", blocking=True):
+            # Stop every probe writer first, then delete, then resync the jobs.
+            ids = await asyncio.to_thread(service.monitor_ids_for_scope, "all")
+            await service.quiesce_monitors(ids)
+            result = await asyncio.to_thread(service.reset_statistics)
+            await _resync_after_delete()
+        return {
+            "status": "ok",
+            **result,
+            "message": (
+                f"Deleted {result['heartbeats']} heartbeats and {result['aggregates']} daily aggregates; "
+                "monitor states were kept."
+            ),
+        }
+
+    @router.post("/maintenance/probe-all")
+    async def maintenance_probe_all(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):
+        """Queue a sweep over every enabled monitor (progress in the plugin banner)."""
+        service.request_full_probe()
+        counts = await asyncio.to_thread(service.status_counts)
+        return {
+            "status": "ok",
+            "monitors": counts.get("monitor_count", 0),
+            "message": f"Full probe sweep queued for {counts.get('monitor_count', 0)} monitors; progress shows in the plugin banner.",
+        }
+
+    @router.post("/maintenance/delete-monitors/{scope}")
+    async def maintenance_delete_monitors(
+        scope: str,
+        identity: ApiIdentity = Depends(require_permission(_PERM_WRITE)),
+    ):
+        """Destructive: delete monitors with their history.
+
+        ``managed`` removes the IaC-inventory monitors only (the orchestrator
+        recreates them on its next publish); ``all`` removes every monitor.
+        """
+        if scope not in ("managed", "all"):
+            raise HTTPException(status_code=400, detail="scope must be 'managed' or 'all'")
+        async with service.maintenance_window("Deleting monitors", blocking=True):
+            # Stop the probe writers of the affected monitors first (their jobs +
+            # in-flight probes), otherwise concurrent heartbeat/aggregate writes
+            # trip MariaDB's snapshot-isolation check (error 1020) mid-delete.
+            ids = await asyncio.to_thread(service.monitor_ids_for_scope, scope)
+            await service.quiesce_monitors(ids)
+            result = await asyncio.to_thread(service.delete_monitors, scope)
+            await _resync_after_delete()
+        hint = (
+            " The IaC orchestrator recreates its monitors on the next inventory publish."
+            if scope == "managed" else ""
+        )
+        return {
+            "status": "ok",
+            "scope": scope,
+            **result,
+            "message": f"Deleted {result['monitors']} monitors with {result['heartbeats']} heartbeats.{hint}",
+        }
+
     return router
