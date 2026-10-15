@@ -135,10 +135,11 @@ Core-Doku *High Availability*), gilt für dieses Plugin:
   `LYNDRIX_INSTANCE_ROLES`, z. B. `runner`), bewirbt sich nur eine Instanz mit einer dieser Rollen
   um die Prober-Lease — so lässt sich das Probing auf Docker-Hosts mit ICMP/`NET_RAW` und
   passendem Netzzugang festlegen. Leer (Standard) = jede Instanz. Trägt keine lebende Instanz eine
-  der Rollen, probt niemand (Warnung im Log, `health()` zeigt `probe_eligible: false`). Eine
-  **Erweiterung** wirkt sofort (`plugin:settings_changed`), eine **Einschränkung** erst nach
-  Plugin-Reload/Neustart — der Core bietet keine öffentliche Möglichkeit, eine gewünschte Lease
-  wieder abzugeben.
+  der Rollen, probt niemand (Warnung im Log, `health()` zeigt `probe_eligible: false`). Änderungen
+  wirken sofort (`plugin:settings_changed`): eine **Erweiterung** lässt die Instanz um die Lease
+  bewerben, eine **Einschränkung** gibt eine gehaltene Lease per `ctx.release_lease` (Core-API
+  ≥ 1.9) sofort ab — `stop_probing` läuft, eine berechtigte Instanz übernimmt beim nächsten
+  Heartbeat. Auf älteren Cores greift eine Einschränkung erst nach Plugin-Reload/Neustart.
 - **Verteiltes Probing (`probe_nodes` > 1, Core-API ≥ 1.8).** Statt einer Lease teilen sich
   bis zu `probe_nodes` Instanzen (gefiltert nach `probe_roles`) die Monitore per
   Rendezvous-Hashing (`ctx.my_shard("probe", monitor_ids, count=probe_nodes, roles=…)`): jede

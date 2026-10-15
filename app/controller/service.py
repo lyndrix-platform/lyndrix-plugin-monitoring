@@ -34,7 +34,7 @@ from .scheduler import SimpleAsyncScheduler
 from .provider.http import is_http_target, run_http_probe
 from .provider.icmp import run_icmp_probe
 from .provider.tcp import looks_like_network_target, run_tcp_probe, tcp_fallback_ports
-from .provider.docker import is_docker_host, run_docker_service_probe
+from .provider.docker import run_docker_service_probe
 
 
 class MonitoringService:
@@ -275,9 +275,9 @@ class MonitoringService:
 
     def claim_prober_lease(self) -> None:
         """Contend for ``monitoring:prober`` if this instance may probe. Must run
-        on the loop. Idempotent; a lease once wanted is kept until the plugin is
-        reloaded (the core has no public "unwant") — narrowing ``probe_roles``
-        therefore takes effect on the next plugin reload/restart."""
+        on the loop. Idempotent. When ``probe_roles`` no longer includes this
+        instance the lease is given up again (core API ≥ 1.9 ``ctx.release_lease``;
+        older cores keep it until the plugin is reloaded)."""
         self._placement_ready = True
         if self._probe_mode is None:
             self._probe_mode = self._desired_probe_mode()
@@ -289,6 +289,8 @@ class MonitoringService:
             self.start_probing()  # core < 1.7: one instance, probe here
             return
         if self._lease_wanted:
+            if not self.may_probe():
+                self._drop_prober_lease()
             return
         if not self.may_probe():
             roles = ",".join(sorted(self._probe_roles))
@@ -306,6 +308,30 @@ class MonitoringService:
             return
         self._lease_wanted = True
         on_lease("monitoring:prober", acquired=self.start_probing, lost=self.stop_probing)
+
+    def _drop_prober_lease(self) -> None:
+        """``probe_roles`` excludes this instance now: stop contending for the
+        prober lease. On core API ≥ 1.9 ``ctx.release_lease`` releases a held lease
+        at once and fires ``lost`` (→ ``stop_probing``), so a peer with a probe
+        role takes over within a heartbeat. Older cores cannot give a wanted lease
+        up — there the change applies after a plugin reload/restart."""
+        roles = ",".join(sorted(self._probe_roles))
+        release = getattr(self.ctx, "release_lease", None)
+        if not callable(release):
+            self.ctx.log.warning(
+                f"State Monitoring: probe_roles={roles} excludes this instance, but this core "
+                "cannot give a lease up (API < 1.9) — takes effect after a plugin reload/restart."
+            )
+            return
+        try:
+            release("monitoring:prober")
+        except Exception as exc:
+            self.ctx.log.warning(f"State Monitoring: could not release the prober lease — {exc}")
+            return
+        self._lease_wanted = False
+        self.ctx.log.info(
+            f"State Monitoring: probe_roles={roles} — gave the prober lease up; this instance no longer probes."
+        )
 
     # ------------------------------------------------------------------
     # Probe sharding (setting ``probe_nodes``, core API >= 1.8)
@@ -400,9 +426,12 @@ class MonitoringService:
             return
         if self.is_sharded:
             self._reconcile_sharded()  # probe_nodes / probe_roles apply at once
-        # Lease mode: probe_roles widened at runtime → contend now (narrowing needs a reload).
-        elif getattr(self.ctx, "on_lease", None) and not self._lease_wanted and self.may_probe():
-            self.claim_prober_lease()
+        # Lease mode: probe_roles widened → contend now; narrowed → give the lease up.
+        elif callable(getattr(self.ctx, "on_lease", None)):
+            if not self._lease_wanted and self.may_probe():
+                self.claim_prober_lease()
+            elif self._lease_wanted and not self.may_probe():
+                self._drop_prober_lease()
 
     def on_monitors_changed(self, payload: Optional[Dict[str, Any]]) -> None:
         """``monitoring:monitors_changed`` subscriber. Our own emits already took

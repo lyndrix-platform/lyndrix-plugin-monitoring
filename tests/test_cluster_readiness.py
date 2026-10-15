@@ -315,6 +315,56 @@ def test_settings_changed_reapplies_and_widens_roles(svc):
     assert s._heartbeat_retention_days == 3 and ctx.wanted == ["monitoring:prober"]
 
 
+class _ReleaseCtx(_LeaseCtx):
+    """Core API >= 1.9: the context can give a wanted lease up again."""
+
+    def __init__(self, roles, settings=None):
+        super().__init__(roles, settings)
+        self.released = []
+        self._lost = None
+
+    def on_lease(self, name, *, acquired=None, lost=None, ttl=None):
+        super().on_lease(name, acquired=acquired, lost=lost, ttl=ttl)
+        self._lost = lost
+
+    def release_lease(self, name):
+        self.released.append(name)
+        self.wanted.remove(name)
+        if self._lost is not None:  # the core fires lost for a held lease
+            res = self._lost()
+            if asyncio.iscoroutine(res):
+                asyncio.get_event_loop().run_until_complete(res) if not asyncio.get_event_loop().is_running() else asyncio.ensure_future(res)
+        return True
+
+
+def test_settings_changed_narrows_roles_and_releases_the_lease(svc):
+    ctx = _ReleaseCtx(["api", "leader"], {"probe_roles": ""})
+    s = _svc_with(svc, ctx)
+    asyncio.run(s.init_placement())
+    assert ctx.wanted == ["monitoring:prober"] and s._lease_wanted
+
+    async def run():
+        ctx._settings = {"probe_roles": "runner"}  # this instance has no runner role
+        await s.reload_settings()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+    assert ctx.released == ["monitoring:prober"] and ctx.wanted == [] and not s._lease_wanted
+    # widened again → contends again
+    ctx._settings = {"probe_roles": ""}
+    asyncio.run(s.reload_settings())
+    assert ctx.wanted == ["monitoring:prober"] and s._lease_wanted
+
+
+def test_settings_changed_narrows_roles_on_old_core_only_warns(svc):
+    ctx = _LeaseCtx(["api"], {"probe_roles": ""})   # no release_lease
+    s = _svc_with(svc, ctx)
+    asyncio.run(s.init_placement())
+    ctx._settings = {"probe_roles": "runner"}
+    asyncio.run(s.reload_settings())
+    assert ctx.wanted == ["monitoring:prober"] and s._lease_wanted  # kept until reload
+
+
 # ── #14 stop_probing leaves the API usable ───────────────────────────────────
 
 def test_stop_probing_resets_stopping(svc):

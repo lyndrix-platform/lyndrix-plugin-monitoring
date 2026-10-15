@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-10-15
+### Changed
+- Narrowing `probe_roles` at runtime now takes effect at once: an instance that may no longer probe gives the prober lease up via `ctx.release_lease` (core API ≥ 1.9), its `stop_probing` runs and an eligible peer takes over on its next heartbeat. Older cores keep the previous behaviour (reload needed, warning logged).
+
 ## [1.6.0] - 2026-10-15
 ### Added
 - Probe sharding: setting `probe_nodes` (default 1). With > 1 and core API ≥ 1.8, up to `probe_nodes` eligible instances (`probe_roles`) split the monitors via `ctx.my_shard("probe", …)` instead of one lease-holding prober; the shard is recomputed on `cluster:changed` and on every monitor-set change, starting/stopping only the jobs that moved.
