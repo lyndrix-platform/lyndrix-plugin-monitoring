@@ -46,7 +46,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="1.4.0",
+    version="1.5.0",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -78,6 +78,9 @@ manifest = ModuleManifest(
         {"key": "overview_cache_seconds", "label": "Overview cache (seconds)", "kind": "int",
          "category": "Dashboard", "default": "10",
          "description": "How long a computed overview is served to concurrent viewers before it is recomputed (0 = always recompute)."},
+        {"key": "probe_roles", "label": "Probe roles", "kind": "str",
+         "category": "Probing", "default": "",
+         "description": "Cluster only: comma-separated instance roles (LYNDRIX_INSTANCE_ROLES) allowed to run the prober, e.g. 'runner' for hosts with ICMP/NET_RAW. Empty = any instance. Narrowing takes effect after a plugin reload."},
         # Maintenance jobs (core API >= 1.6, kind="action"): buttons in the same
         # dialog that call the write-gated /maintenance/* routes in app/controller/api.py.
         {"key": "action_prune", "label": "Prune old heartbeats now", "kind": "action",
@@ -111,8 +114,12 @@ manifest = ModuleManifest(
             "monitoring:admin_override",
             # Cluster: a peer changed the monitor set → the prober reloads its jobs.
             "monitoring:monitors_changed",
+            # Cluster: a peer runs destructive maintenance → the prober pauses probes.
+            "monitoring:quiesce",
+            # Core >= 1.5.1 (bridged): the operator saved this plugin's settings.
+            "plugin:settings_changed",
         ],
-        "emit": ["monitoring:state_changed", "monitoring:monitors_changed", "messaging:outbound"],
+        "emit": ["monitoring:state_changed", "monitoring:monitors_changed", "monitoring:quiesce"],
     },
     # Identity 2.0: roles auto-mapped onto groups. Permissions are written
     # FULLY QUALIFIED (plugin:<id>:api:read / :api:write) rather than the bare
@@ -254,6 +261,7 @@ async def health(ctx) -> PluginHealthStatus:
     details = {
         "db_connected": True,
         "prober": prober,
+        "probe_eligible": bool(getattr(svc, "may_probe", lambda: True)()),
         "scheduler_started": bool(getattr(svc, "_scheduler_started", False)),
         "scheduler_jobs": len(jobs),
         "monitors_configured": counts.get("monitor_count", 0),
@@ -288,15 +296,13 @@ def setup(ctx):
     # unauthenticated. Routes run on EVERY instance (reads from the shared DB).
     ctx.register_routes(build_plugin_router(service))
 
-    # Cluster placement (core API ≥ 1.7): exactly one instance probes. The lease
-    # is granted immediately in single mode; on a cluster the holder's death
-    # hands it over within the lease TTL. Older cores: start probing directly.
-    on_lease = getattr(ctx, "on_lease", None)
-    if callable(on_lease):
-        on_lease("monitoring:prober", acquired=service.start_probing, lost=service.stop_probing)
-        service.queue_bootstrap()  # tables for the API; sweeps wait for the lease
-    else:
-        service.start_probing()
+    # Cluster placement (core API ≥ 1.7): exactly one instance probes, under the
+    # "monitoring:prober" lease (granted immediately in single mode). Settings are
+    # loaded first — ``probe_roles`` decides whether this instance contends at
+    # all. Older cores: probe directly.
+    service.queue_bootstrap()  # tables for the API; sweeps wait for the lease
+    create_task = getattr(ctx, "create_task", None) or asyncio.create_task
+    create_task(service.init_placement(), name="monitoring:placement")
 
     @nicegui_app.on_shutdown
     async def _on_shutdown():
@@ -312,18 +318,20 @@ def setup(ctx):
 
     @ctx.subscribe("monitoring:monitors_changed")
     async def on_monitors_changed(payload):
-        # Our own changes already resynced locally; a peer's change (bridged
-        # event, ``_origin`` set) means the prober must reload its jobs.
-        if (payload or {}).get("_origin"):
-            service.request_resync()
+        service.on_monitors_changed(payload)  # peers only (``_origin``)
+
+    @ctx.subscribe("monitoring:quiesce")
+    async def on_quiesce(payload):
+        service.on_quiesce(payload)  # peers only (``_origin``)
 
     @ctx.subscribe("vault:ready_for_data")
     async def on_vault_ready(payload):
-        try:
-            values = await asyncio.to_thread(ctx.get_all_settings)  # Vault I/O is blocking
-            service.apply_settings(values or {})
-        except Exception as exc:
-            ctx.log.warning(f"State Monitoring: could not apply settings — {exc}")
+        await service.reload_settings()
+
+    @ctx.subscribe("plugin:settings_changed")
+    async def on_settings_changed(payload):
+        if (payload or {}).get("plugin_id") == manifest.id:
+            await service.reload_settings()
 
     @ctx.subscribe("monitoring:config_upsert")
     async def on_config_upsert(payload):

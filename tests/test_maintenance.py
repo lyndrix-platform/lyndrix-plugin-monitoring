@@ -96,6 +96,7 @@ def test_request_full_probe_forces_every_monitor_without_blocking(svc):
     _beat(svc, mid, "UP")  # fresh + UP → not a candidate for the normal sweep
     assert svc._load_probe_candidates() == []
 
+    svc._probing = True  # only the prober sweeps (a standby forwards via the bus)
     svc.request_full_probe()
     assert svc._load_probe_candidates() == [mid]
     assert svc._sweep_blocking is False

@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, case, func
+from sqlalchemy import Boolean, Column, DateTime, Float, Index, Integer, String, Text, case, func
 
 from core.api import Base
 
@@ -71,7 +71,13 @@ class MonitorHeartbeat(Base):
 
 class MonitorDailyAggregate(Base):
     __tablename__ = "monitoring_daily_aggregates"
-    __table_args__ = {"extend_existing": True}
+    # One row per monitor and day: lets the probe writers upsert atomically
+    # (INSERT … ON DUPLICATE KEY UPDATE). Existing installs get it through the
+    # deduplicating migration in MonitoringService._ensure_daily_aggregate_unique.
+    __table_args__ = (
+        Index("uq_monitoring_daily_aggregates_monitor_day", "monitor_id", "day", unique=True),
+        {"extend_existing": True},
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     monitor_id = Column(String(191), nullable=False, index=True)

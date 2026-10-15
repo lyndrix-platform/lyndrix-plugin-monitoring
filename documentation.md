@@ -118,8 +118,8 @@ Core-Doku *High Availability*), gilt für dieses Plugin:
 
 - **Jede Instanz bedient die API** (`/overview`, `/dashboard`, Wartungsaktionen …) aus der
   gemeinsamen Datenbank. Das Plugin hat `placement: any`.
-- **Genau eine Instanz probt.** In `setup()` meldet das Plugin `ctx.on_lease("monitoring:prober",
-  acquired=start_probing, lost=stop_probing)`. Nur der Lease-Halter startet Scheduler, Startup-Sweep
+- **Genau eine Instanz probt.** Nach dem Laden der Einstellungen meldet das Plugin
+  `ctx.on_lease("monitoring:prober", acquired=start_probing, lost=stop_probing)`. Nur der Lease-Halter startet Scheduler, Startup-Sweep
   und Housekeeping (Prune, Rollups, Uptime-Fenster). Stirbt er, übernimmt eine andere Instanz
   innerhalb der Lease-TTL (Standard 30 s). Im Single-Modus wird die Lease sofort gewährt — ein
   Code-Pfad für beide Betriebsarten. Auf einem älteren Core ohne `on_lease` startet das Plugin
@@ -131,6 +131,37 @@ Core-Doku *High Availability*), gilt für dieses Plugin:
   der Orchestrator läuft), Einzel-Upserts und die Wartungsaktionen senden
   `monitoring:monitors_changed` mit `cluster=True`; der Prober lädt daraufhin seine Jobs neu und
   probt die neuen Monitore.
+- **Probe-Standort (`probe_roles`).** Ist die Einstellung gesetzt (Komma-Liste von Rollen aus
+  `LYNDRIX_INSTANCE_ROLES`, z. B. `runner`), bewirbt sich nur eine Instanz mit einer dieser Rollen
+  um die Prober-Lease — so lässt sich das Probing auf Docker-Hosts mit ICMP/`NET_RAW` und
+  passendem Netzzugang festlegen. Leer (Standard) = jede Instanz. Trägt keine lebende Instanz eine
+  der Rollen, probt niemand (Warnung im Log, `health()` zeigt `probe_eligible: false`). Eine
+  **Erweiterung** wirkt sofort (`plugin:settings_changed`), eine **Einschränkung** erst nach
+  Plugin-Reload/Neustart — der Core bietet keine öffentliche Möglichkeit, eine gewünschte Lease
+  wieder abzugeben.
+- **Einstellungen gelten clusterweit.** Speichert der Operator die Plugin-Einstellungen, sendet
+  der Core (≥ 1.5.1) das gebridgte Event `plugin:settings_changed`; jede Instanz liest die Werte
+  dann neu aus Vault.
+- **„Alle Monitore jetzt prüfen“ auf einem Standby** setzt nichts lokal, sondern sendet
+  `monitoring:monitors_changed` mit `{"reason": "probe_all"}` (`cluster=True`); der Prober startet
+  beim Empfang den vollständigen Sweep. Die Antwort enthält `prober_here`.
+- **Destruktive Wartung stoppt den Prober clusterweit (Quiesce).** Löschen von Statistiken,
+  Zuständen oder Monitoren läuft auf der Instanz, die den Request erhält. Vorher sendet sie
+  `monitoring:quiesce` `{"on": true, "ttl": 120}` (`cluster=True`); der Prober überspringt
+  daraufhin alle Probes. Ist die ausführende Instanz selbst nicht Prober, wartet sie zusätzlich
+  3 s (Bus-Relay + Abarbeitung laufender Probes). Danach `{"on": false}` und
+  `monitoring:monitors_changed` (`maintenance`) → der Prober lädt seine Jobs neu. Geht das
+  „off“-Event verloren, endet der Quiesce nach der TTL von selbst. Die Löschungen laufen
+  zusätzlich in READ-COMMITTED-Batches mit Retry auf 1020/1205/1213, ein verspäteter
+  Probe-Schreibzugriff bricht sie also nicht ab. Das blockierende Wartungsfenster (503) gilt nur
+  auf der ausführenden Instanz. Gewählt wurde das Event statt `ctx.lease("monitoring:prober")`,
+  weil die One-Shot-Lease auf einem Standby nie gewährt würde (der Prober hält sie dauerhaft).
+- **Inventar-Import per REST** (`POST /inventory-sync`) synchronisiert danach ebenfalls die Jobs,
+  stößt den Sweep an und meldet die Änderung clusterweit — wie der Bus-Pfad.
+- **Hintergrundjobs überleben Fehler.** Wirft ein Scheduler-Lauf (z. B. DB-Fehler), wird das
+  geloggt und der Job läuft weiter; nach wiederholten Fehlern mit kurzer zusätzlicher Pause
+  (2, 4, 8 … max. 60 s). Rollups und Uptime-Fenster schreiben in Häppchen à 200 Monitore
+  (READ COMMITTED, Retry).
 - **Verlorene Schreibvorgänge sind kein Fehler.** Schlägt das Speichern eines Probe-Ergebnisses
   mit MariaDB 1020/1205/1213 fehl (Wartung auf einer anderen Instanz, Lease-Übergabe), wird die
   Stichprobe verworfen und der nächste Intervall-Lauf probt erneut — der Scheduler-Job lebt weiter.
@@ -142,9 +173,11 @@ Core-Doku *High Availability*), gilt für dieses Plugin:
 | Richtung | Topic | Beschreibung |
 |---|---|---|
 | subscribe | `db:connected` | Datenbank bereit — Tabellen initialisieren |
-| subscribe | `vault:ready_for_data` | Plugin-Einstellungen (Retention, Worker, Cache) aus Vault anwenden |
+| subscribe | `vault:ready_for_data` | Plugin-Einstellungen (Retention, Worker, Cache, `probe_roles`) aus Vault anwenden |
+| subscribe | `plugin:settings_changed` | Core ≥ 1.5.1, gebridgt: Operator hat die Einstellungen gespeichert → bei passender `plugin_id` neu laden |
 | subscribe | `monitoring:inventory_sync` | Inventar-Sync vom IaC Orchestrator empfangen |
-| subscribe / emit | `monitoring:monitors_changed` | Monitor-Satz geändert (Inventar, Upsert, Wartung) — mit `cluster=True` an alle Instanzen; der Prober lädt seine Jobs neu |
+| subscribe / emit | `monitoring:monitors_changed` | Monitor-Satz geändert (Inventar, Upsert, Admin-Override, Wartung) — mit `cluster=True` an alle Instanzen; der Prober lädt seine Jobs neu, bei `reason: probe_all` startet er einen vollständigen Sweep |
+| subscribe / emit | `monitoring:quiesce` | `{"on": bool, "ttl"}` mit `cluster=True` — destruktive Wartung auf einer anderen Instanz, der Prober pausiert alle Probes |
 | emit | `monitoring:status_changed` | Statusänderung eines Monitors |
 | emit | `system:notify` | Plattform-Benachrichtigung bei Statusänderungen |
 
@@ -162,10 +195,14 @@ Alle Modelle verwenden `extend_existing=True`, um `InvalidRequestError` beim Plu
 |---|---|
 | `monitoring_monitors` | Monitor-Register (ID, Name, Typ, Gruppe, letzter Status, Uptime-Fenster 24h/7d/30d) |
 | `monitoring_heartbeats` | Rohe Probe-Ergebnisse (Zeitstempel, Status, Latenz, Quelle); Retention `heartbeat_retention_days`; Indizes `monitor_id`, `created_at`, `(monitor_id, created_at)` |
-| `monitoring_daily_aggregates` | Tagesaggregate je Monitor (Samples gesamt/up/down/paused, Latenz-Mittel, `latency_samples`) — Quelle für `uptime_all`/7d/30d |
+| `monitoring_daily_aggregates` | Tagesaggregate je Monitor (Samples gesamt/up/down/paused, Latenz-Mittel, `latency_samples`) — Quelle für `uptime_all`/7d/30d; eindeutiger Schlüssel `uq_monitoring_daily_aggregates_monitor_day` auf `(monitor_id, day)` |
 
 Schemaänderungen (Index, neue Spalte) werden in `MonitoringService._ensure_schema` idempotent
 nachgezogen (`CREATE INDEX IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS`).
+`_ensure_daily_aggregate_unique` führt vorhandene Duplikate je `(monitor_id, day)` zusammen
+(Zähler summiert, Latenz-Mittel nach `latency_samples` gewichtet, Zeile mit kleinster `id` bleibt)
+und legt dann den eindeutigen Index an (1061 „Duplicate key name“ wird toleriert). Auf MariaDB
+schreibt jede Probe ihr Tagesaggregat atomar per `INSERT … ON DUPLICATE KEY UPDATE`.
 
 ---
 
@@ -181,6 +218,10 @@ Plugin-Einstellungen (Settings-Dialog des Cores, in Vault gespeichert, angewende
 | `heartbeat_retention_days` | `7` | Aufbewahrung roher Heartbeats (1–365) |
 | `initial_probe_workers` | `8` | parallele Probes während der Startsequenz (1–64) |
 | `overview_cache_seconds` | `10` | Gültigkeit einer berechneten Übersicht für gleichzeitige Betrachter (0 = immer neu) |
+| `probe_roles` | leer | nur Cluster: Instanz-Rollen, die proben dürfen (Komma-Liste, z. B. `runner`); leer = jede Instanz — siehe *Cluster-Betrieb* |
+
+Die Einstellungen werden beim Laden des Plugins, nach `vault:ready_for_data` und bei
+`plugin:settings_changed` (Core ≥ 1.5.1) angewendet.
 
 ### Wartungsaktionen
 
@@ -193,13 +234,14 @@ Plugins (`POST /api/plugins/lyndrix.plugin.state_monitoring/maintenance/…`, Be
 |---|---|---|
 | Alte Heartbeats jetzt bereinigen | `/maintenance/prune` | führt den stündlichen Retention-Job sofort aus (Batches à 20 000) |
 | Statistiken neu berechnen | `/maintenance/rebuild-stats` | Tagesaggregate aus den Roh-Heartbeats neu aufbauen + Uptime-Fenster auffrischen (Reparatur bei falschen Zählern) |
-| Alle Monitore jetzt prüfen | `/maintenance/probe-all` | Sweep über **alle** aktiven Monitore (nicht nur stale/unbekannt), nicht blockierend, Fortschritt im Banner |
+| Alle Monitore jetzt prüfen | `/maintenance/probe-all` | Sweep über **alle** aktiven Monitore (nicht nur stale/unbekannt), nicht blockierend, Fortschritt im Banner — läuft immer auf der Prober-Instanz (siehe *Cluster-Betrieb*) |
 | Statistiken löschen | `/maintenance/reset-stats` | alle Heartbeats + Tagesaggregate löschen, Uptime auf 100 % — **Zustände bleiben** |
 | Zustände und Statistiken zurücksetzen | `/clear-states` | wie oben, zusätzlich jeder Monitor auf `UNKNOWN` (nächster Sweep ist blockierend) |
 | IaC-Monitore löschen | `/maintenance/delete-monitors/managed` | alle vom Orchestrator erzeugten Monitore (`owner_source` `orchestrator_service`/`iac_orchestrator`) samt Historie löschen; **der Orchestrator legt sie beim nächsten Inventar-Publish neu an** (Boot des Orchestrators oder Pipeline-Lauf); manuelle Monitore (`ui_admin`) bleiben |
 | ALLE Monitore löschen | `/maintenance/delete-monitors/all` | alles weg, inklusive manueller Monitore |
 
-Nach dem Löschen werden die Scheduler-Jobs auf dem Event-Loop neu synchronisiert und die
+Vor dem Löschen werden alle Probe-Schreiber clusterweit angehalten (Quiesce, siehe
+*Cluster-Betrieb*). Nach dem Löschen werden die Scheduler-Jobs auf dem Event-Loop neu synchronisiert und die
 In-Memory-Zähler (Flap-Dämpfung, Host-Circuit-Breaker, View-Cache) verworfen. Heartbeats werden
 auch hier in Batches gelöscht, damit kein Statement in die 60-s-Grenze des Cores läuft.
 

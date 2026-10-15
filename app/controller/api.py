@@ -119,7 +119,8 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
         payload: InventorySyncPayload,
         identity: ApiIdentity = Depends(require_permission(_PERM_WRITE)),
     ):
-        return await asyncio.to_thread(service.ingest_inventory_snapshot, payload)
+        # Ingest + give the new monitors probe jobs + announce it to the prober.
+        return await service.ingest_inventory(payload)
 
     @router.post("/clear-states")
     async def clear_states(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):
@@ -129,7 +130,8 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
         clients and the React UI can perform and audit the operation.
         """
         async with service.maintenance_window("Clearing monitor states"):
-            deleted = await asyncio.to_thread(service.clear_states_db)
+            # Quiesces the prober (also on another instance), deletes, resyncs.
+            deleted = await service.clear_states()
         return {"deleted": deleted}
 
     # ------------------------------------------------------------------
@@ -138,12 +140,11 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
     # return a human-readable ``message`` the dialog shows after the run.
     # ------------------------------------------------------------------
 
-    async def _resync_after_delete():
-        service.reset_probe_state()
-        records = await asyncio.to_thread(service._snapshot_records_for_scheduler)
-        service.sync_scheduler_jobs_from(records)
-        # The prober may be another instance — it reloads its jobs on this event.
-        service._notify_monitors_changed("maintenance", count=len(records or []))
+    # Destructive jobs run on whichever instance received the request. The
+    # prober may be a peer: ``service.quiesced`` stops its probe writers through
+    # the bridged ``monitoring:quiesce`` event, ``resync_after_delete`` makes it
+    # reload its jobs afterwards. The blocking maintenance window (503s) is
+    # local to the instance running the job.
 
     @router.post("/maintenance/prune")
     async def maintenance_prune(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):
@@ -172,9 +173,9 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
         async with service.maintenance_window("Deleting statistics", blocking=True):
             # Stop every probe writer first, then delete, then resync the jobs.
             ids = await asyncio.to_thread(service.monitor_ids_for_scope, "all")
-            await service.quiesce_monitors(ids)
-            result = await asyncio.to_thread(service.reset_statistics)
-            await _resync_after_delete()
+            async with service.quiesced(ids):
+                result = await asyncio.to_thread(service.reset_statistics)
+            await service.resync_after_delete()
         return {
             "status": "ok",
             **result,
@@ -186,13 +187,20 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
 
     @router.post("/maintenance/probe-all")
     async def maintenance_probe_all(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):
-        """Queue a sweep over every enabled monitor (progress in the plugin banner)."""
-        service.request_full_probe()
+        """Queue a sweep over every enabled monitor (progress in the plugin banner).
+
+        Runs on the prober: locally when this instance holds the lease, otherwise
+        the bridged ``monitoring:monitors_changed`` {"reason": "probe_all"} asks it."""
+        service.request_full_probe_cluster()
         counts = await asyncio.to_thread(service.status_counts)
         return {
             "status": "ok",
             "monitors": counts.get("monitor_count", 0),
-            "message": f"Full probe sweep queued for {counts.get('monitor_count', 0)} monitors; progress shows in the plugin banner.",
+            "prober_here": service.is_prober,
+            "message": (
+                f"Full probe sweep queued for {counts.get('monitor_count', 0)} monitors on the prober instance; "
+                "progress shows in the plugin banner there."
+            ),
         }
 
     @router.post("/maintenance/delete-monitors/{scope}")
@@ -212,9 +220,9 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
             # in-flight probes), otherwise concurrent heartbeat/aggregate writes
             # trip MariaDB's snapshot-isolation check (error 1020) mid-delete.
             ids = await asyncio.to_thread(service.monitor_ids_for_scope, scope)
-            await service.quiesce_monitors(ids)
-            result = await asyncio.to_thread(service.delete_monitors, scope)
-            await _resync_after_delete()
+            async with service.quiesced(ids):
+                result = await asyncio.to_thread(service.delete_monitors, scope)
+            await service.resync_after_delete()
         hint = (
             " The IaC orchestrator recreates its monitors on the next inventory publish."
             if scope == "managed" else ""

@@ -1,13 +1,13 @@
 import asyncio
 import json
 import time
-from contextlib import nullcontext, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 import httpx
 from sqlalchemy import case, func, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from core.api import db_instance
 
@@ -45,7 +45,12 @@ class MonitoringService:
 
     def __init__(self, ctx):
         self.ctx = ctx
-        self.scheduler = SimpleAsyncScheduler()
+        self.scheduler = SimpleAsyncScheduler(log=getattr(ctx, "log", None))
+        # The core event loop. setup() runs on it; API/bus handlers call the sync
+        # write API through asyncio.to_thread, so scheduler task creation and
+        # ctx.emit from those workers must hop back onto this loop.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._remember_loop()
         # Redirects are followed manually by the http provider (run_http_probe)
         # so every hop can be re-validated against the SSRF guard — a client
         # with follow_redirects=True would chase a monitored host's
@@ -71,6 +76,14 @@ class MonitoringService:
         # serves the API; only the prober runs scheduler, sweeps and housekeeping.
         self._probing = False
         self._resync_task: Optional[asyncio.Task] = None
+        # Cluster quiesce: while monotonic() < this deadline the prober skips every
+        # probe (a destructive maintenance job runs, possibly on another instance).
+        self._quiesced_until = 0.0
+        # Probe vantage point (setting ``probe_roles``): empty = any instance may
+        # hold the prober lease; otherwise only instances with one of these roles.
+        self._probe_roles: set = set()
+        self._lease_wanted = False
+        self._placement_ready = False
         # Decided by _load_probe_candidates(): the sweep only blocks the UI when it
         # has monitors we know nothing about (UNKNOWN or stale) — re-probing a set
         # of persistently DOWN monitors after every restart is not a warm-up.
@@ -97,6 +110,63 @@ class MonitoringService:
         if not db_instance.is_connected or not db_instance.SessionLocal:
             return None
         return db_instance.SessionLocal()
+
+    def _rc_session(self):
+        """Session pinned to READ COMMITTED on MariaDB/MySQL (snapshot isolation
+        would turn concurrent writers into error 1020); other dialects unchanged."""
+        session = self._session()
+        if session is None:
+            return None
+        try:
+            bind = session.get_bind()
+            if getattr(getattr(bind, "dialect", None), "name", "") in ("mysql", "mariadb"):
+                session.connection(execution_options={"isolation_level": "READ COMMITTED"})
+        except Exception as exc:  # an optimisation, never a reason to fail
+            self.ctx.log.debug(f"State Monitoring: READ COMMITTED not applied: {exc}")
+        return session
+
+    # ------------------------------------------------------------------
+    # Event-loop marshalling (sync write API runs in to_thread workers)
+    # ------------------------------------------------------------------
+
+    def _remember_loop(self) -> None:
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _on_loop_thread() -> bool:
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+
+    def _call_on_loop(self, fn, *args) -> bool:
+        """Run ``fn(*args)`` now when we are on the loop thread, otherwise hand it
+        to the core loop with ``call_soon_threadsafe``. Returns False when no
+        running loop is known (the call is dropped)."""
+        if self._on_loop_thread():
+            fn(*args)
+            return True
+        loop = self._loop
+        if loop is not None and loop.is_running() and not loop.is_closed():
+            loop.call_soon_threadsafe(fn, *args)
+            return True
+        return False
+
+    def _emit(self, topic: str, payload: Dict[str, Any]) -> None:
+        """``ctx.emit`` from any thread: the bus schedules async subscribers with
+        ``asyncio.create_task`` → only valid on the loop thread."""
+        def _do():
+            try:
+                self.ctx.emit(topic, payload)
+            except Exception as exc:
+                self.ctx.log.debug(f"State Monitoring: emit {topic} failed: {exc}")
+
+        if not self._call_on_loop(_do):
+            _do()  # no loop known (tests / sync callers): emit directly
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -135,6 +205,7 @@ class MonitoringService:
             return
         self._probing = True
         self._stopping = False
+        self._remember_loop()
         if getattr(self.http_client, "is_closed", False):
             self.http_client = httpx.AsyncClient(follow_redirects=False)
         self.start()
@@ -149,6 +220,88 @@ class MonitoringService:
         self._probing = False
         self.ctx.log.warning("State Monitoring: prober lease lost — stopping probes on this instance.")
         await self.stop()
+        # stop() flags the background writers to stop; on a lease loss the
+        # process lives on and the API (e.g. /maintenance/prune) must still work.
+        self._stopping = False
+
+    # ------------------------------------------------------------------
+    # Probe vantage point (setting ``probe_roles``)
+    # ------------------------------------------------------------------
+
+    def may_probe(self) -> bool:
+        """True when this instance is allowed to hold the prober lease: no
+        ``probe_roles`` configured, or this instance carries one of them. A core
+        without ``ctx.roles`` (single instance, old API) always may."""
+        if not self._probe_roles:
+            return True
+        roles = getattr(self.ctx, "roles", None)
+        if roles is None:
+            return True
+        return bool(set(roles) & self._probe_roles)
+
+    def claim_prober_lease(self) -> None:
+        """Contend for ``monitoring:prober`` if this instance may probe. Must run
+        on the loop. Idempotent; a lease once wanted is kept until the plugin is
+        reloaded (the core has no public "unwant") — narrowing ``probe_roles``
+        therefore takes effect on the next plugin reload/restart."""
+        self._placement_ready = True
+        on_lease = getattr(self.ctx, "on_lease", None)
+        if not callable(on_lease):
+            self.start_probing()  # core < 1.7: one instance, probe here
+            return
+        if self._lease_wanted:
+            return
+        if not self.may_probe():
+            roles = ",".join(sorted(self._probe_roles))
+            self.ctx.log.info(
+                f"State Monitoring: probe_roles={roles} — this instance "
+                f"(roles {','.join(getattr(self.ctx, 'roles', None) or []) or '-'}) does not probe."
+            )
+            has_live_role = getattr(self.ctx, "has_live_role", None)
+            if callable(has_live_role):
+                with suppress(Exception):
+                    if not any(has_live_role(r) for r in self._probe_roles):
+                        self.ctx.log.warning(
+                            f"State Monitoring: no live instance carries a probe role ({roles}) — nothing probes."
+                        )
+            return
+        self._lease_wanted = True
+        on_lease("monitoring:prober", acquired=self.start_probing, lost=self.stop_probing)
+
+    async def init_placement(self) -> None:
+        """Load the operator settings (Vault, off the loop) and only then decide
+        whether to contend for the prober lease — ``probe_roles`` lives there."""
+        await self.reload_settings()
+        self.claim_prober_lease()
+
+    async def reload_settings(self) -> None:
+        """Re-read the plugin settings from Vault and apply them (boot,
+        ``vault:ready_for_data`` and the bridged ``plugin:settings_changed``)."""
+        getter = getattr(self.ctx, "get_all_settings", None)
+        if not callable(getter):
+            return
+        try:
+            values = await asyncio.to_thread(getter)  # Vault I/O is blocking
+        except Exception as exc:
+            self.ctx.log.warning(f"State Monitoring: could not load settings — {exc}")
+            return
+        self.apply_settings(values or {})
+        # probe_roles widened at runtime → contend now (narrowing needs a reload).
+        if getattr(self.ctx, "on_lease", None) and not self._lease_wanted and self.may_probe():
+            if self._placement_ready:
+                self.claim_prober_lease()
+
+    def on_monitors_changed(self, payload: Optional[Dict[str, Any]]) -> None:
+        """``monitoring:monitors_changed`` subscriber. Our own emits already took
+        effect locally; a peer's (bridged, ``_origin`` set) means the prober must
+        reload its jobs — or, for ``probe_all``, run a full sweep."""
+        payload = payload or {}
+        if not payload.get("_origin"):
+            return
+        if payload.get("reason") == "probe_all":
+            self.request_full_probe()
+        else:
+            self.request_resync()
 
     def request_resync(self):
         """A peer changed the monitor set (cluster event): reload scheduler jobs
@@ -173,16 +326,89 @@ class MonitoringService:
         """Tell the other core instances the monitor set changed (``cluster=True``
         reaches every instance; peers receive it with ``_origin`` set)."""
         payload = {"reason": reason, "count": count, "instance_id": getattr(self.ctx, "instance_id", None)}
-        try:
-            self.ctx.emit("monitoring:monitors_changed", payload, cluster=True)
-        except TypeError:
-            # Core < 1.7: no cluster flag — local emit only (single instance anyway).
+        self._emit_cluster("monitoring:monitors_changed", payload)
+
+    def _emit_cluster(self, topic: str, payload: Dict[str, Any]) -> None:
+        """Bridged emit from any thread (marshalled onto the loop)."""
+        def _do():
             try:
-                self.ctx.emit("monitoring:monitors_changed", payload)
-            except Exception:
-                pass
-        except Exception as exc:
-            self.ctx.log.debug(f"State Monitoring: monitors_changed emit failed: {exc}")
+                self.ctx.emit(topic, payload, cluster=True)
+            except TypeError:
+                # Core < 1.7: no cluster flag — local emit only (single instance anyway).
+                with suppress(Exception):
+                    self.ctx.emit(topic, payload)
+            except Exception as exc:
+                self.ctx.log.debug(f"State Monitoring: {topic} emit failed: {exc}")
+
+        if not self._call_on_loop(_do):
+            _do()
+
+    # ------------------------------------------------------------------
+    # Cluster quiesce — destructive maintenance stops the prober's writers
+    # ------------------------------------------------------------------
+
+    QUIESCE_TOPIC = "monitoring:quiesce"
+    QUIESCE_TTL_SECONDS = 120     # safety net if the "off" event is lost
+    QUIESCE_GRACE_SECONDS = 3.0   # standby: bus relay (~0.5 s) + prober in-flight drain
+
+    @property
+    def is_quiesced(self) -> bool:
+        return time.monotonic() < self._quiesced_until
+
+    def apply_quiesce(self, on: bool, ttl: Optional[float] = None) -> None:
+        """Local switch: while on, ``run_scheduled_probe`` skips every probe.
+        Turning it off resyncs the jobs (the maintenance may have deleted rows)."""
+        if on:
+            ttl = float(ttl or self.QUIESCE_TTL_SECONDS)
+            self._quiesced_until = time.monotonic() + max(1.0, min(ttl, 600.0))
+        else:
+            self._quiesced_until = 0.0
+            self.request_resync()
+
+    def on_quiesce(self, payload: Optional[Dict[str, Any]]) -> None:
+        """``monitoring:quiesce`` subscriber — a peer runs destructive maintenance."""
+        payload = payload or {}
+        if not payload.get("_origin"):
+            return  # our own request was applied locally already
+        self.apply_quiesce(bool(payload.get("on")), payload.get("ttl"))
+
+    @asynccontextmanager
+    async def quiesced(self, monitor_ids: List[str]):
+        """Stop every probe writer in the cluster for the duration of a
+        destructive maintenance job. Locally: drop the affected jobs, skip probes
+        and wait for in-flight ones. On a standby the prober is another instance:
+        ask it via the bridged ``monitoring:quiesce`` event and give it a grace
+        period to drain. The batched deletes additionally tolerate a straggling
+        write (READ COMMITTED + 1020/1205/1213 retry)."""
+        self.apply_quiesce(True)
+        self._emit_cluster(self.QUIESCE_TOPIC, {"on": True, "ttl": self.QUIESCE_TTL_SECONDS})
+        try:
+            await self.quiesce_monitors(monitor_ids)
+            if not self._probing:
+                await asyncio.sleep(self.QUIESCE_GRACE_SECONDS)
+            yield
+        finally:
+            self._quiesced_until = 0.0
+            self._emit_cluster(self.QUIESCE_TOPIC, {"on": False})
+
+    async def resync_after_delete(self) -> None:
+        """After monitors/states were removed: forget probe bookkeeping, reload
+        the local jobs (prober) and tell the other instances."""
+        self.reset_probe_state()
+        records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
+        self.sync_scheduler_jobs_from(records)
+        # The prober may be another instance — it reloads its jobs on this event.
+        self._notify_monitors_changed("maintenance", count=len(records or []))
+
+    async def apply_monitor_set_change(self, reason: str) -> None:
+        """The monitor set changed in bulk (inventory import): reload the local
+        jobs, sweep the new monitors (prober only) and announce it cluster-wide."""
+        records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
+        self.sync_scheduler_jobs_from(records)
+        self._view_cache.clear()
+        await asyncio.sleep(0)
+        self.enqueue_background_probe_refresh()
+        self._notify_monitors_changed(reason, count=len(records or []))
 
     # ------------------------------------------------------------------
     # Async-safe probe lifecycle helpers
@@ -258,7 +484,7 @@ class MonitoringService:
         error_message: Optional[str],
     ):
         """Persist probe result to the DB (runs in a thread)."""
-        session = self._session()
+        session = self._rc_session()
         if not session:
             return
         try:
@@ -335,6 +561,7 @@ class MonitoringService:
         if db_instance.is_connected and db_instance.engine:
             Base.metadata.create_all(bind=db_instance.engine, checkfirst=True)
             self._ensure_schema(db_instance.engine)
+            self._ensure_daily_aggregate_unique(db_instance.engine)
 
     def _ensure_tables_locked(self):
         """``ensure_tables`` under the core's cross-instance bootstrap lock (core
@@ -364,6 +591,84 @@ class MonitoringService:
                     conn.execute(text(stmt))
             except Exception:
                 pass
+
+    DAILY_AGG_UNIQUE = "uq_monitoring_daily_aggregates_monitor_day"
+
+    def _ensure_daily_aggregate_unique(self, engine) -> None:
+        """Idempotent migration: one aggregate row per (monitor_id, day).
+
+        Older installs could get duplicate rows (two writers both missed the
+        select in select-then-insert). Merge them first — counters summed, the
+        latency mean weighted by its sample count, kept on the lowest id — then
+        add the unique index. "Duplicate key name" (1061) means a peer or a
+        fresh ``create_all`` already did it; any other failure is logged and the
+        plugin keeps running (writes then fall back to the old behaviour)."""
+        from sqlalchemy import inspect as sa_inspect
+
+        try:
+            existing = {ix.get("name") for ix in sa_inspect(engine).get_indexes("monitoring_daily_aggregates")}
+        except Exception:
+            existing = set()
+        if self.DAILY_AGG_UNIQUE in existing:
+            return
+        try:
+            merged = self._dedupe_daily_aggregates(engine)
+            if merged:
+                self.ctx.log.warning(
+                    f"State Monitoring: merged {merged} duplicate daily aggregate rows before adding the unique key."
+                )
+        except Exception as exc:
+            self.ctx.log.warning(f"State Monitoring: daily aggregate dedupe failed: {exc}")
+            return
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {self.DAILY_AGG_UNIQUE} "
+                    "ON monitoring_daily_aggregates (monitor_id, day)"
+                ))
+        except Exception as exc:
+            code = getattr(getattr(exc, "orig", None), "args", (None,))[0]
+            if code != 1061:  # duplicate key name → already there
+                self.ctx.log.warning(f"State Monitoring: unique key on daily aggregates not added: {exc}")
+
+    @staticmethod
+    def _dedupe_daily_aggregates(engine) -> int:
+        """Merge duplicate (monitor_id, day) aggregate rows; returns rows removed."""
+        from sqlalchemy.orm import Session
+
+        removed = 0
+        with Session(bind=engine) as session:
+            groups = (
+                session.query(MonitorDailyAggregate.monitor_id, MonitorDailyAggregate.day)
+                .group_by(MonitorDailyAggregate.monitor_id, MonitorDailyAggregate.day)
+                .having(func.count(MonitorDailyAggregate.id) > 1)
+                .all()
+            )
+            for monitor_id, day in groups:
+                rows = (
+                    session.query(MonitorDailyAggregate)
+                    .filter(MonitorDailyAggregate.monitor_id == monitor_id, MonitorDailyAggregate.day == day)
+                    .order_by(MonitorDailyAggregate.id)
+                    .all()
+                )
+                keep, extra = rows[0], rows[1:]
+                lat_n = sum(int(r.latency_samples or 0) for r in rows)
+                lat_sum = sum(float(r.avg_latency_ms or 0.0) * int(r.latency_samples or 0) for r in rows)
+                keep.total_samples = sum(int(r.total_samples or 0) for r in rows)
+                keep.up_samples = sum(int(r.up_samples or 0) for r in rows)
+                keep.down_samples = sum(int(r.down_samples or 0) for r in rows)
+                keep.paused_samples = sum(int(r.paused_samples or 0) for r in rows)
+                keep.latency_samples = lat_n
+                if lat_n:
+                    keep.avg_latency_ms = round(lat_sum / lat_n, 2)
+                else:
+                    keep.avg_latency_ms = next((r.avg_latency_ms for r in rows if r.avg_latency_ms is not None), None)
+                keep.updated_at = _utc_now()
+                for r in extra:
+                    session.delete(r)
+                removed += len(extra)
+                session.commit()
+        return removed
 
     def bootstrap(self):
         self.ensure_tables()
@@ -544,6 +849,10 @@ class MonitoringService:
         self._heartbeat_retention_days = _int("heartbeat_retention_days", 7, 1, 365)
         self._initial_probe_worker_limit = _int("initial_probe_workers", 8, 1, 64)
         self._overview_cache_seconds = _int("overview_cache_seconds", 10, 0, 300)
+        raw_roles = values.get("probe_roles") or ""
+        if isinstance(raw_roles, (list, tuple, set)):
+            raw_roles = ",".join(str(r) for r in raw_roles)
+        self._probe_roles = {r.strip() for r in str(raw_roles).split(",") if r.strip()}
 
     # ------------------------------------------------------------------
     # Inventory sync queue
@@ -557,6 +866,17 @@ class MonitoringService:
             self._process_inventory_sync_queue(), name="monitoring:inventory_sync"
         )
 
+    async def ingest_inventory(self, payload: InventorySyncPayload) -> Dict[str, Any]:
+        """Synchronous inventory import (``POST /inventory-sync``): ingest, then
+        give the new monitors probe jobs and announce the change — the bulk
+        upserts run with ``sync_scheduler=False`` and never notify on their own."""
+        stats = await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
+        try:
+            await self.apply_monitor_set_change("inventory")
+        except Exception as exc:
+            self.ctx.log.error(f"State Monitoring: resync after inventory import failed: {exc}")
+        return stats
+
     async def _process_inventory_sync_queue(self):
         await asyncio.sleep(0.5)
         while self._pending_inventory_payload is not None:
@@ -564,17 +884,11 @@ class MonitoringService:
             self._pending_inventory_payload = None
             try:
                 async with self.maintenance_window("Importing inventory"):
-                    stats = await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
+                    await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
                 await asyncio.sleep(0)
-                # DB read off the loop; scheduler task-creation stays on the loop.
-                records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
-                self.sync_scheduler_jobs_from(records)
-                await asyncio.sleep(0)
-                self.enqueue_background_probe_refresh()
                 # The prober may be another instance (inventory arrives where the
-                # orchestrator runs) — tell it to reload its jobs.
-                self._notify_monitors_changed("inventory", count=len(records or []))
-                del stats
+                # orchestrator runs) — this also tells it to reload its jobs.
+                await self.apply_monitor_set_change("inventory")
             except Exception as exc:
                 self.ctx.log.error(f"State Monitoring: inventory sync processing failed: {exc}")
 
@@ -606,16 +920,26 @@ class MonitoringService:
         running latency mean. The old path re-read the whole day and ran six
         COUNTs per probe; with 200 monitors that alone saturated the database."""
         day = _day_start(_utc_now())
-        aggregate = session.query(MonitorDailyAggregate).filter(
-            MonitorDailyAggregate.monitor_id == monitor.monitor_id,
-            MonitorDailyAggregate.day == day,
-        ).first()
+        bind = session.get_bind()
+        if getattr(getattr(bind, "dialect", None), "name", "") in ("mysql", "mariadb"):
+            self._upsert_daily_aggregate_mysql(session, monitor.monitor_id, day, state, latency_ms)
+            return
+        # Portable path (SQLite in tests): select-then-insert inside a savepoint;
+        # a concurrent insert of the same (monitor_id, day) hits the unique key
+        # → re-read the winner's row and increment that one.
+        aggregate = self._get_daily_aggregate(session, monitor.monitor_id, day)
         if aggregate is None:
-            aggregate = MonitorDailyAggregate(
-                monitor_id=monitor.monitor_id, day=day, total_samples=0, up_samples=0,
-                down_samples=0, paused_samples=0, latency_samples=0,
-            )
-            session.add(aggregate)
+            try:
+                with session.begin_nested():
+                    aggregate = MonitorDailyAggregate(
+                        monitor_id=monitor.monitor_id, day=day, total_samples=0, up_samples=0,
+                        down_samples=0, paused_samples=0, latency_samples=0,
+                    )
+                    session.add(aggregate)
+            except IntegrityError:
+                aggregate = self._get_daily_aggregate(session, monitor.monitor_id, day)
+                if aggregate is None:
+                    raise
         aggregate.total_samples = (aggregate.total_samples or 0) + 1
         if state == MonitorState.UP:
             aggregate.up_samples = (aggregate.up_samples or 0) + 1
@@ -630,6 +954,52 @@ class MonitoringService:
             aggregate.latency_samples = n + 1
         aggregate.updated_at = _utc_now()
 
+    @staticmethod
+    def _get_daily_aggregate(session, monitor_id: str, day):
+        return session.query(MonitorDailyAggregate).filter(
+            MonitorDailyAggregate.monitor_id == monitor_id,
+            MonitorDailyAggregate.day == day,
+        ).first()
+
+    @staticmethod
+    def _upsert_daily_aggregate_mysql(session, monitor_id: str, day, state: "MonitorState",
+                                      latency_ms: Optional[float]) -> None:
+        """One atomic ``INSERT … ON DUPLICATE KEY UPDATE`` on the unique
+        (monitor_id, day) key — no read, no lost update between instances.
+        MariaDB evaluates the SET list left to right with already-updated values,
+        so ``avg_latency_ms`` must be computed before ``latency_samples`` moves."""
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+        up = 1 if state == MonitorState.UP else 0
+        down = 1 if state == MonitorState.DOWN else 0
+        paused = 1 if state == MonitorState.PAUSED else 0
+        has_lat = 1 if latency_ms is not None else 0
+        now = _utc_now()
+        stmt = mysql_insert(MonitorDailyAggregate.__table__).values(
+            monitor_id=monitor_id, day=day, total_samples=1, up_samples=up, down_samples=down,
+            paused_samples=paused, avg_latency_ms=(round(float(latency_ms), 2) if has_lat else None),
+            latency_samples=has_lat, updated_at=now,
+        )
+        t = MonitorDailyAggregate.__table__.c
+        updates = [
+            ("total_samples", t.total_samples + 1),
+            ("up_samples", t.up_samples + up),
+            ("down_samples", t.down_samples + down),
+            ("paused_samples", t.paused_samples + paused),
+        ]
+        if has_lat:
+            updates.append((
+                "avg_latency_ms",
+                func.round(
+                    (func.coalesce(t.avg_latency_ms, 0.0) * t.latency_samples + float(latency_ms))
+                    / (t.latency_samples + 1),
+                    2,
+                ),
+            ))
+            updates.append(("latency_samples", t.latency_samples + 1))
+        updates.append(("updated_at", now))
+        session.execute(stmt.on_duplicate_key_update(updates))
+
     def _recompute_daily_aggregate(self, session, monitor: MonitorRecord):
         """Full recompute of today's aggregate from heartbeats (daily rollup job —
         self-heals the incremental counters)."""
@@ -640,10 +1010,7 @@ class MonitoringService:
             MonitorHeartbeat.created_at >= day,
             MonitorHeartbeat.created_at < next_day,
         ).all()
-        aggregate = session.query(MonitorDailyAggregate).filter(
-            MonitorDailyAggregate.monitor_id == monitor.monitor_id,
-            MonitorDailyAggregate.day == day,
-        ).first()
+        aggregate = self._get_daily_aggregate(session, monitor.monitor_id, day)
         if aggregate is None:
             aggregate = MonitorDailyAggregate(monitor_id=monitor.monitor_id, day=day)
             session.add(aggregate)
@@ -663,7 +1030,7 @@ class MonitoringService:
         """uptime_24h from the last 24 h of heartbeats (one GROUP BY over the
         composite index), uptime_7d/30d from daily aggregates — for all monitors
         in one pass. Runs hourly and after the daily rollup, never per write."""
-        session = self._session()
+        session = self._rc_session()
         if not session:
             return
         try:
@@ -685,11 +1052,21 @@ class MonitoringService:
             }
             week = _uptime_from_aggregates(session, ids, days=7)
             month = _uptime_from_aggregates(session, ids, days=30)
-            for record in session.query(MonitorRecord).all():
-                record.uptime_24h = day.get(record.monitor_id, 100.0)
-                record.uptime_7d = week.get(record.monitor_id, 100.0)
-                record.uptime_30d = month.get(record.monitor_id, 100.0)
-            session.commit()
+            session.commit()  # end the read transaction before the chunked writes
+            # Short committed chunks (READ COMMITTED) next to the probe writers,
+            # each retried on 1020/1205/1213 — one big transaction over every
+            # monitor row used to collide with concurrent probe writes.
+            for i in range(0, len(ids), self.ROLLUP_CHUNK):
+                chunk = ids[i:i + self.ROLLUP_CHUNK]
+
+                def _write(chunk=chunk) -> None:
+                    for record in session.query(MonitorRecord).filter(MonitorRecord.monitor_id.in_(chunk)).all():
+                        record.uptime_24h = day.get(record.monitor_id, 100.0)
+                        record.uptime_7d = week.get(record.monitor_id, 100.0)
+                        record.uptime_30d = month.get(record.monitor_id, 100.0)
+                    session.commit()
+
+                self._retrying(session, _write)
         finally:
             session.close()
 
@@ -931,7 +1308,8 @@ class MonitoringService:
         if previous_state == record.latest_state:
             return
         self._view_cache.clear()  # a state change must show up on the next poll
-        self.ctx.emit(
+        # Runs in to_thread workers (probe writes, passive results) → marshal.
+        self._emit(
             "monitoring:state_changed",
             {
                 "monitor_id": record.monitor_id,
@@ -976,7 +1354,29 @@ class MonitoringService:
     # Scheduler sync
     # ------------------------------------------------------------------
 
-    def _sync_job_for_monitor(self, record: MonitorRecord):
+    def _sync_job_for_monitor(self, record: Any):
+        """Create/replace/remove the probe job of one monitor. The scheduler
+        creates asyncio tasks, so off the loop (the write API runs in to_thread
+        workers) the change is handed to the loop on a detached snapshot."""
+        if not self._scheduler_started:
+            return
+        if not self._on_loop_thread():
+            from types import SimpleNamespace
+            snap = SimpleNamespace(
+                monitor_id=record.monitor_id, enabled=record.enabled, latest_state=record.latest_state,
+                monitor_type=record.monitor_type, target=record.target, address=record.address,
+                interval_seconds=record.interval_seconds,
+            )
+            if not self._call_on_loop(self._sync_job_on_loop, snap):
+                self.request_resync_threadsafe()
+            return
+        self._sync_job_on_loop(record)
+
+    def request_resync_threadsafe(self) -> None:
+        """``request_resync`` from any thread; a no-op without a known loop."""
+        self._call_on_loop(self.request_resync)
+
+    def _sync_job_on_loop(self, record: Any):
         if not self._scheduler_started:
             return
         job_id = f"monitor:{record.monitor_id}"
@@ -1060,7 +1460,7 @@ class MonitoringService:
         if not session:
             raise RuntimeError("Database unavailable")
         try:
-            self.ensure_tables()
+            # No DDL here: bootstrap creates the tables under the cluster lock.
             record = self._get_monitor(session, data.monitor_id)
             payload = data.model_dump(exclude={"force"}, mode="json")
             desired_hash = data.source_hash or self._canonical_hash(payload)
@@ -1154,12 +1554,13 @@ class MonitoringService:
             session.commit()
             session.refresh(record)
             self._sync_job_for_monitor(record)
+            self._notify_monitors_changed("override", count=1)
             return _serialize_monitor(record)
         finally:
             session.close()
 
     def ingest_passive_result(self, payload: PassiveResult) -> Dict[str, Any]:
-        session = self._session()
+        session = self._rc_session()
         if not session:
             raise RuntimeError("Database unavailable")
         try:
@@ -1222,24 +1623,46 @@ class MonitoringService:
 
     def clear_states_db(self) -> int:
         """Delete ALL heartbeat + aggregate records and reset every monitor to UNKNOWN.
-        Returns the number of heartbeat rows deleted."""
-        session = self._session()
+        Returns the number of heartbeat rows deleted.
+
+        Batched READ COMMITTED deletes with 1020/1205/1213 retry; callers stop the
+        probe writers first (``clear_states``)."""
+        session = self._maintenance_session()
         if not session:
             return 0
         try:
-            deleted = session.query(MonitorHeartbeat).delete(synchronize_session=False)
-            session.query(MonitorDailyAggregate).delete(synchronize_session=False)
-            for record in session.query(MonitorRecord).all():
-                record.latest_state = MonitorState.UNKNOWN.value
-                record.uptime_24h = 100.0
-                record.uptime_7d = 100.0
-                record.uptime_30d = 100.0
-                record.last_checked_at = None
-                record.latest_error = None
-            session.commit()
+            deleted = self._delete_heartbeats_for(session, None)
+
+            def _rest() -> None:
+                session.query(MonitorDailyAggregate).delete(synchronize_session=False)
+                session.query(MonitorRecord).update(
+                    {
+                        MonitorRecord.latest_state: MonitorState.UNKNOWN.value,
+                        MonitorRecord.uptime_24h: 100.0,
+                        MonitorRecord.uptime_7d: 100.0,
+                        MonitorRecord.uptime_30d: 100.0,
+                        MonitorRecord.last_checked_at: None,
+                        MonitorRecord.latest_error: None,
+                    },
+                    synchronize_session=False,
+                )
+                session.commit()
+
+            self._retrying(session, _rest)
             return deleted
         finally:
             session.close()
+
+    async def clear_states(self) -> int:
+        """Destructive reset (API + NiceGUI danger zone): stop every probe writer
+        in the cluster, wipe heartbeats/aggregates, reset all monitors to
+        UNKNOWN, then reload the jobs — the next sweep re-probes everything."""
+        ids = await asyncio.to_thread(self.monitor_ids_for_scope, "all")
+        async with self.quiesced(ids):
+            deleted = await asyncio.to_thread(self.clear_states_db)
+        await self.resync_after_delete()
+        self.enqueue_background_probe_refresh()
+        return deleted
 
     # ------------------------------------------------------------------
     # Maintenance actions (core settings dialog → POST /maintenance/*)
@@ -1247,6 +1670,7 @@ class MonitoringService:
 
     MANAGED_OWNER_SOURCES = ("orchestrator_service", "iac_orchestrator")
     DELETE_CHUNK = 500
+    ROLLUP_CHUNK = 200
     # MariaDB error codes that mean "another transaction touched these rows":
     # 1020 record changed since last read (innodb_snapshot_isolation, MariaDB >= 11.6),
     # 1213 deadlock, 1205 lock wait timeout. Writers (probes, passive results) run
@@ -1257,25 +1681,19 @@ class MonitoringService:
         """Session for destructive maintenance: READ COMMITTED where the dialect
         supports it, so a long sequence of batches never trips snapshot-isolation
         conflicts against the probe writers (SQLite: no-op)."""
-        session = self._session()
-        if session is None:
-            return None
-        try:
-            session.connection(execution_options={"isolation_level": "READ COMMITTED"})
-        except Exception:
-            pass
-        return session
+        return self._rc_session()
 
-    def _retrying(self, session, fn, attempts: int = 4):
+    def _retrying(self, session, fn, attempts: int = 4, extra_codes: tuple = ()):
         """Run ``fn()`` (one short write transaction, committed inside) and retry it
         on the concurrent-write errors above with a short back-off."""
+        retry_codes = self._RETRY_DB_ERRORS + tuple(extra_codes)
         for attempt in range(1, attempts + 1):
             try:
                 return fn()
             except Exception as exc:  # sqlalchemy.exc.OperationalError wraps the driver error
                 code = getattr(getattr(exc, "orig", None), "args", (None,))[0]
                 session.rollback()
-                if code not in self._RETRY_DB_ERRORS or attempt == attempts:
+                if code not in retry_codes or attempt == attempts:
                     raise
                 time.sleep(0.2 * attempt)
 
@@ -1407,24 +1825,40 @@ class MonitoringService:
     def request_full_probe(self) -> None:
         """Queue a sweep that probes EVERY enabled monitor (not just stale/unknown
         ones). Reported as a non-blocking ``starting`` status with progress."""
+        if not self._probing:
+            return  # a standby never sweeps — request_full_probe_cluster() asks the prober
         self._force_full_sweep = True
-        try:
-            self.enqueue_background_probe_refresh()
-        except RuntimeError:
-            # No running loop (tests) — the flag is honoured by the next sweep.
-            pass
+        # Off the loop (tests, threads) the flag is honoured by the next sweep.
+        self._call_on_loop(self.enqueue_background_probe_refresh)
+
+    def request_full_probe_cluster(self) -> None:
+        """``/maintenance/probe-all`` on any instance: sweep locally when this is
+        the prober, and ask the prober (peer) via the bridged event otherwise."""
+        self.request_full_probe()
+        self._notify_monitors_changed("probe_all")
 
     async def refresh_rollups(self):
         await asyncio.to_thread(self._refresh_rollups_sync)
 
     def _refresh_rollups_sync(self):
-        session = self._session()
+        """Recompute today's aggregates, ROLLUP_CHUNK monitors per committed READ
+        COMMITTED transaction (retried on 1020/1205/1213, and on 1062 when a
+        concurrent writer inserted today's row first), then the uptime windows."""
+        session = self._rc_session()
         if not session:
             return
         try:
-            for record in session.query(MonitorRecord).all():
-                self._recompute_daily_aggregate(session, record)
+            ids = [r[0] for r in session.query(MonitorRecord.monitor_id).all()]
             session.commit()
+            for i in range(0, len(ids), self.ROLLUP_CHUNK):
+                chunk = ids[i:i + self.ROLLUP_CHUNK]
+
+                def _write(chunk=chunk) -> None:
+                    for record in session.query(MonitorRecord).filter(MonitorRecord.monitor_id.in_(chunk)).all():
+                        self._recompute_daily_aggregate(session, record)
+                    session.commit()
+
+                self._retrying(session, _write, extra_codes=(1062,))
         finally:
             session.close()
         self._refresh_uptime_windows_sync()
@@ -1465,8 +1899,8 @@ class MonitoringService:
         suppresses a single transient failure (no DB write / no state_changed
         emit) until ``_flap_threshold`` consecutive failures are seen.
         """
-        if monitor_id in self._inflight_probes:
-            return
+        if monitor_id in self._inflight_probes or self.is_quiesced:
+            return  # quiesced: a destructive maintenance job runs somewhere in the cluster
         self._inflight_probes.add(monitor_id)
         try:
             # Phase 1: read from DB in a worker thread so the event loop stays free.

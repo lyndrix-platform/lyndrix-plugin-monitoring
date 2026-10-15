@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import timedelta
 from hashlib import sha256
@@ -13,10 +14,17 @@ class _ScheduledJobHandle:
     task: asyncio.Task
 
 
+_log = logging.getLogger("lyndrix.plugin.state_monitoring.scheduler")
+
+
 class SimpleAsyncScheduler:
-    def __init__(self):
+    # Extra pause after N consecutive failures of one job: 2, 4, 8 … capped.
+    FAILURE_BACKOFF_CAP = 60
+
+    def __init__(self, log=None):
         self._jobs: Dict[str, _ScheduledJobHandle] = {}
         self._started = False
+        self._log = log or _log
 
     def start(self):
         self._started = True
@@ -65,11 +73,13 @@ class SimpleAsyncScheduler:
         delay = max(1, int(initial_delay)) if initial_delay is not None else self._initial_delay(id, interval)
 
         async def runner():
+            failures = 0
             try:
                 await asyncio.sleep(delay)
                 while True:
-                    await self._invoke(func, args or [])
-                    await asyncio.sleep(interval)
+                    # One failed run (DB error, lost write) must never end the job.
+                    failures = 0 if await self._invoke_safely(id, func, args or []) else failures + 1
+                    await asyncio.sleep(interval + self._failure_backoff(failures))
             except asyncio.CancelledError:
                 raise
 
@@ -87,7 +97,7 @@ class SimpleAsyncScheduler:
                     if next_run <= now:
                         next_run += timedelta(days=1)
                     await asyncio.sleep(max(1, int((next_run - now).total_seconds())))
-                    await self._invoke(func, [])
+                    await self._invoke_safely(id, func, [])
             except asyncio.CancelledError:
                 raise
 
@@ -97,6 +107,25 @@ class SimpleAsyncScheduler:
         result = func(*args)
         if asyncio.iscoroutine(result):
             await result
+
+    async def _invoke_safely(self, job_id: str, func, args: List[Any]) -> bool:
+        """Run one job iteration; log and swallow anything but cancellation."""
+        try:
+            await self._invoke(func, args)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                self._log.warning(f"State Monitoring: scheduled job '{job_id}' failed: {exc}")
+            except Exception:
+                pass
+            return False
+
+    def _failure_backoff(self, failures: int) -> int:
+        if failures < 2:
+            return 0
+        return min(self.FAILURE_BACKOFF_CAP, 2 ** (failures - 1))
 
     def _initial_delay(self, job_id: str, interval_seconds: int) -> int:
         if interval_seconds <= 1:

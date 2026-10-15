@@ -253,10 +253,10 @@ def render_settings_ui(ctx, service: MonitoringService):
 
                                 async def _do_clear(d=confirm_dialog):
                                     try:
-                                        # Full DELETE of heartbeats/aggregates +
-                                        # UPDATE over every monitor — keep it off
-                                        # the event loop so it never freezes clients.
-                                        deleted = await asyncio.to_thread(service.clear_states_db)
+                                        # DB work runs off the event loop inside.
+                                        # Quiesce the prober, delete, resync —
+                                        # same path as POST /clear-states.
+                                        deleted = await service.clear_states()
                                         ui.notify(
                                             f"Cleared {deleted} heartbeat records. "
                                             "All monitors reset to UNKNOWN.",
