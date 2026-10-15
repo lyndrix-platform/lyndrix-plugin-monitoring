@@ -46,7 +46,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="1.5.0",
+    version="1.6.0",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -80,7 +80,10 @@ manifest = ModuleManifest(
          "description": "How long a computed overview is served to concurrent viewers before it is recomputed (0 = always recompute)."},
         {"key": "probe_roles", "label": "Probe roles", "kind": "str",
          "category": "Probing", "default": "",
-         "description": "Cluster only: comma-separated instance roles (LYNDRIX_INSTANCE_ROLES) allowed to run the prober, e.g. 'runner' for hosts with ICMP/NET_RAW. Empty = any instance. Narrowing takes effect after a plugin reload."},
+         "description": "Cluster only: comma-separated instance roles (LYNDRIX_INSTANCE_ROLES) allowed to probe, e.g. 'runner' for hosts with ICMP/NET_RAW. Empty = any instance. Single prober: narrowing takes effect after a plugin reload; sharded probing: applies at once."},
+        {"key": "probe_nodes", "label": "Probe nodes", "kind": "int",
+         "category": "Probing", "default": "1",
+         "description": "Cluster only (core API >= 1.8): number of instances that share the probing (rendezvous sharding, each monitor has one owner). 1 = single prober via lease. Changing between 1 and >1 takes effect after a plugin reload; other changes apply at once."},
         # Maintenance jobs (core API >= 1.6, kind="action"): buttons in the same
         # dialog that call the write-gated /maintenance/* routes in app/controller/api.py.
         {"key": "action_prune", "label": "Prune old heartbeats now", "kind": "action",
@@ -118,6 +121,8 @@ manifest = ModuleManifest(
             "monitoring:quiesce",
             # Core >= 1.5.1 (bridged): the operator saved this plugin's settings.
             "plugin:settings_changed",
+            # Core >= 1.6 (API 1.8): membership changed → recompute the probe shard.
+            "cluster:changed",
         ],
         "emit": ["monitoring:state_changed", "monitoring:monitors_changed", "monitoring:quiesce"],
     },
@@ -262,6 +267,9 @@ async def health(ctx) -> PluginHealthStatus:
         "db_connected": True,
         "prober": prober,
         "probe_eligible": bool(getattr(svc, "may_probe", lambda: True)()),
+        "probe_mode": getattr(svc, "_probe_mode", None) or "lease",
+        "probe_nodes": getattr(svc, "_probe_nodes", 1),
+        "shard_size": svc.shard_size() if hasattr(svc, "shard_size") else None,
         "scheduler_started": bool(getattr(svc, "_scheduler_started", False)),
         "scheduler_jobs": len(jobs),
         "monitors_configured": counts.get("monitor_count", 0),
@@ -327,6 +335,10 @@ def setup(ctx):
     @ctx.subscribe("vault:ready_for_data")
     async def on_vault_ready(payload):
         await service.reload_settings()
+
+    @ctx.subscribe("cluster:changed")
+    async def on_cluster_changed(payload):
+        service.on_cluster_changed(payload)  # sharded mode only
 
     @ctx.subscribe("plugin:settings_changed")
     async def on_settings_changed(payload):

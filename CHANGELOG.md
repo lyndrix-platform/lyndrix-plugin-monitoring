@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-10-15
+### Added
+- Probe sharding: setting `probe_nodes` (default 1). With > 1 and core API ≥ 1.8, up to `probe_nodes` eligible instances (`probe_roles`) split the monitors via `ctx.my_shard("probe", …)` instead of one lease-holding prober; the shard is recomputed on `cluster:changed` and on every monitor-set change, starting/stopping only the jobs that moved.
+- Global housekeeping (prune, rollups, uptime windows) runs on one `housekeeping` worker in sharded mode.
+- `health()` reports `probe_mode`, `probe_nodes` and `shard_size`.
+
+### Changed
+- `probe_nodes` (within > 1) and `probe_roles` apply at runtime in sharded mode; switching between single prober and sharding needs a plugin reload.
+- A resync requested while one is running is no longer dropped (runs again afterwards).
+- Probe-all and quiesce reach every worker in sharded mode; a sharded instance always waits the quiesce grace period.
+
 ## [1.5.0] - 2026-10-15
 ### Added
 - Setting `probe_roles` (comma list of instance roles): only instances carrying one of them contend for the `monitoring:prober` lease (e.g. `runner` hosts with ICMP/NET_RAW). Empty = any instance. `health()` reports `probe_eligible`.

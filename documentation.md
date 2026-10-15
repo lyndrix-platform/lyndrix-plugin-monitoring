@@ -139,6 +139,20 @@ Core-Doku *High Availability*), gilt für dieses Plugin:
   **Erweiterung** wirkt sofort (`plugin:settings_changed`), eine **Einschränkung** erst nach
   Plugin-Reload/Neustart — der Core bietet keine öffentliche Möglichkeit, eine gewünschte Lease
   wieder abzugeben.
+- **Verteiltes Probing (`probe_nodes` > 1, Core-API ≥ 1.8).** Statt einer Lease teilen sich
+  bis zu `probe_nodes` Instanzen (gefiltert nach `probe_roles`) die Monitore per
+  Rendezvous-Hashing (`ctx.my_shard("probe", monitor_ids, count=probe_nodes, roles=…)`): jede
+  Instanz berechnet lokal dieselbe Aufteilung, jeder Monitor hat genau einen Besitzer. Neu
+  berechnet wird bei `cluster:changed` (Mitgliedschaft) und bei jeder Änderung des Monitor-Satzes
+  (`monitoring:monitors_changed`, Inventar-Import, Upsert); dabei werden nur Jobs für neu
+  übernommene Monitore gestartet und für abgegebene gestoppt — laufende Jobs bleiben unangetastet.
+  Verlässt eine Instanz den Cluster, wandern nur ihre Monitore. Während sich die Sicht auf die
+  Mitglieder für wenige Sekunden unterscheidet, kann ein Monitor doppelt geprobt werden
+  (at-least-once) — für Probes unkritisch. Globale Aufgaben (Prune, Rollups, Uptime-Fenster)
+  übernimmt genau ein Worker (`ctx.is_worker("housekeeping")`). „Alle Monitore jetzt prüfen“
+  lässt jeden Worker seinen eigenen Anteil prüfen, Quiesce pausiert alle Worker. Ohne
+  `ctx.my_shard` (älterer Core) fällt das Plugin mit Warnung auf den einzelnen Prober zurück.
+  `health()` meldet `probe_mode` (`lease` | `sharded`), `probe_nodes` und `shard_size`.
 - **Einstellungen gelten clusterweit.** Speichert der Operator die Plugin-Einstellungen, sendet
   der Core (≥ 1.5.1) das gebridgte Event `plugin:settings_changed`; jede Instanz liest die Werte
   dann neu aus Vault.
@@ -174,6 +188,7 @@ Core-Doku *High Availability*), gilt für dieses Plugin:
 |---|---|---|
 | subscribe | `db:connected` | Datenbank bereit — Tabellen initialisieren |
 | subscribe | `vault:ready_for_data` | Plugin-Einstellungen (Retention, Worker, Cache, `probe_roles`) aus Vault anwenden |
+| subscribe | `cluster:changed` | Core ≥ 1.6: Mitgliedschaft geändert → im verteilten Modus den eigenen Anteil neu berechnen |
 | subscribe | `plugin:settings_changed` | Core ≥ 1.5.1, gebridgt: Operator hat die Einstellungen gespeichert → bei passender `plugin_id` neu laden |
 | subscribe | `monitoring:inventory_sync` | Inventar-Sync vom IaC Orchestrator empfangen |
 | subscribe / emit | `monitoring:monitors_changed` | Monitor-Satz geändert (Inventar, Upsert, Admin-Override, Wartung) — mit `cluster=True` an alle Instanzen; der Prober lädt seine Jobs neu, bei `reason: probe_all` startet er einen vollständigen Sweep |
@@ -218,7 +233,8 @@ Plugin-Einstellungen (Settings-Dialog des Cores, in Vault gespeichert, angewende
 | `heartbeat_retention_days` | `7` | Aufbewahrung roher Heartbeats (1–365) |
 | `initial_probe_workers` | `8` | parallele Probes während der Startsequenz (1–64) |
 | `overview_cache_seconds` | `10` | Gültigkeit einer berechneten Übersicht für gleichzeitige Betrachter (0 = immer neu) |
-| `probe_roles` | leer | nur Cluster: Instanz-Rollen, die proben dürfen (Komma-Liste, z. B. `runner`); leer = jede Instanz — siehe *Cluster-Betrieb* |
+| `probe_roles` | leer | nur Cluster: Instanz-Rollen, die proben dürfen (Komma-Liste, z. B. `runner`); leer = jede Instanz — siehe *Cluster-Betrieb*. Im verteilten Modus sofort wirksam |
+| `probe_nodes` | `1` | nur Cluster (Core-API ≥ 1.8): Anzahl Instanzen, die sich das Probing teilen (1–64). `1` = einzelner Prober per Lease (bisheriges Verhalten). Änderungen innerhalb von > 1 wirken sofort; der Wechsel zwischen `1` und > 1 erst nach Plugin-Reload/Neustart |
 
 Die Einstellungen werden beim Laden des Plugins, nach `vault:ready_for_data` und bei
 `plugin:settings_changed` (Core ≥ 1.5.1) angewendet.

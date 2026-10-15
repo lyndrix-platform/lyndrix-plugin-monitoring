@@ -12,6 +12,7 @@ from ..model.models import _utc_now
 class _ScheduledJobHandle:
     id: str
     task: asyncio.Task
+    interval: Optional[int] = None
 
 
 _log = logging.getLogger("lyndrix.plugin.state_monitoring.scheduler")
@@ -83,7 +84,7 @@ class SimpleAsyncScheduler:
             except asyncio.CancelledError:
                 raise
 
-        self._jobs[id] = _ScheduledJobHandle(id=id, task=asyncio.create_task(runner(), name=id))
+        self._jobs[id] = _ScheduledJobHandle(id=id, task=asyncio.create_task(runner(), name=id), interval=interval)
 
     def add_daily_job(self, func, *, hour: int, minute: int, id: str, replace_existing: bool = True):
         if replace_existing:

@@ -84,6 +84,15 @@ class MonitoringService:
         self._probe_roles: set = set()
         self._lease_wanted = False
         self._placement_ready = False
+        # Probe sharding (setting ``probe_nodes`` > 1, core API >= 1.8): every
+        # eligible instance probes only its rendezvous share of the monitors.
+        # ``_probe_mode`` is fixed when placement is decided ("lease" | "sharded");
+        # ``_shard`` is this instance's monitor set (None = lease mode: all).
+        self._probe_nodes = 1
+        self._probe_mode: Optional[str] = None
+        self._shard: Optional[set] = None
+        self._shard_universe: set = set()   # monitor ids the shard was computed over
+        self._resync_again = False
         # Decided by _load_probe_candidates(): the sweep only blocks the UI when it
         # has monitors we know nothing about (UNKNOWN or stale) — re-probing a set
         # of persistently DOWN monitors after every restart is not a warm-up.
@@ -175,20 +184,41 @@ class MonitoringService:
     def start(self):
         if self._scheduler_started:
             return
-        self.scheduler.add_daily_job(self.prune_heartbeats, hour=0, minute=0, id="monitoring:prune")
-        self.scheduler.add_daily_job(self.refresh_rollups, hour=0, minute=5, id="monitoring:rollups")
+        self.scheduler.add_daily_job(self._housekeeping(self.prune_heartbeats), hour=0, minute=0, id="monitoring:prune")
+        self.scheduler.add_daily_job(self._housekeeping(self.refresh_rollups), hour=0, minute=5, id="monitoring:rollups")
         # Housekeeping that must not depend on the process surviving until
         # midnight (every restart used to reset the daily jobs → heartbeats grew
         # for months). First runs are delayed so they never compete with the
         # startup sweep; the sweep itself schedules the first prune.
         self.scheduler.add_interval_job(
-            self.prune_heartbeats, seconds=3600, id="monitoring:prune_hourly", initial_delay=3600
+            self._housekeeping(self.prune_heartbeats), seconds=3600, id="monitoring:prune_hourly", initial_delay=3600
         )
         self.scheduler.add_interval_job(
-            self.refresh_uptime_windows, seconds=3600, id="monitoring:uptime_hourly", initial_delay=1800
+            self._housekeeping(self.refresh_uptime_windows), seconds=3600, id="monitoring:uptime_hourly", initial_delay=1800
         )
         self.scheduler.start()
         self._scheduler_started = True
+
+    def housekeeping_here(self) -> bool:
+        """Global housekeeping (prune, rollups, uptime windows) runs on one
+        instance: the prober in lease mode, the single ``housekeeping`` worker
+        (rendezvous) in sharded mode — idempotent jobs, at-least-once is fine."""
+        if not self.is_sharded:
+            return True
+        is_worker = getattr(self.ctx, "is_worker", None)
+        if not callable(is_worker):
+            return True
+        try:
+            return bool(is_worker("housekeeping", count=1, roles=sorted(self._probe_roles) or None))
+        except Exception:
+            return True
+
+    def _housekeeping(self, job):
+        async def run():
+            if self.housekeeping_here():
+                await job()
+        run.__name__ = getattr(job, "__name__", "housekeeping")
+        return run
 
     # ------------------------------------------------------------------
     # Cluster placement — exactly one prober (lease "monitoring:prober")
@@ -218,7 +248,11 @@ class MonitoringService:
         if not self._probing:
             return
         self._probing = False
-        self.ctx.log.warning("State Monitoring: prober lease lost — stopping probes on this instance.")
+        self.ctx.log.warning(
+            "State Monitoring: no longer a probe worker — stopping probes on this instance."
+            if self.is_sharded else
+            "State Monitoring: prober lease lost — stopping probes on this instance."
+        )
         await self.stop()
         # stop() flags the background writers to stop; on a lease loss the
         # process lives on and the API (e.g. /maintenance/prune) must still work.
@@ -245,6 +279,11 @@ class MonitoringService:
         reloaded (the core has no public "unwant") — narrowing ``probe_roles``
         therefore takes effect on the next plugin reload/restart."""
         self._placement_ready = True
+        if self._probe_mode is None:
+            self._probe_mode = self._desired_probe_mode()
+        if self._probe_mode == "sharded":
+            self._reconcile_sharded()
+            return
         on_lease = getattr(self.ctx, "on_lease", None)
         if not callable(on_lease):
             self.start_probing()  # core < 1.7: one instance, probe here
@@ -268,6 +307,71 @@ class MonitoringService:
         self._lease_wanted = True
         on_lease("monitoring:prober", acquired=self.start_probing, lost=self.stop_probing)
 
+    # ------------------------------------------------------------------
+    # Probe sharding (setting ``probe_nodes``, core API >= 1.8)
+    # ------------------------------------------------------------------
+
+    SHARD_NAME = "probe"
+
+    @property
+    def is_sharded(self) -> bool:
+        return self._probe_mode == "sharded"
+
+    def _desired_probe_mode(self) -> str:
+        if self._probe_nodes <= 1:
+            return "lease"
+        if not callable(getattr(self.ctx, "my_shard", None)):
+            self.ctx.log.warning(
+                f"State Monitoring: probe_nodes={self._probe_nodes} needs core API >= 1.8 "
+                "(ctx.my_shard) — falling back to a single prober (lease)."
+            )
+            return "lease"
+        return "sharded"
+
+    def _reconcile_sharded(self) -> None:
+        """Sharded mode: every instance allowed by ``probe_roles`` runs the
+        scheduler; which monitors it probes is decided per resync by
+        ``ctx.my_shard``. No lease — so eligibility may change at runtime."""
+        if self.may_probe():
+            if self._probing:
+                self.request_resync()  # probe_nodes/roles changed → new shard
+            else:
+                self.start_probing()
+        elif self._probing:
+            self._shard = set()
+            task = asyncio.create_task(self.stop_probing(), name="monitoring:unshard")
+            task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+
+    def _compute_shard(self, monitor_ids: List[str]) -> set:
+        """This instance's share of ``monitor_ids`` (rendezvous hashing in the core:
+        every instance computes the same split locally, only the keys of a
+        leaving/joining instance move)."""
+        roles = sorted(self._probe_roles) or None
+        try:
+            mine = self.ctx.my_shard(self.SHARD_NAME, list(monitor_ids), count=self._probe_nodes, roles=roles)
+        except Exception as exc:
+            self.ctx.log.warning(f"State Monitoring: shard computation failed, keeping the old shard: {exc}")
+            return set(self._shard or ())
+        return set(mine or ())
+
+    def owns(self, monitor_id: str) -> bool:
+        """Lease mode: the prober owns every monitor; sharded: only its shard."""
+        return self._shard is None or monitor_id in self._shard
+
+    def shard_size(self) -> int:
+        """Monitors this instance is responsible for (health)."""
+        if self._shard is not None:
+            return len(self._shard)
+        if not self._probing:
+            return 0
+        return sum(1 for j in self.scheduler.get_jobs() if j.id.startswith("monitor:"))
+
+    def on_cluster_changed(self, payload: Optional[Dict[str, Any]] = None) -> None:
+        """``cluster:changed`` (membership): recompute the shard and apply the
+        difference. Lease mode ignores it (the lease handles failover)."""
+        if self.is_sharded and self._probing:
+            self.request_resync()
+
     async def init_placement(self) -> None:
         """Load the operator settings (Vault, off the loop) and only then decide
         whether to contend for the prober lease — ``probe_roles`` lives there."""
@@ -286,10 +390,19 @@ class MonitoringService:
             self.ctx.log.warning(f"State Monitoring: could not load settings — {exc}")
             return
         self.apply_settings(values or {})
-        # probe_roles widened at runtime → contend now (narrowing needs a reload).
-        if getattr(self.ctx, "on_lease", None) and not self._lease_wanted and self.may_probe():
-            if self._placement_ready:
-                self.claim_prober_lease()
+        if not self._placement_ready:
+            return  # init_placement decides right after loading
+        if self._probe_mode is not None and self._desired_probe_mode() != self._probe_mode:
+            self.ctx.log.warning(
+                f"State Monitoring: probe_nodes={self._probe_nodes} switches between single prober and "
+                "sharded probing — takes effect after a plugin reload/restart."
+            )
+            return
+        if self.is_sharded:
+            self._reconcile_sharded()  # probe_nodes / probe_roles apply at once
+        # Lease mode: probe_roles widened at runtime → contend now (narrowing needs a reload).
+        elif getattr(self.ctx, "on_lease", None) and not self._lease_wanted and self.may_probe():
+            self.claim_prober_lease()
 
     def on_monitors_changed(self, payload: Optional[Dict[str, Any]]) -> None:
         """``monitoring:monitors_changed`` subscriber. Our own emits already took
@@ -309,18 +422,25 @@ class MonitoringService:
         if not self._probing:
             return
         if self._resync_task and not self._resync_task.done():
+            # A change arrived while a resync is running (it may already have read
+            # the DB / membership) → run once more afterwards.
+            self._resync_again = True
             return
         self._resync_task = asyncio.create_task(self._resync_async(), name="monitoring:resync")
 
     async def _resync_async(self):
-        await asyncio.sleep(0.2)
-        try:
-            records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
-            self.sync_scheduler_jobs_from(records)
-            self._view_cache.clear()
-            self.enqueue_background_probe_refresh()
-        except Exception as exc:
-            self.ctx.log.error(f"State Monitoring: resync after cluster event failed: {exc}")
+        while True:
+            self._resync_again = False
+            await asyncio.sleep(0.2)
+            try:
+                records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
+                self.sync_scheduler_jobs_from(records)
+                self._view_cache.clear()
+                self.enqueue_background_probe_refresh()
+            except Exception as exc:
+                self.ctx.log.error(f"State Monitoring: resync after cluster event failed: {exc}")
+            if not self._resync_again or not self._probing:
+                return
 
     def _notify_monitors_changed(self, reason: str, count: Optional[int] = None) -> None:
         """Tell the other core instances the monitor set changed (``cluster=True``
@@ -384,7 +504,7 @@ class MonitoringService:
         self._emit_cluster(self.QUIESCE_TOPIC, {"on": True, "ttl": self.QUIESCE_TTL_SECONDS})
         try:
             await self.quiesce_monitors(monitor_ids)
-            if not self._probing:
+            if not self._probing or self.is_sharded:  # other instances probe too
                 await asyncio.sleep(self.QUIESCE_GRACE_SECONDS)
             yield
         finally:
@@ -745,6 +865,7 @@ class MonitoringService:
             candidates = [
                 r for r in records
                 if (r.target or r.address)
+                and self.owns(r.monitor_id)
                 and (
                     force
                     or r.latest_state in {MonitorState.UNKNOWN.value, MonitorState.DOWN.value}
@@ -835,7 +956,11 @@ class MonitoringService:
             if not self._stopping:
                 await self.prune_heartbeats()
 
-        self._startup_prune_task = asyncio.create_task(_later(), name="monitoring:startup_prune")
+        async def _guarded():
+            if self.housekeeping_here():
+                await _later()
+
+        self._startup_prune_task = asyncio.create_task(_guarded(), name="monitoring:startup_prune")
 
     def apply_settings(self, values: Dict[str, Any]) -> None:
         """Operator settings from the manifest ``settings_schema`` (Vault-backed)."""
@@ -849,6 +974,7 @@ class MonitoringService:
         self._heartbeat_retention_days = _int("heartbeat_retention_days", 7, 1, 365)
         self._initial_probe_worker_limit = _int("initial_probe_workers", 8, 1, 64)
         self._overview_cache_seconds = _int("overview_cache_seconds", 10, 0, 300)
+        self._probe_nodes = _int("probe_nodes", 1, 1, 64)
         raw_roles = values.get("probe_roles") or ""
         if isinstance(raw_roles, (list, tuple, set)):
             raw_roles = ",".join(str(r) for r in raw_roles)
@@ -1380,6 +1506,15 @@ class MonitoringService:
         if not self._scheduler_started:
             return
         job_id = f"monitor:{record.monitor_id}"
+        if self._shard is not None and record.monitor_id not in self._shard:
+            if record.monitor_id in self._shard_universe:
+                if self.scheduler.get_job(job_id):
+                    self.scheduler.remove_job(job_id)  # owned by another worker
+            else:
+                # A monitor we have never seen (single upsert): the shard is
+                # recomputed over the full monitor set, never per key.
+                self.request_resync()
+            return
         schedulable = {MonitorType.PING.value, MonitorType.HTTP.value, MonitorType.SERVER.value, MonitorType.SERVICE.value}
         if (
             not record.enabled
@@ -1390,6 +1525,12 @@ class MonitoringService:
             if self.scheduler.get_job(job_id):
                 self.scheduler.remove_job(job_id)
             return
+        if self.is_sharded:
+            # Rebalances run on every membership change: keep a running job with
+            # an unchanged interval instead of restarting it (no probe gap).
+            current = self.scheduler.get_job(job_id)
+            if current is not None and current.interval == max(1, int(record.interval_seconds or 1)):
+                return
         self.scheduler.add_interval_job(
             self.run_scheduled_probe,
             seconds=record.interval_seconds,
@@ -1443,6 +1584,15 @@ class MonitoringService:
         event loop thread (the scheduler uses asyncio.create_task)."""
         if records is None or not self._scheduler_started:
             return
+        if self.is_sharded:
+            old = self._shard
+            self._shard_universe = {r.monitor_id for r in records}
+            self._shard = self._compute_shard([r.monitor_id for r in records])
+            if old is not None and old != self._shard:
+                self.ctx.log.info(
+                    f"State Monitoring: shard now {len(self._shard)} monitors "
+                    f"(+{len(self._shard - old)} / -{len(old - self._shard)})."
+                )
         active_ids = set()
         for record in records:
             active_ids.add(f"monitor:{record.monitor_id}")
@@ -1899,8 +2049,10 @@ class MonitoringService:
         suppresses a single transient failure (no DB write / no state_changed
         emit) until ``_flap_threshold`` consecutive failures are seen.
         """
-        if monitor_id in self._inflight_probes or self.is_quiesced:
-            return  # quiesced: a destructive maintenance job runs somewhere in the cluster
+        if monitor_id in self._inflight_probes or self.is_quiesced or not self.owns(monitor_id):
+            # quiesced: a destructive maintenance job runs somewhere in the cluster;
+            # not owned: sharded mode, another worker probes this monitor.
+            return
         self._inflight_probes.add(monitor_id)
         try:
             # Phase 1: read from DB in a worker thread so the event loop stays free.
