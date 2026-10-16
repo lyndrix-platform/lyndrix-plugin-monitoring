@@ -882,6 +882,8 @@ function Toolbar({
   const { t } = useTranslation('monitoring')
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const menuBtnRef = useRef<HTMLButtonElement>(null)
+  const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null)
 
   useEffect(() => {
     if (!menuOpen) return
@@ -981,22 +983,30 @@ function Toolbar({
 
       <span style={{ flex: 1 }} />
 
-      {/* Visibility popover */}
+      {/* Visibility popover — rendered position:fixed from the button's rect so the
+          toolbar card's overflow:hidden (rounded corners) cannot clip it. */}
       <div style={{ position: 'relative' }} ref={menuRef}>
         <button
-          onClick={() => setMenuOpen((o) => !o)}
+          ref={menuBtnRef}
+          onClick={() => {
+            const rect = menuBtnRef.current?.getBoundingClientRect()
+            if (rect) setMenuPos({ top: rect.bottom + 6, right: Math.max(8, window.innerWidth - rect.right) })
+            setMenuOpen((o) => !o)
+          }}
           title={t('toolbar.visibility', { defaultValue: 'Show / hide sections' })}
           style={{ ...selectStyle, padding: '8px 12px', fontWeight: 700 }}
         >
           ☰ {t('toolbar.visibility', { defaultValue: 'Show / hide sections' })}
         </button>
-        {menuOpen && (
+        {menuOpen && menuPos && (
           <div
             style={{
-              position: 'absolute',
-              right: 0,
-              top: 'calc(100% + 6px)',
-              zIndex: 50,
+              position: 'fixed',
+              right: menuPos.right,
+              top: menuPos.top,
+              zIndex: 1000,
+              maxHeight: `calc(100vh - ${menuPos.top + 16}px)`,
+              overflowY: 'auto',
               minWidth: 240,
               padding: 12,
               borderRadius: 'var(--lx-radius-md)',

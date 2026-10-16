@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-10-16
+### Fixed
+- The "Show / hide sections" menu of the toolbar was clipped by the toolbar card (overflow hidden for the rounded corners); it is now positioned fixed from the button's rectangle and scrolls when it would leave the viewport.
+
 ## [1.6.1] - 2026-10-15
 ### Changed
 - Narrowing `probe_roles` at runtime now takes effect at once: an instance that may no longer probe gives the prober lease up via `ctx.release_lease` (core API ≥ 1.9), its `stop_probing` runs and an eligible peer takes over on its next heartbeat. Older cores keep the previous behaviour (reload needed, warning logged).
