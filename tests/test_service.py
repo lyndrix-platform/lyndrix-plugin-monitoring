@@ -6,7 +6,6 @@ without requiring a live database or running event loop.
 """
 
 import importlib
-import sys
 
 
 def test_monitoring_service_importable():
@@ -36,7 +35,30 @@ def test_manifest_fields():
 
     m = entrypoint.manifest
     # Keep these in sync with the manifest in entrypoint.py / the git tag.
-    assert m.version == "1.6.2"
+    assert m.version == "1.7.0"
     assert m.repo_url == "https://github.com/lyndrix-platform/lyndrix-plugin-monitoring"
     assert m.id == "lyndrix.plugin.state_monitoring"
-    assert m.min_core_version == "1.6.0"
+    assert m.min_core_version == "1.11.0"
+
+
+def test_manifest_declares_maintenance_topics():
+    """Bus contract (00-ergebnis-p0.md §3): consume the maintenance events, emit
+    our manual windows/overrides and the outage events — all declared, otherwise
+    ``ctx.emit`` raises PermissionError at runtime."""
+    from monitoring_plugin import entrypoint
+
+    perms = entrypoint.manifest.permissions
+    assert {"maintenance:windows_published", "maintenance:override_started", "maintenance:override_ended"} <= set(
+        perms.subscribe
+    )
+    assert {
+        "maintenance:windows_published", "maintenance:override_started", "maintenance:override_ended",
+        "monitoring:outage_persisted", "monitoring:outage_recovered",
+    } <= set(perms.emit)
+    keys = {f.key for f in entrypoint.manifest.settings_schema}
+    assert {
+        "outage_rules_enabled", "outage_rules_enabled_host", "outage_rules_enabled_service",
+        "outage_rules_enabled_hypervisor", "outage_rules_enabled_container", "outage_rules_disabled_kinds",
+        "outage_default_offline_minutes", "outage_default_severity", "outage_default_auto_resolve",
+        "override_default_minutes", "override_max_minutes", "override_linger_minutes",
+    } <= keys

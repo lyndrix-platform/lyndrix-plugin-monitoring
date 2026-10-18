@@ -20,6 +20,7 @@
     "online": "Online",
     "offline": "Offline",
     "paused": "Paused",
+    "maintenance": "Maintenance",
     "uptime_avg": "Uptime ø"
   },
   "hstat": {
@@ -27,13 +28,16 @@
     "up": "Up",
     "down": "Down",
     "paused": "Paused",
+    "maintenance": "Maintenance",
     "uptime": "Uptime"
   },
   "state": {
     "up": "Online",
     "down": "Offline",
     "paused": "Paused",
-    "unknown": "Unknown"
+    "unknown": "Unknown",
+    "maintenance": "Maintenance",
+    "until": "until {{time}}"
   },
   "monitor": {
     "manual_override": "manual",
@@ -61,7 +65,8 @@
     "toggle_services": "Services in host",
     "toggle_paused": "Paused monitors",
     "toggle_unknown": "Unknown monitors",
-    "refresh": "Refresh now"
+    "refresh": "Refresh now",
+    "maintenance": "Maintenance…"
   },
   "host": {
     "standalone": "Standalone host",
@@ -69,7 +74,8 @@
     "service_other": "{{count}} services",
     "uptime_24h": "24h {{value}}%",
     "uptime_all": "all-time {{value}}%",
-    "host_monitor": "Host monitor"
+    "host_monitor": "Host monitor",
+    "maintenance_button": "Maintenance"
   },
   "group": {
     "offline_count_one": "{{count}} offline",
@@ -103,5 +109,49 @@
     "hours_ago": "{{value}}h ago",
     "days_ago_one": "{{count}} day ago",
     "days_ago_other": "{{count}} days ago"
+  },
+  "maintenance": {
+    "title": "Maintenance",
+    "target": "{{label}} · {{count}} monitors",
+    "no_target": "Choose the hosts to put into maintenance.",
+    "pick_hosts": "Select at least one host.",
+    "hosts": "Hosts",
+    "mode_override": "Override now",
+    "mode_window": "Recurring / planned window",
+    "duration": "Duration",
+    "minutes": "{{count}} min",
+    "max_minutes": "max. {{count}} min",
+    "reason": "Reason",
+    "reason_placeholder": "e.g. kernel update",
+    "kind_weekly": "Weekly",
+    "kind_once": "Once",
+    "days": "Days",
+    "day_mon": "Mo",
+    "day_tue": "Tu",
+    "day_wed": "We",
+    "day_thu": "Th",
+    "day_fri": "Fr",
+    "day_sat": "Sa",
+    "day_sun": "Su",
+    "start": "Start",
+    "end": "End",
+    "timezone": "Time zone",
+    "over_midnight": "An end before the start means \"over midnight\".",
+    "note": "Note",
+    "cancel": "Cancel",
+    "start_override": "Start override",
+    "save_window": "Save window"
+  },
+  "overrides": {
+    "title": "Active maintenance overrides",
+    "no_reason": "(no reason)",
+    "source": "by {{source}}",
+    "ci_count_one": "{{count}} CI",
+    "ci_count_other": "{{count}} CIs",
+    "monitor_count_one": "{{count}} monitor",
+    "monitor_count_other": "{{count}} monitors",
+    "until": "until {{time}}",
+    "lingering_until": "ending, lingers until {{time}}",
+    "end": "End"
   }
 }

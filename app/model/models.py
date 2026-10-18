@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import Boolean, Column, DateTime, Float, Index, Integer, String, Text, case, func
 
 from core.api import Base
@@ -14,6 +14,14 @@ class MonitorState(str, Enum):
     DOWN = "DOWN"
     PAUSED = "PAUSED"
     UNKNOWN = "UNKNOWN"
+    # Derived, never reported: a probe that fails while a maintenance window or an
+    # override is active is stored as MAINTENANCE instead of DOWN (a successful
+    # probe stays UP). See controller/maintenance.py.
+    MAINTENANCE = "MAINTENANCE"
+
+
+# States that do not count towards the uptime denominator.
+UPTIME_EXCLUDED_STATES = (MonitorState.PAUSED.value, MonitorState.MAINTENANCE.value)
 
 
 class MonitorType(str, Enum):
@@ -44,6 +52,11 @@ class MonitorRecord(Base):
     source_hash = Column(String(128), nullable=True)
     config_hash = Column(String(128), nullable=True)
     metadata_json = Column(Text, nullable=False, default="{}")
+    # Entity-Registry configuration-item id of the monitored thing (host or
+    # service) and, for service monitors, of the host it runs on. Delivered by
+    # the IaC orchestrator through /inventory-sync; empty until it does.
+    ci_id = Column(String(36), nullable=True, index=True)
+    host_ci_id = Column(String(36), nullable=True)
     latest_state = Column(String(16), nullable=False, default=MonitorState.UNKNOWN.value)
     latest_latency_ms = Column(Float, nullable=True)
     latest_error = Column(Text, nullable=True)
@@ -86,10 +99,84 @@ class MonitorDailyAggregate(Base):
     up_samples = Column(Integer, nullable=False, default=0)
     down_samples = Column(Integer, nullable=False, default=0)
     paused_samples = Column(Integer, nullable=False, default=0)
+    # Failed probes inside a maintenance window/override; excluded from the
+    # uptime denominator like paused samples (added in 1.7.0, _ensure_schema).
+    maintenance_samples = Column(Integer, nullable=False, default=0)
     avg_latency_ms = Column(Float, nullable=True)
     # Number of samples that carried a latency — lets avg_latency_ms be updated
     # incrementally per heartbeat (running mean) instead of re-reading the day.
     latency_samples = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# Maintenance windows, overrides and outages (1.7.0, core API >= 1.13)
+#
+# Timestamps are stored as naive UTC like the rest of the plugin; the
+# controller converts to aware datetimes for core.api.maintenance.
+# ---------------------------------------------------------------------------
+
+
+class MaintenanceWindowRecord(Base):
+    """Windows published by one ``source`` for one CI (``maintenance:windows_published``)
+    or entered manually in this plugin (``source="monitoring"``, by CI or monitor)."""
+
+    __tablename__ = "monitoring_maintenance_windows"
+    __table_args__ = (
+        Index("uq_monitoring_mw_source_ci_monitor", "source", "ci_id", "monitor_id", unique=True),
+        {"extend_existing": True},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ci_id = Column(String(36), nullable=True, index=True)
+    monitor_id = Column(String(191), nullable=True, index=True)
+    source = Column(String(64), nullable=False)
+    kind = Column(String(32), nullable=False, default="generic")
+    name = Column(String(255), nullable=False, default="")
+    host_ci_id = Column(String(36), nullable=True)
+    windows_json = Column(Text, nullable=False, default="[]")
+    inherited_from = Column(String(32), nullable=True)
+    incidents_json = Column(Text, nullable=True)
+    deploy_policy = Column(String(16), nullable=True)
+    note = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class MaintenanceOverrideRecord(Base):
+    """A temporary maintenance marker (running deploy, manual override)."""
+
+    __tablename__ = "monitoring_overrides"
+    __table_args__ = {"extend_existing": True}
+
+    override_id = Column(String(64), primary_key=True)
+    source = Column(String(64), nullable=False)
+    ci_ids_json = Column(Text, nullable=False, default="[]")
+    monitor_ids_json = Column(Text, nullable=True)
+    until = Column(DateTime(timezone=True), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    linger_minutes = Column(Integer, nullable=False, default=15)
+    reason = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class OutageRecord(Base):
+    """Outage clock of one monitor: ``open`` while DOWN/MAINTENANCE, ``persisted``
+    once reported, deleted on recovery."""
+
+    __tablename__ = "monitoring_outages"
+    __table_args__ = {"extend_existing": True}
+
+    monitor_id = Column(String(191), primary_key=True)
+    outage_id = Column(String(128), nullable=True)
+    ci_id = Column(String(36), nullable=True)
+    down_since = Column(DateTime(timezone=True), nullable=False)
+    suppressed_until = Column(DateTime(timezone=True), nullable=True)
+    state = Column(String(16), nullable=False, default="open")  # open | persisted | recovered
+    persisted_at = Column(DateTime(timezone=True), nullable=True)
+    recovered_at = Column(DateTime(timezone=True), nullable=True)
+    rule_json = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
@@ -112,6 +199,9 @@ class MonitorUpsert(BaseModel):
     enabled: bool = True
     source_hash: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # Part of the config hash: a changed ci_id is a changed monitor.
+    ci_id: Optional[str] = Field(default=None, max_length=36)
+    host_ci_id: Optional[str] = Field(default=None, max_length=36)
     force: bool = False
 
 
@@ -122,6 +212,33 @@ class PassiveResult(BaseModel):
     error_message: Optional[str] = None
     source: str = "event_bus"
     timestamp: Optional[str] = None
+
+    @field_validator("state")
+    @classmethod
+    def _no_derived_state(cls, value: MonitorState) -> MonitorState:
+        # MAINTENANCE is derived from DOWN + an active window; a reporter only
+        # knows whether the thing is up or down.
+        if value == MonitorState.MAINTENANCE:
+            raise ValueError("state MAINTENANCE is derived by the monitoring plugin and cannot be reported")
+        return value
+
+
+class WindowCreate(BaseModel):
+    """``POST /windows`` — a manual maintenance window for a CI or a monitor."""
+
+    ci_id: Optional[str] = Field(default=None, max_length=36)
+    monitor_id: Optional[str] = Field(default=None, max_length=191)
+    windows: List[Dict[str, Any]] = Field(min_length=1)
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class OverrideCreate(BaseModel):
+    """``POST /overrides`` — a manual override for CIs and/or monitors."""
+
+    ci_ids: List[str] = Field(default_factory=list)
+    monitor_ids: List[str] = Field(default_factory=list)
+    minutes: Optional[int] = Field(default=None, ge=1)
+    reason: str = Field(default="", max_length=1000)
 
 
 class AdminOverride(BaseModel):
@@ -175,6 +292,8 @@ def _serialize_monitor(record: MonitorRecord) -> Dict[str, Any]:
         "enabled": record.enabled,
         "source_hash": record.source_hash,
         "metadata": _safe_json_load(record.metadata_json),
+        "ci_id": record.ci_id,
+        "host_ci_id": record.host_ci_id,
         "latest_state": record.latest_state,
         "latest_latency_ms": record.latest_latency_ms,
         "latest_error": record.latest_error,
@@ -198,7 +317,7 @@ def _calculate_uptime_percentages(session, monitor_ids: List[str]) -> Dict[str, 
         func.sum(case((MonitorHeartbeat.state == MonitorState.UP.value, 1), else_=0)),
     ).filter(
         MonitorHeartbeat.monitor_id.in_(monitor_ids),
-        MonitorHeartbeat.state != MonitorState.PAUSED.value,
+        MonitorHeartbeat.state.notin_(UPTIME_EXCLUDED_STATES),
     ).group_by(MonitorHeartbeat.monitor_id).all()
     for mid, total, up_total in rows:
         totals[mid] = {"total": int(total or 0), "up": int(up_total or 0)}
@@ -214,7 +333,7 @@ def _calculate_uptime_percentages(session, monitor_ids: List[str]) -> Dict[str, 
 def _uptime_from_aggregates(session, monitor_ids: List[str], days: int = 30) -> Dict[str, float]:
     """Uptime over the last ``days`` from ``monitoring_daily_aggregates`` — one
     small query over ~days × monitors rows instead of a scan of every heartbeat.
-    Paused samples do not count. Monitors without samples read 100 %.
+    Paused and maintenance samples do not count. Monitors without samples read 100 %.
     """
     if not monitor_ids:
         return {}
@@ -222,7 +341,11 @@ def _uptime_from_aggregates(session, monitor_ids: List[str], days: int = 30) -> 
     rows = session.query(
         MonitorDailyAggregate.monitor_id,
         func.sum(MonitorDailyAggregate.up_samples),
-        func.sum(MonitorDailyAggregate.total_samples - MonitorDailyAggregate.paused_samples),
+        func.sum(
+            MonitorDailyAggregate.total_samples
+            - MonitorDailyAggregate.paused_samples
+            - MonitorDailyAggregate.maintenance_samples
+        ),
     ).filter(
         MonitorDailyAggregate.monitor_id.in_(monitor_ids),
         MonitorDailyAggregate.day >= cutoff,

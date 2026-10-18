@@ -1,10 +1,19 @@
 import asyncio
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.api import ApiIdentity, require_permission
 
-from ..model.models import AdminOverride, InventorySyncPayload, MonitorUpsert, PassiveResult
+from ..model.models import (
+    AdminOverride,
+    InventorySyncPayload,
+    MonitorUpsert,
+    OverrideCreate,
+    PassiveResult,
+    WindowCreate,
+)
 from .service import MonitoringService
 
 # Fully qualified permission ids (Identity 2.0). Route gates check the
@@ -121,6 +130,93 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
     ):
         # Ingest + give the new monitors probe jobs + announce it to the prober.
         return await service.ingest_inventory(payload)
+
+    # ------------------------------------------------------------------
+    # Maintenance windows, overrides, outages (1.7.0, core API >= 1.13).
+    # ``/maintenance/*`` below belongs to the plugin's own housekeeping actions,
+    # so the feature lives under /windows, /overrides and /outages.
+    # ------------------------------------------------------------------
+
+    mnt = service.maintenance
+
+    @router.get("/windows")
+    async def list_windows(
+        ci_id: Optional[str] = None,
+        monitor_id: Optional[str] = None,
+        source: Optional[str] = None,
+        identity: ApiIdentity = Depends(require_permission(_PERM_READ)),
+    ):
+        """Stored windows (published + manual) with their effective state right now."""
+        items = await asyncio.to_thread(mnt.list_windows, ci_id=ci_id, monitor_id=monitor_id, source=source)
+        return {"items": items}
+
+    @router.post("/windows")
+    async def create_window(
+        payload: WindowCreate,
+        identity: ApiIdentity = Depends(require_permission(_PERM_WRITE)),
+    ):
+        """Manual window for a CI or a monitor (input or normal form; 400 names the problem)."""
+        try:
+            return await asyncio.to_thread(mnt.create_manual_window, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown monitor: {exc.args[0]}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @router.delete("/windows/{window_id}")
+    async def delete_window(
+        window_id: int,
+        identity: ApiIdentity = Depends(require_permission(_PERM_WRITE)),
+    ):
+        status = await asyncio.to_thread(mnt.delete_manual_window, window_id)
+        if status == "missing":
+            raise HTTPException(status_code=404, detail=f"Unknown window: {window_id}")
+        if status == "foreign":
+            raise HTTPException(status_code=409, detail="Only manual windows (source 'monitoring') can be deleted here")
+        return {"status": "deleted", "id": window_id}
+
+    @router.get("/overrides")
+    async def list_overrides(
+        active: bool = False,
+        identity: ApiIdentity = Depends(require_permission(_PERM_READ)),
+    ):
+        """Overrides with ``active`` / ``until_effective`` plus the UI defaults."""
+        return await asyncio.to_thread(mnt.list_overrides, active_only=active)
+
+    @router.post("/overrides")
+    async def create_override(
+        payload: OverrideCreate,
+        identity: ApiIdentity = Depends(require_permission(_PERM_WRITE)),
+    ):
+        """Manual override (``minutes`` capped at ``override_max_minutes``) → ``override_id = mon-<uuid>``."""
+        try:
+            return await asyncio.to_thread(mnt.create_override, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown monitor: {exc.args[0]}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @router.delete("/overrides/{override_id}")
+    async def end_override(
+        override_id: str,
+        identity: ApiIdentity = Depends(require_permission(_PERM_WRITE)),
+    ):
+        """End a manual override now (it lingers ``override_linger_minutes``)."""
+        status = await asyncio.to_thread(mnt.end_manual_override, override_id)
+        if status == "missing":
+            raise HTTPException(status_code=404, detail=f"Unknown override: {override_id}")
+        if status == "foreign":
+            raise HTTPException(status_code=409, detail="Only overrides created here (source 'monitoring') can be ended here")
+        return {"status": "ended", "override_id": override_id}
+
+    @router.get("/outages")
+    async def list_outages(identity: ApiIdentity = Depends(require_permission(_PERM_READ))):
+        """Open and reported outages with their rule and effective (unsuppressed) duration."""
+        return {"items": await asyncio.to_thread(mnt.list_outages)}
 
     @router.post("/clear-states")
     async def clear_states(identity: ApiIdentity = Depends(require_permission(_PERM_WRITE))):

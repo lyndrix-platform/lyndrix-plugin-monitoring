@@ -10,7 +10,7 @@ from .styles import aggregate_state, state_color
 # ------------------------------------------------------------------
 _SIZE_CONFIG = {
     "full": {
-        "heights": {MonitorState.UP.value: 80, MonitorState.DOWN.value: 40, MonitorState.PAUSED.value: 44, MonitorState.UNKNOWN.value: 20},
+        "heights": {MonitorState.UP.value: 80, MonitorState.DOWN.value: 40, MonitorState.PAUSED.value: 44, MonitorState.MAINTENANCE.value: 44, MonitorState.UNKNOWN.value: 20},
         "container_height": 88,
         "gap": "6px",
         "radius": "0 0 3px 3px",
@@ -20,7 +20,7 @@ _SIZE_CONFIG = {
         "scale_margin": "3px",
     },
     "host": {
-        "heights": {MonitorState.UP.value: 46, MonitorState.DOWN.value: 23, MonitorState.PAUSED.value: 26, MonitorState.UNKNOWN.value: 12},
+        "heights": {MonitorState.UP.value: 46, MonitorState.DOWN.value: 23, MonitorState.PAUSED.value: 26, MonitorState.MAINTENANCE.value: 26, MonitorState.UNKNOWN.value: 12},
         "container_height": 52,
         "gap": "4px",
         "radius": "0 0 2px 2px",
@@ -30,7 +30,7 @@ _SIZE_CONFIG = {
         "scale_margin": "2px",
     },
     "service": {
-        "heights": {MonitorState.UP.value: 30, MonitorState.DOWN.value: 15, MonitorState.PAUSED.value: 16, MonitorState.UNKNOWN.value: 6},
+        "heights": {MonitorState.UP.value: 30, MonitorState.DOWN.value: 15, MonitorState.PAUSED.value: 16, MonitorState.MAINTENANCE.value: 16, MonitorState.UNKNOWN.value: 6},
         "container_height": 34,
         "gap": "2px",
         "radius": "0 0 1px 1px",

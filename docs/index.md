@@ -5,13 +5,18 @@ Native infrastructure and service monitoring with persistent, grouped status tim
 - **Repository:** [https://github.com/lyndrix-platform/lyndrix-plugin-monitoring](https://github.com/lyndrix-platform/lyndrix-plugin-monitoring)
 - **Platform docs:** [Lyndrix Core](https://docs.lyndrix.eu) · [Plugin ecosystem](https://docs.lyndrix.eu/ecosystem/)
 
-This plugin builds on the Lyndrix Core [notification router](https://docs.lyndrix.eu/core-components/notification-router/) extension point.
+The plugin has no notification path of its own: state changes are published on the event bus
+(`monitoring:state_changed`, `monitoring:outage_persisted` / `outage_recovered`) and consumed by
+other plugins (e.g. ITSM). It speaks the shared maintenance-window contract of
+`core.api.maintenance` (core API ≥ 1.13).
 
 ## Features
 
 - Infrastructure and service state monitoring
 - Passive monitoring-result ingestion with admin override
-- Inventory sync from other plugins
+- Inventory sync from the IaC orchestrator (`POST /inventory-sync`, incl. `ci_id`)
+- Maintenance windows and overrides (consumed from the bus, manual ones in the UI), state `MAINTENANCE`
+- Outage rule: `monitoring:outage_persisted` after `offline_minutes` outside maintenance
 - Modular UI with toolbar and preferences
 
 ## Installation

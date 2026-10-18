@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-10-18
+### Added
+- Maintenance windows, overrides and the outage rule (core API ≥ 1.13, `core.api.maintenance`; `min_core_version` 1.11.0):
+  - New tables `monitoring_maintenance_windows`, `monitoring_overrides`, `monitoring_outages` (idempotent DDL under the bootstrap lock) and the module `app/controller/maintenance.py` (`MaintenanceStore`, per-instance `MaintenanceCache`, `MaintenanceManager`).
+  - Consumes `maintenance:windows_published` (`replaces: true` swaps every row of the publishing source in one transaction; kinds are open — any valid slug is stored), `maintenance:override_started` / `override_ended` (`until` + `linger_minutes`). Own windows/overrides (`source: "monitoring"`) are ignored by the handlers; the cache of the peers is invalidated with the plugin's own `monitoring:monitors_changed` broadcast (`reason: maintenance_windows`).
+  - Monitor state `MAINTENANCE`: a failed probe (active or passive) inside an active window/override is stored as `MAINTENANCE` instead of `DOWN`; a successful probe stays `UP`, `latest_error` is kept. New aggregate column `maintenance_samples`; the uptime denominator is `total − paused − maintenance`. Roll-up order `DOWN > UNKNOWN > MAINTENANCE > UP > PAUSED`; colour `--lx-state-maintenance` (fallback paused), badge `lx-badge--maintenance`; header counter "Maintenance".
+  - `ci_id` / `host_ci_id` on monitors — taken from the orchestrator's inventory sync (hosts and services, orchestrator ≥ 1.6.0), part of the config hash; a service without its own ci borrows the ci of its host monitor.
+  - Outage clock: `monitoring_outages` is written in the heartbeat transaction (`down_since`, `suppressed_until` = window end). A 60 s job on the probing instance (`monitoring:outages`; sharded: the owner, orphans by the housekeeping worker) reports an outage once `now − max(down_since, suppressed_until)` reaches the rule's `offline_minutes` — conditional `UPDATE … WHERE state='open'` → exactly one `monitoring:outage_persisted` (`outage_id = "<ci_id>:<since>"`), `monitoring:outage_recovered` after the recovering commit. Rule cascade: service CI → host CI → settings default; no `ci_id` → no event.
+  - Settings: `outage_rules_enabled`, per-kind switches (`…_hypervisor/_host/_service/_container`), `outage_rules_disabled_kinds`, `outage_default_offline_minutes/severity/auto_resolve`, `override_default_minutes`, `override_max_minutes`, `override_linger_minutes` (apply at runtime).
+  - API: `GET/POST /windows`, `DELETE /windows/{id}` (manual rows only), `GET/POST /overrides`, `DELETE /overrides/{id}`, `GET /outages`. Manual windows/overrides are published locally (`maintenance:*`, `source: "monitoring"`) for the registry and the server manager.
+  - React UI: `MaintenanceDialog` (override 30/60/120/240 min + reason, or weekly/once window) from the host detail card and the toolbar (host picker), `OverridesPanel` with "End" for own overrides, badge "Maintenance · until hh:mm"; NiceGUI mirrors colour and counters.
+  - `monitoring:state_changed` carries `ci_id` and `maintenance`; `health()` reports `monitors_maintenance`.
+
+### Changed
+- `apply_admin_override(pause)`, `delete_monitors`, `clear_states` and the inventory stale-delete also clear the outage clock (and manual windows pinned to a deleted monitor).
+
 ## [1.6.2] - 2026-10-16
 ### Fixed
 - The "Show / hide sections" menu of the toolbar was clipped by the toolbar card (overflow hidden for the rounded corners); it is now positioned fixed from the button's rectangle and scrolls when it would leave the viewport.

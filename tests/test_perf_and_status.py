@@ -20,12 +20,16 @@ from sqlalchemy.pool import StaticPool
 class _FakeCtx:
     def __init__(self) -> None:
         self.events: list[tuple[str, dict]] = []
+        # (topic, payload, cluster) — lets tests assert which emits were bridged
+        # (``cluster=True``) and which stayed local (maintenance:* / outage_*).
+        self.emits: list[tuple[str, dict, bool]] = []
         self.statuses: list[tuple[str, dict]] = []
         self.log = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None,
                                    debug=lambda *a, **k: None, error=lambda *a, **k: None)
 
-    def emit(self, topic, payload):
+    def emit(self, topic, payload, cluster: bool = False):
         self.events.append((topic, payload))
+        self.emits.append((topic, payload, cluster))
 
     def set_status(self, phase, **kw):
         self.statuses.append((phase, kw))
@@ -44,10 +48,17 @@ class _FakeCtx:
 
 @pytest.fixture()
 def svc(monkeypatch):
+    from sqlalchemy import event
+
     from core.api import Base, db_instance
     from app.controller.service import MonitoringService
 
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_conn, _record):  # MariaDB enforces FKs — so does the test DB
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
     monkeypatch.setattr(db_instance, "engine", engine)
     monkeypatch.setattr(db_instance, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(db_instance, "is_connected", True)

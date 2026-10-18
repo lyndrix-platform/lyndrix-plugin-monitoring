@@ -2,7 +2,9 @@
 
 ## Übersicht
 
-Das State-Monitoring-Plugin ist das native Infrastruktur- und Service-Monitoring für Lyndrix. Es pflegt ein Monitor-Register mit persistenter Statushistorie, unterstützt gruppierte Übersichten (nach Site, Umgebung etc.), Timeline-Visualisierungen und Admin-Overrides. Inventar-Synchronisation mit dem IaC Orchestrator erfolgt über das Event `monitoring:inventory_sync` — der IaC Orchestrator ist die primäre Quelle für Infrastruktur-Monitore.
+Das State-Monitoring-Plugin ist das native Infrastruktur- und Service-Monitoring für Lyndrix. Es pflegt ein Monitor-Register mit persistenter Statushistorie, unterstützt gruppierte Übersichten (nach Site, Umgebung etc.), Timeline-Visualisierungen und Admin-Overrides. Das Inventar kommt vom IaC Orchestrator per HTTP (`POST /inventory-sync`, mit `ci_id` je Host und Service) — er ist die primäre Quelle für Infrastruktur-Monitore. Seit 1.7.0 kennt das Plugin Wartungsfenster und Overrides (Zustand `MAINTENANCE`) und meldet Ausfälle außerhalb eines Fensters als `monitoring:outage_persisted` (siehe *Wartungsfenster, Overrides und Outage-Regel*).
+
+Das Plugin hat **keinen eigenen Benachrichtigungspfad** (kein Discord, kein Notification-Router): Zustandswechsel und Ausfälle werden auf dem Event-Bus veröffentlicht und von anderen Plugins (z. B. ITSM) konsumiert.
 
 ---
 
@@ -17,11 +19,12 @@ lyndrix-plugin-monitoring/
     ├── controller/
     │   ├── api.py              # FastAPI-Router (auth + permission-gated)
     │   ├── service.py          # MonitoringService: Register, Historie, Stats
+    │   ├── maintenance.py      # Wartungsfenster, Overrides, Outage-Uhr (Store, Cache, Manager)
     │   ├── helpers.py          # Reine Geschäftslogik: build_grouped_overview, flatten_monitors, …
     │   ├── scheduler.py        # Passive-Check-Scheduler
     │   └── provider/           # Aktive Check-Provider
     ├── model/
-    │   └── models.py           # SQLAlchemy: Monitor, MonitorHistory, AdminOverride
+    │   └── models.py           # SQLAlchemy: Monitor, Heartbeat, Tagesaggregat, Fenster, Override, Outage
     └── ui/
         ├── nicegui/            # NiceGUI-UI: overview.py, timeline.py, cards.py, split.py, table.py, styles.py
         │   └── helpers.py      # Re-Export-Shim → controller/helpers.py (Abwärtskompatibilität)
@@ -40,13 +43,22 @@ Alle Routen sind unter `/api/plugins/lyndrix.plugin.state_monitoring/` erreichba
 |---|---|---|---|
 | `GET` | `/dashboard` | `api:read` | Monitor-Liste + Statistiken (gecacht, s. Performance-Modell) |
 | `GET` | `/overview` | `api:read` | Gruppierte + gefilterte Übersicht für den React-Client (gecacht) |
-| `GET` | `/monitors/{monitor_id}` | `api:read` | Einzelner Monitor |
+| `GET` | `/monitors/{monitor_id}` | `api:read` | Einzelner Monitor (inkl. `ci_id`, `in_maintenance`, `maintenance_until`, `outage_since`) |
 | `GET` | `/history/{monitor_id}` | `api:read` | Statushistorie |
-| `POST` | `/monitors` | `api:write` | Monitor anlegen oder aktualisieren (Upsert) |
-| `DELETE` | `/monitors/{monitor_id}` | `api:write` | Monitor entfernen |
-| `POST` | `/passive` | `api:write` | Passives Check-Ergebnis empfangen |
-| `POST` | `/inventory-sync` | `api:write` | Bulk-Upsert aus dem IaC Orchestrator |
-| `PUT` | `/admin-override/{monitor_id}` | `api:write` | Admin-Statusüberschreibung setzen |
+| `POST` | `/monitors` | `api:write` | Monitor anlegen oder aktualisieren (Upsert; `ci_id`/`host_ci_id` sind Teil des Config-Hashes) |
+| `POST` | `/passive` | `api:write` | Passives Check-Ergebnis empfangen (`MAINTENANCE` wird abgelehnt — der Zustand ist abgeleitet) |
+| `POST` | `/inventory-sync` | `api:write` | Bulk-Upsert aus dem IaC Orchestrator (Hosts und Services, mit `ci_id`/`host_ci_id`) |
+| `POST` | `/admin-override` | `api:write` | Admin-Override `pause` / `resume` / `update` |
+| `POST` | `/clear-states` | `api:write` | Zustände und Statistiken zurücksetzen (destruktiv) |
+| `GET` | `/windows?ci_id=&monitor_id=&source=` | `api:read` | Gespeicherte Wartungsfenster (publiziert + manuell) mit `effective` (`active`, `until`, `source`, `next_start`) |
+| `POST` | `/windows` | `api:write` | Manuelles Fenster `{ci_id \| monitor_id, windows: [...], note}` — Eingabe- oder Normalform; Validierungsfehler → `400` mit Meldung je Fenster |
+| `DELETE` | `/windows/{id}` | `api:write` | Nur manuelle Zeilen (`source == "monitoring"`), sonst `409` |
+| `GET` | `/overrides?active=true` | `api:read` | Overrides mit `active`, `until_effective`, `own` plus `defaults` (Minuten-Vorgaben aus den Settings) |
+| `POST` | `/overrides` | `api:write` | Manuelles Override `{ci_ids \| monitor_ids, minutes, reason}` → `override_id = "mon-<uuid>"`; `minutes` wird auf `override_max_minutes` begrenzt |
+| `DELETE` | `/overrides/{id}` | `api:write` | Beendet ein eigenes Override jetzt (`ended_at`, Nachlauf `override_linger_minutes`); fremde → `409` |
+| `GET` | `/outages` | `api:read` | Offene und gemeldete Ausfälle mit Regel, `effective_since`, `effective_duration_s`, `in_maintenance` |
+
+Die Wartungsaktionen unter `/maintenance/*` (Prune, Rebuild, Delete …) sind die Plugin-Pflege (siehe *Wartungsaktionen*), nicht die Wartungsfenster.
 
 ### `/overview`-Endpunkt
 
@@ -185,21 +197,145 @@ Core-Doku *High Availability*), gilt für dieses Plugin:
 
 ## Events
 
+Alle Topics stehen in `permissions.subscribe` bzw. `permissions.emit` des Manifests (der Core
+lehnt nicht deklarierte Emits mit `PermissionError` ab).
+
 | Richtung | Topic | Beschreibung |
 |---|---|---|
-| subscribe | `db:connected` | Datenbank bereit — Tabellen initialisieren |
-| subscribe | `vault:ready_for_data` | Plugin-Einstellungen (Retention, Worker, Cache, `probe_roles`) aus Vault anwenden |
+| subscribe | `db:connected` | Datenbank bereit — Tabellen initialisieren (unter dem Bootstrap-Lock), Wartungs-Cache laden |
+| subscribe | `vault:ready_for_data` | Plugin-Einstellungen (Retention, Worker, Cache, `probe_roles`, Outage-Regel, Override-Grenzen) aus Vault anwenden |
 | subscribe | `cluster:changed` | Core ≥ 1.6: Mitgliedschaft geändert → im verteilten Modus den eigenen Anteil neu berechnen |
 | subscribe | `plugin:settings_changed` | Core ≥ 1.5.1, gebridgt: Operator hat die Einstellungen gespeichert → bei passender `plugin_id` neu laden |
-| subscribe | `monitoring:inventory_sync` | Inventar-Sync vom IaC Orchestrator empfangen |
-| subscribe / emit | `monitoring:monitors_changed` | Monitor-Satz geändert (Inventar, Upsert, Admin-Override, Wartung) — mit `cluster=True` an alle Instanzen; der Prober lädt seine Jobs neu, bei `reason: probe_all` startet er einen vollständigen Sweep |
+| subscribe | `monitoring:config_upsert` | `MonitorUpsert` über den Bus (wie `POST /monitors`) |
+| subscribe | `monitoring:passive_result` | `PassiveResult` über den Bus (wie `POST /passive`) |
+| subscribe | `monitoring:admin_override` | `AdminOverride` über den Bus (wie `POST /admin-override`) |
+| subscribe | `maintenance:windows_published` | Core-API ≥ 1.13: Fenster eines Publishers (Orchestrator, künftig weitere). `replaces: true` ersetzt alle Zeilen dieser `source` in einer Transaktion; Items ohne `ci_id`, mit ungültigem Kind oder ungültigem Fenster werden einzeln übersprungen. `source: "monitoring"` (eigene Fenster) wird ignoriert |
+| subscribe | `maintenance:override_started` / `override_ended` | Override eines Publishers (laufender Deploy); Upsert je `override_id`, Ende mit `ended_at` + `linger_minutes`. Eigene (`source: "monitoring"`) werden ignoriert |
+| subscribe / emit | `monitoring:monitors_changed` | Monitor-Satz geändert (Inventar, Upsert, Admin-Override, Wartung) — mit `cluster=True` an alle Instanzen; der Prober lädt seine Jobs neu, bei `reason: probe_all` startet er einen vollständigen Sweep; **`reason: maintenance_windows`** lädt nur den Wartungs-Cache neu (jede Instanz, kein Job-Resync) |
 | subscribe / emit | `monitoring:quiesce` | `{"on": bool, "ttl"}` mit `cluster=True` — destruktive Wartung auf einer anderen Instanz, der Prober pausiert alle Probes |
-| emit | `monitoring:status_changed` | Statusänderung eines Monitors |
-| emit | `system:notify` | Plattform-Benachrichtigung bei Statusänderungen |
+| emit | `monitoring:state_changed` | Zustandswechsel eines Monitors `{monitor_id, previous_state, new_state, timestamp, error_message, ci_id, maintenance}` — lokal, vor dem Commit (nur Cache-/UI-Signal) |
+| emit | `maintenance:windows_published` | Manuelle Fenster dieses Plugins `{source: "monitoring", published_at, replaces: true, items}` — **lokal**, nach jedem Anlegen/Löschen; nur Zeilen mit `ci_id` |
+| emit | `maintenance:override_started` / `override_ended` | Manuelle Overrides aus der UI/API, `source: "monitoring"` — **lokal** |
+| emit | `monitoring:outage_persisted` | Einmal je Ausfall, nach `offline_minutes` außerhalb jeder Wartung — **lokal**, nur von der probenden Instanz (Payload siehe unten) |
+| emit | `monitoring:outage_recovered` | `{outage_id, ci_id, since, recovered_at, duration_s}` — **lokal**, nach dem Commit des Heartbeats, der den Monitor wieder `UP` setzt |
+
+Transportregel (Vertrag `00-ergebnis-p0.md` §3): `maintenance:*` und `monitoring:outage_*` werden
+**ohne** `cluster=True` emittiert — Plugins mit `placement: any` laufen auf jeder Instanz, der
+lokale Konsument schreibt in die gemeinsame Datenbank, genau eine Instanz verarbeitet jedes Event.
+Peers erfahren von geänderten Fenstern über das eigene `monitoring:monitors_changed`
+(`reason: maintenance_windows`). Die Handler sind trotzdem idempotent (Unique-Key je
+`(source, ci_id, monitor_id)`, Upsert je `override_id`), damit ein späterer Wechsel auf
+`cluster=True` nichts kaputt macht.
 
 ### Inventar-Synchronisation
 
-Der IaC Orchestrator emittiert `monitoring:inventory_sync` mit einer Liste von Hosts und Services. Das Monitoring-Plugin führt daraufhin einen Bulk-Upsert aus und aktualisiert alle bekannten Monitore. Hosts, die aus dem Inventar verschwunden sind, werden auf `unknown` gesetzt, nicht gelöscht.
+Der IaC Orchestrator **postet** sein Inventar mit dem System-API-Key an `POST /inventory-sync`
+(beim Boot und nach jeder `NativeGenerateStage`), nicht über den Bus. Je Host entsteht
+`host:<name>` (Typ `server`), je Service `service:<host>:<name>` (`http` bei URL-Ziel, sonst
+`service`). Seit Orchestrator 1.6.0 tragen Hosts `ci_id` und Services `ci_id` + `host_ci_id`
+(Entity-Registry-UUIDs); sie landen am Monitor und sind Teil des Config-Hashes. Monitore dieser
+Quelle, die im Payload fehlen, werden samt Historie, Outage-Uhr und daran gepinnten manuellen
+Fenstern gelöscht. Ein Service-Monitor ohne eigene `ci_id` übernimmt für Fenster, Overrides und
+Outage-Meldungen die `ci_id` seines Host-Monitors.
+
+---
+
+## Wartungsfenster, Overrides und Outage-Regel (1.7.0)
+
+Grundlage ist `core.api.maintenance` (Core-API ≥ 1.13): Fensterformate `weekly` / `once` /
+`cron + duration` (Normalform `{"type": …}`), DST-sichere Auswertung, Override-Semantik
+(`until` + `linger_minutes`) und der Bus-Vertrag. Der Core hält **keine** Daten — das Plugin
+speichert, was es empfängt, und wertet beim Lesen aus.
+
+### Ablage und Cache
+
+| Tabelle | Inhalt |
+|---|---|
+| `monitoring_maintenance_windows` | eine Zeile je `(source, ci_id, monitor_id)`: `kind`, `name`, `host_ci_id`, `windows_json` (Normalform), `inherited_from`, `incidents_json` (Regel des Publishers), `deploy_policy`, `note`. Publizierte Zeilen haben `ci_id`, manuelle (`source = monitoring`) `ci_id` und/oder `monitor_id` |
+| `monitoring_overrides` | `override_id` (PK), `source`, `ci_ids_json`, `monitor_ids_json` (nur manuelle), `until`, `started_at`, `ended_at`, `linger_minutes`, `reason` |
+| `monitoring_outages` | die Outage-Uhr je Monitor (siehe unten) |
+
+Jede Instanz hält einen **In-Memory-Cache** (`MaintenanceCache`): Fenster je `ci_id` und je
+`monitor_id`, aktive Overrides, Regeln je `ci_id`, Kind je `ci_id`, Zuordnung Host-Name →
+Host-`ci_id`. Der Probe-Hot-Path liest nur diesen Cache (kein DB-Zugriff pro Heartbeat). Neu
+geladen wird er nach jedem eigenen Schreibvorgang, bei `monitoring:monitors_changed`
+(`reason: maintenance_windows`) eines Peers, nach Inventar-Import, beim Bootstrap und spätestens
+alle 5 Minuten durch den Outage-Job. Zeiten liegen in den Tabellen naiv in UTC; der Controller
+konvertiert.
+
+### Zustand `MAINTENANCE`
+
+Jeder Heartbeat (aktive Probe, passives Ergebnis) läuft durch `_store_heartbeat`: ist der
+gemessene Zustand `DOWN` und für den Monitor ein Fenster oder Override aktiv
+(`effective_state(...)` über Fenster/Overrides am `monitor_id` und an der effektiven `ci_id`),
+wird `MAINTENANCE` gespeichert — **nur `DOWN` wird ersetzt**, eine erfolgreiche Probe bleibt `UP`,
+`latest_error` bleibt zur Diagnose erhalten. Die Flap-Dämpfung (drei Fehlschläge) greift davor.
+Folgen:
+
+- Tagesaggregat: eigene Spalte `maintenance_samples`; der Uptime-Nenner ist
+  `total − paused − maintenance` (Aggregate, Heartbeat-Fenster 24 h, Rollups).
+- Rangfolge für Hosts und Gruppen: `DOWN > UNKNOWN > MAINTENANCE > UP > PAUSED`.
+- Farbe `--lx-state-maintenance` (Core ≥ 1.11 / Shell ≥ 1.8), Fallback `--lx-state-paused`;
+  Badge `lx-badge--maintenance`; im React-UI „Wartung · bis hh:mm“, eigener Zähler in der
+  Kopfkarte, Widget und NiceGUI-Seite.
+- Der Probe-Job läuft weiter (Recovery wird erkannt); `MAINTENANCE`-Monitore werden im Sweep wie
+  `DOWN` behandelt. `PassiveResult` mit `MAINTENANCE` wird abgelehnt (Validierungsfehler).
+- `GET /overview`, `/dashboard`, `/monitors/{id}` liefern je Monitor `ci_id`, `in_maintenance`,
+  `maintenance_until`, `maintenance_source` (`window` | `override`), `outage_since`; Hosts
+  zusätzlich `monitor_ids`, `ci_ids`, `in_maintenance`, `maintenance_until`.
+
+### Outage-Uhr und Outage-Regel
+
+`monitoring_outages` wird **in derselben Transaktion** wie der Heartbeat geschrieben (keine
+Phantome):
+
+- `DOWN`/`MAINTENANCE` ohne Zeile → `state = open`, `down_since = jetzt`, `suppressed_until =
+  Fensterende` (falls Wartung aktiv). Jeder weitere Heartbeat in Wartung schreibt
+  `suppressed_until = max(…, Fensterende)` fort; `down_since` bleibt.
+- `UP` und `state = open` → Zeile gelöscht (nie gemeldet). `UP` und `state = persisted` →
+  bedingtes `UPDATE … WHERE state='persisted'`, bei Treffer **nach dem Commit**
+  `monitoring:outage_recovered` (`duration_s = recovered_at − down_since`), Zeile gelöscht.
+- `UNKNOWN` ändert nichts; `pause`, `clear-states`, `delete-monitors` und der Inventar-Abgleich
+  löschen die Zeilen mit.
+
+Der Interval-Job `monitoring:outages` (60 s, nur auf der probenden Instanz; im Shard-Modus die
+Besitzerin des Monitors, verwaiste Zeilen übernimmt der `housekeeping`-Worker) prüft jede
+offene Zeile: läuft Wartung → `suppressed_until` fortschreiben. Sonst
+`effektive Ausfallzeit = jetzt − max(down_since, suppressed_until)`; erreicht sie
+`offline_minutes` der Regel, wird die Zeile per bedingtem `UPDATE … WHERE state='open'` auf
+`persisted` gesetzt — `rowcount == 1` gewinnt, auch bei Lease-Wechsel oder zwei gleichzeitigen
+Instanzen — und **einmal** emittiert:
+
+```json
+{"outage_id": "<ci_id>:<since ISO-UTC>", "ci_id": "…", "kind": "host", "name": "<Monitor-Name>",
+ "host_ci_id": null, "monitor_id": "host:docker-hydra", "since": "…Z", "persisted_at": "…Z",
+ "duration_s": 600, "rule": {"offline_minutes": 10, "severity": "high", "auto_resolve": true},
+ "error": "connection refused"}
+```
+
+`outage_id` ist deterministisch (`make_outage_id`) und dient ITSM als `external_id`. Ohne
+`ci_id` am Monitor (auch nicht über den Host-Monitor) gibt es **kein Event**, nur einen
+Log-Eintrag je Monitor; die Zeile bleibt für `GET /outages` sichtbar.
+
+**Regelkaskade** (`rule_for`): `incidents` des publizierten Items der Service-`ci_id` → der
+Host-`ci_id` → Settings-Default (`outage_default_*`). `enabled: false` oder `offline_minutes: 0`
+= keine Meldung. **Notschalter:** `outage_rules_enabled` global; die bekannten Kinds
+`hypervisor`, `host`, `service`, `container` haben eigene Schalter; jeder andere Kind (die Kinds
+sind offen, Entscheidung A) ist stumm, wenn er in `outage_rules_disabled_kinds` steht — sonst
+gilt die Regel. Der Kind kommt aus dem publizierten Item, sonst `server`-Monitor → `host`, alles
+andere → `service`.
+
+### Manuelle Fenster und Overrides (UI/API)
+
+Im React-UI öffnet „Wartung“ (Detailkarte eines Hosts bzw. Toolbar mit Host-Auswahl) den
+Dialog: **Override jetzt** (30/60/120/240 min oder frei, max. `override_max_minutes`, Grund) oder
+**Fenster** (wöchentlich mit Tagen/Beginn/Ende/Zeitzone, oder einmalig). Overrides gelten für die
+Monitore des Hosts und die daraus aufgelösten `ci_id`s; Fenster werden je Monitor gespeichert
+(zweiter Eintrag für dasselbe Ziel hängt die Fenster an). Das Panel „Aktive Wartungs-Overrides“
+zeigt eigene und fremde Overrides; eigene lassen sich beenden (Nachlauf
+`override_linger_minutes`). Jede Änderung wird **lokal** als `maintenance:windows_published`
+(`source: "monitoring"`) bzw. `override_started`/`override_ended` emittiert, damit Entity
+Registry und Server Manager sie sehen; die eigenen Handler ignorieren diese Quelle.
 
 ---
 
@@ -209,12 +345,17 @@ Alle Modelle verwenden `extend_existing=True`, um `InvalidRequestError` beim Plu
 
 | Tabelle | Beschreibung |
 |---|---|
-| `monitoring_monitors` | Monitor-Register (ID, Name, Typ, Gruppe, letzter Status, Uptime-Fenster 24h/7d/30d) |
+| `monitoring_monitors` | Monitor-Register (ID, Name, Typ, Gruppe, letzter Status, Uptime-Fenster 24h/7d/30d, `ci_id` (Index) und `host_ci_id`) |
 | `monitoring_heartbeats` | Rohe Probe-Ergebnisse (Zeitstempel, Status, Latenz, Quelle); Retention `heartbeat_retention_days`; Indizes `monitor_id`, `created_at`, `(monitor_id, created_at)` |
-| `monitoring_daily_aggregates` | Tagesaggregate je Monitor (Samples gesamt/up/down/paused, Latenz-Mittel, `latency_samples`) — Quelle für `uptime_all`/7d/30d; eindeutiger Schlüssel `uq_monitoring_daily_aggregates_monitor_day` auf `(monitor_id, day)` |
+| `monitoring_daily_aggregates` | Tagesaggregate je Monitor (Samples gesamt/up/down/paused/maintenance, Latenz-Mittel, `latency_samples`) — Quelle für `uptime_all`/7d/30d; eindeutiger Schlüssel `uq_monitoring_daily_aggregates_monitor_day` auf `(monitor_id, day)` |
+| `monitoring_maintenance_windows` | Wartungsfenster je `(source, ci_id, monitor_id)` (eindeutig), publiziert oder manuell — siehe *Wartungsfenster* |
+| `monitoring_overrides` | Overrides je `override_id` |
+| `monitoring_outages` | Outage-Uhr je Monitor (`open` → `persisted`, bei Recovery gelöscht) |
 
 Schemaänderungen (Index, neue Spalte) werden in `MonitoringService._ensure_schema` idempotent
-nachgezogen (`CREATE INDEX IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS`).
+nachgezogen (`CREATE INDEX IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS`; 1.7.0:
+`ci_id`, `host_ci_id`, `maintenance_samples`); neue Tabellen legt `create_all` unter dem
+Bootstrap-Lock `lyndrix_bootstrap` an.
 `_ensure_daily_aggregate_unique` führt vorhandene Duplikate je `(monitor_id, day)` zusammen
 (Zähler summiert, Latenz-Mittel nach `latency_samples` gewichtet, Zeile mit kleinster `id` bleibt)
 und legt dann den eindeutigen Index an (1061 „Duplicate key name“ wird toleriert). Auf MariaDB
@@ -236,9 +377,19 @@ Plugin-Einstellungen (Settings-Dialog des Cores, in Vault gespeichert, angewende
 | `overview_cache_seconds` | `10` | Gültigkeit einer berechneten Übersicht für gleichzeitige Betrachter (0 = immer neu) |
 | `probe_roles` | leer | nur Cluster: Instanz-Rollen, die proben dürfen (Komma-Liste, z. B. `runner`); leer = jede Instanz — siehe *Cluster-Betrieb*. Im verteilten Modus sofort wirksam |
 | `probe_nodes` | `1` | nur Cluster (Core-API ≥ 1.8): Anzahl Instanzen, die sich das Probing teilen (1–64). `1` = einzelner Prober per Lease (bisheriges Verhalten). Änderungen innerhalb von > 1 wirken sofort; der Wechsel zwischen `1` und > 1 erst nach Plugin-Reload/Neustart |
+| `outage_rules_enabled` | `true` | Kategorie *Incidents*: globaler Notschalter für `monitoring:outage_persisted` / `outage_recovered` |
+| `outage_rules_enabled_hypervisor` / `_host` / `_service` / `_container` | `true` / `true` / `true` / `false` | Schalter je bekanntem Kind |
+| `outage_rules_disabled_kinds` | leer | Komma-Liste weiterer Kinds ohne eigenen Schalter, die stumm sind (z. B. `network,generic`); nicht gelistete unbekannte Kinds werden gemeldet |
+| `outage_default_offline_minutes` | `10` | Minuten außerhalb der Wartung bis zur Meldung, wenn weder CI noch Host eine Regel publiziert haben (`0` = Default-Regel aus) |
+| `outage_default_severity` | `high` | `critical` / `high` / `medium` / `low` im Payload der Default-Regel |
+| `outage_default_auto_resolve` | `true` | darf der Konsument (ITSM) bei `outage_recovered` automatisch lösen (Default-Regel) |
+| `override_default_minutes` | `60` | Kategorie *Maintenance windows*: Vorauswahl der Dauer eines manuellen Overrides |
+| `override_max_minutes` | `240` | Obergrenze eines manuellen Overrides (längere Anfragen werden gekappt) |
+| `override_linger_minutes` | `15` | Nachlauf nach dem Ende eines eigenen Overrides, bevor `DOWN` wieder zählt |
 
 Die Einstellungen werden beim Laden des Plugins, nach `vault:ready_for_data` und bei
-`plugin:settings_changed` (Core ≥ 1.5.1) angewendet.
+`plugin:settings_changed` (Core ≥ 1.5.1) angewendet — auch die Outage- und Override-Werte,
+ohne Reload.
 
 ### Wartungsaktionen
 
@@ -303,3 +454,8 @@ docker exec -w /tmp/t-mon -e PYTHONPATH=/app:/tmp/pytest-sm lyndrix-core-dev pyt
 
 `tests/test_perf_and_status.py` deckt das Performance-Modell (Aggregate, SQL-Buckets, Batch-Prune,
 Single-Flight-Cache) und die Startsequenz (Statusmeldungen, Stop-Flag) gegen In-Memory-SQLite ab.
+Die Wartungsfenster testen `test_maintenance_windows.py` (Bus-Handler, Store, Cache, manuelle
+Fenster/Overrides), `test_store_heartbeat_maintenance.py` (Zustand `MAINTENANCE`, Aggregate,
+Outage-Uhr), `test_outage_rule.py` (Evaluator mit eingefrorener Uhr, Regelkaskade, Notschalter,
+Exactly-once, Recovery) und `test_inventory_ci_id.py` (`ci_id` im Inventar-Import und im
+Config-Hash). `tests/test_maintenance.py` behandelt die Plugin-Pflege (Settings-Buttons).

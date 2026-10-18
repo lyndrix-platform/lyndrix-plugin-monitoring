@@ -6,12 +6,25 @@ import { useState, useEffect, useCallback, useRef, useMemo, CSSProperties } from
 // by core and served via the catalog (namespace "monitoring").
 import { useTranslation } from 'react-i18next'
 import { ApiError, pluginApi } from './lib/api'
+import MaintenanceDialog, { HostOption, MaintenanceTarget } from './MaintenanceDialog'
+import OverridesPanel from './OverridesPanel'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type MonitorState = 'UP' | 'DOWN' | 'PAUSED' | 'UNKNOWN'
+// MAINTENANCE (1.7.0): a failed probe inside an active maintenance window or
+// override — derived server-side, replaces DOWN only.
+type MonitorState = 'UP' | 'DOWN' | 'PAUSED' | 'UNKNOWN' | 'MAINTENANCE'
 
-interface ServiceView {
+/** Maintenance/outage fields every serialised monitor carries (1.7.0). */
+interface MaintenanceInfo {
+  ci_id?: string | null
+  in_maintenance?: boolean
+  maintenance_until?: string | null
+  maintenance_source?: 'window' | 'override' | null
+  outage_since?: string | null
+}
+
+interface ServiceView extends MaintenanceInfo {
   monitor_id: string
   name: string | null
   display_name: string
@@ -35,6 +48,12 @@ interface Host {
   host_monitor: ServiceView | null
   services: ServiceView[]
   service_count: number
+  // Maintenance (1.7.0): dialog targets + roll-up.
+  monitor_ids?: string[]
+  ci_id?: string | null
+  ci_ids?: string[]
+  in_maintenance?: boolean
+  maintenance_until?: string | null
 }
 
 interface Group {
@@ -49,7 +68,7 @@ interface Group {
   service_count: number
 }
 
-interface Row {
+interface Row extends MaintenanceInfo {
   monitor_id: string
   name: string
   type: string
@@ -71,6 +90,7 @@ interface Stats {
   up_count: number
   down_count: number
   paused_count: number
+  maintenance_count?: number
   uptime_all: number
 }
 
@@ -142,6 +162,14 @@ const STATE_COLOR: Record<MonitorState, string> = {
   DOWN: 'var(--lx-state-down)',
   PAUSED: 'var(--lx-state-paused)',
   UNKNOWN: 'var(--lx-state-unknown)',
+  // Shell >= 1.8 defines --lx-state-maintenance; older shells fall back to paused.
+  MAINTENANCE: 'var(--lx-state-maintenance, var(--lx-state-paused))',
+}
+
+function fmtClock(iso: string | null | undefined): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
 function stateColor(state: string): string {
@@ -176,7 +204,7 @@ interface SizeCfg {
 
 const SIZE_CONFIG: Record<TimelineSize, SizeCfg> = {
   full: {
-    heights: { UP: 80, DOWN: 40, PAUSED: 44, UNKNOWN: 20 },
+    heights: { UP: 80, DOWN: 40, PAUSED: 44, UNKNOWN: 20, MAINTENANCE: 44 },
     container: 88,
     gap: '6px',
     radius: '0 0 3px 3px',
@@ -186,7 +214,7 @@ const SIZE_CONFIG: Record<TimelineSize, SizeCfg> = {
     scaleMargin: '3px',
   },
   host: {
-    heights: { UP: 46, DOWN: 23, PAUSED: 26, UNKNOWN: 12 },
+    heights: { UP: 46, DOWN: 23, PAUSED: 26, UNKNOWN: 12, MAINTENANCE: 26 },
     container: 52,
     gap: '4px',
     radius: '0 0 2px 2px',
@@ -196,7 +224,7 @@ const SIZE_CONFIG: Record<TimelineSize, SizeCfg> = {
     scaleMargin: '2px',
   },
   service: {
-    heights: { UP: 30, DOWN: 15, PAUSED: 16, UNKNOWN: 6 },
+    heights: { UP: 30, DOWN: 15, PAUSED: 16, UNKNOWN: 6, MAINTENANCE: 16 },
     container: 34,
     gap: '2px',
     radius: '0 0 1px 1px',
@@ -322,11 +350,14 @@ const STATE_LABEL: Record<MonitorState, string> = {
   DOWN: 'Offline',
   PAUSED: 'Paused',
   UNKNOWN: 'Unknown',
+  MAINTENANCE: 'Maintenance',
 }
 
-function StateBadge({ state, small }: { state: MonitorState; small?: boolean }) {
+/** State pill; a MAINTENANCE badge shows "until hh:mm" when the end is known. */
+function StateBadge({ state, small, until }: { state: MonitorState; small?: boolean; until?: string | null }) {
   const { t } = useTranslation('monitoring')
   const color = stateColor(state)
+  const suffix = state === 'MAINTENANCE' && until ? ` · ${t('state.until', { defaultValue: 'until {{time}}', time: fmtClock(until) })}` : ''
   return (
     <span
       style={{
@@ -348,7 +379,27 @@ function StateBadge({ state, small }: { state: MonitorState; small?: boolean }) 
     >
       <span style={{ width: small ? 5 : 6, height: small ? 5 : 6, borderRadius: '50%', background: color, flexShrink: 0 }} />
       {t(`state.${state.toLowerCase()}`, { defaultValue: STATE_LABEL[state] ?? state })}
+      {suffix && <span style={{ letterSpacing: 0, textTransform: 'none', opacity: 0.85 }}>{suffix}</span>}
     </span>
+  )
+}
+
+/** Small wrench button that opens the maintenance dialog for a host. */
+function MaintenanceButton({ onClick, small }: { onClick: () => void; small?: boolean }) {
+  const { t } = useTranslation('monitoring')
+  return (
+    <button
+      type="button"
+      className="lx-btn lx-btn--secondary lx-btn--sm"
+      onClick={(e) => {
+        e.stopPropagation()
+        onClick()
+      }}
+      title={t('host.maintenance_button', { defaultValue: 'Maintenance' })}
+      style={{ padding: small ? '2px 8px' : undefined, fontSize: small ? '0.68rem' : undefined, flexShrink: 0 }}
+    >
+      🛠 {t('host.maintenance_button', { defaultValue: 'Maintenance' })}
+    </button>
   )
 }
 
@@ -407,14 +458,14 @@ function ServicesInline({ host, prefs }: { host: Host; prefs: Prefs }) {
               {fmtPct(svc.uptime_24h)}%
             </span>
           )}
-          <StateBadge state={svc.state} small />
+          <StateBadge state={svc.state} small until={svc.maintenance_until} />
         </div>
       ))}
     </div>
   )
 }
 
-function HostHeader({ host, prefs }: { host: Host; prefs: Prefs }) {
+function HostHeader({ host, prefs, onMaintenance }: { host: Host; prefs: Prefs; onMaintenance?: (host: Host) => void }) {
   return (
     <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8, width: '100%' }}>
       <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 }}>
@@ -464,7 +515,10 @@ function HostHeader({ host, prefs }: { host: Host; prefs: Prefs }) {
           )}
         </div>
       </div>
-      <StateBadge state={host.state} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+        {onMaintenance && <MaintenanceButton small onClick={() => onMaintenance(host)} />}
+        <StateBadge state={host.state} until={host.maintenance_until} />
+      </div>
     </div>
   )
 }
@@ -516,7 +570,7 @@ function HostCard({ host, prefs }: { host: Host; prefs: Prefs }) {
   )
 }
 
-function HostCardDetail({ host, prefs }: { host: Host; prefs: Prefs }) {
+function HostCardDetail({ host, prefs, onMaintenance }: { host: Host; prefs: Prefs; onMaintenance?: (host: Host) => void }) {
   const { t } = useTranslation('monitoring')
   const color = stateColor(host.state)
   return (
@@ -527,7 +581,7 @@ function HostCardDetail({ host, prefs }: { host: Host; prefs: Prefs }) {
     >
       <div style={{ height: 4, width: '100%', background: color, boxShadow: `0 0 18px color-mix(in srgb, ${color} 40%, transparent)` }} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16, padding: 20, width: '100%' }}>
-        <HostHeader host={host} prefs={prefs} />
+        <HostHeader host={host} prefs={prefs} onMaintenance={onMaintenance} />
         <HostMeta host={host} prefs={prefs} />
         <div style={{ width: '100%' }}>
           <Timeline states={host.timeline} size="full" />
@@ -538,7 +592,7 @@ function HostCardDetail({ host, prefs }: { host: Host; prefs: Prefs }) {
             <span style={{ fontSize: '0.62rem', textTransform: 'uppercase', letterSpacing: '0.16em', color: 'var(--lx-text-muted)', fontWeight: 700 }}>
               {t('host.host_monitor', { defaultValue: 'Host monitor' })}
             </span>
-            <StateBadge state={host.host_monitor.state} small />
+            <StateBadge state={host.host_monitor.state} small until={host.host_monitor.maintenance_until} />
             {host.host_monitor.target && (
               <span style={{ fontSize: '0.72rem', fontFamily: 'var(--lx-font-mono)', color: 'var(--lx-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {host.host_monitor.target}
@@ -735,7 +789,7 @@ function TableView({ rows, prefs }: { rows: Row[]; prefs: Prefs }) {
               <td style={{ ...cellStyle, color: 'var(--lx-text-muted)' }}>{row.location}</td>
               <td style={{ ...cellStyle, fontFamily: 'var(--lx-font-mono)', color: 'var(--lx-text-muted)' }}>{row.host}</td>
               <td style={cellStyle}>
-                <StateBadge state={row.state} small />
+                <StateBadge state={row.state} small until={row.maintenance_until} />
               </td>
               {prefs.show_uptime_24h && (
                 <td style={{ ...cellStyle, textAlign: 'right', fontFamily: 'var(--lx-font-mono)' }}>{fmtPct(row.uptime_24h)}%</td>
@@ -768,7 +822,17 @@ function findHost(groups: Group[], hostKey: string | null): Host | null {
   return null
 }
 
-function SplitView({ rows, groups, prefs }: { rows: Row[]; groups: Group[]; prefs: Prefs }) {
+function SplitView({
+  rows,
+  groups,
+  prefs,
+  onMaintenance,
+}: {
+  rows: Row[]
+  groups: Group[]
+  prefs: Prefs
+  onMaintenance: (host: Host) => void
+}) {
   const { t } = useTranslation('monitoring')
   const [selected, setSelected] = useState<string | null>(null)
 
@@ -841,7 +905,7 @@ function SplitView({ rows, groups, prefs }: { rows: Row[]; groups: Group[]; pref
                     {row.host}
                   </td>
                   <td style={{ padding: rowCss.padding, borderTop: '1px solid var(--lx-border-soft)' }}>
-                    <StateBadge state={row.state} small />
+                    <StateBadge state={row.state} small until={row.maintenance_until} />
                   </td>
                   <td style={{ fontSize: rowCss.fontSize, fontFamily: 'var(--lx-font-mono)', color: 'var(--lx-text-muted)', padding: rowCss.padding, borderTop: '1px solid var(--lx-border-soft)', textAlign: 'right', whiteSpace: 'nowrap' }}>
                     {fmtPct(row.uptime_24h)}%
@@ -856,7 +920,7 @@ function SplitView({ rows, groups, prefs }: { rows: Row[]; groups: Group[]; pref
       {/* Right pane: detail card */}
       <div style={{ width: '100%' }}>
         {host ? (
-          <HostCardDetail host={host} prefs={prefs} />
+          <HostCardDetail host={host} prefs={prefs} onMaintenance={onMaintenance} />
         ) : (
           <EmptyCard
             title={t('split.select_title', { defaultValue: 'Select a row' })}
@@ -874,10 +938,12 @@ function Toolbar({
   prefs,
   setPref,
   onRefresh,
+  onMaintenance,
 }: {
   prefs: Prefs
   setPref: <K extends keyof Prefs>(key: K, value: Prefs[K]) => void
   onRefresh: () => void
+  onMaintenance: () => void
 }) {
   const { t } = useTranslation('monitoring')
   const [menuOpen, setMenuOpen] = useState(false)
@@ -983,6 +1049,11 @@ function Toolbar({
 
       <span style={{ flex: 1 }} />
 
+      {/* Maintenance for several hosts at once (host picker inside the dialog) */}
+      <button onClick={onMaintenance} title={t('toolbar.maintenance', { defaultValue: 'Maintenance…' })} style={{ ...selectStyle, padding: '8px 12px', fontWeight: 700 }}>
+        🛠 {t('toolbar.maintenance', { defaultValue: 'Maintenance…' })}
+      </button>
+
       {/* Visibility popover — rendered position:fixed from the button's rect so the
           toolbar card's overflow:hidden (rounded corners) cannot clip it. */}
       <div style={{ position: 'relative' }} ref={menuRef}>
@@ -1054,6 +1125,7 @@ function HeaderCard({ stats }: { stats: Stats | null }) {
     { key: 'monitor_count', label: t('hstat.monitors', { defaultValue: 'Monitors' }), color: 'var(--lx-accent)' },
     { key: 'up_count', label: t('hstat.up', { defaultValue: 'Up' }), color: STATE_COLOR.UP },
     { key: 'down_count', label: t('hstat.down', { defaultValue: 'Down' }), color: STATE_COLOR.DOWN },
+    { key: 'maintenance_count', label: t('hstat.maintenance', { defaultValue: 'Maintenance' }), color: STATE_COLOR.MAINTENANCE },
     { key: 'paused_count', label: t('hstat.paused', { defaultValue: 'Paused' }), color: STATE_COLOR.PAUSED },
     { key: 'uptime_all', label: t('hstat.uptime', { defaultValue: 'Uptime' }), color: 'var(--lx-accent-2)', pct: true },
   ]
@@ -1091,7 +1163,7 @@ function HeaderCard({ stats }: { stats: Stats | null }) {
                 {it.label}
               </span>
               <span style={{ fontSize: '1.9rem', fontWeight: 900, color: it.color, lineHeight: 1 }}>
-                {stats ? (it.pct ? `${fmtPct(stats[it.key])}%` : stats[it.key]) : '—'}
+                {stats ? (it.pct ? `${fmtPct(stats[it.key] ?? 0)}%` : stats[it.key] ?? 0) : '—'}
               </span>
             </div>
           ))}
@@ -1116,6 +1188,32 @@ export default function PluginApp() {
   // back-off window are skipped, so a struggling backend is not hammered.
   const failures = useRef(0)
   const nextAllowedAt = useRef(0)
+
+  // Maintenance dialog (1.7.0): opened for one host card or, from the toolbar,
+  // with a host picker. ``overridesKey`` re-fetches the overrides panel.
+  const [dialog, setDialog] = useState<{ open: boolean; target: MaintenanceTarget | null }>({ open: false, target: null })
+  const [overridesKey, setOverridesKey] = useState(0)
+  const openMaintenance = useCallback((host?: Host) => {
+    setDialog({
+      open: true,
+      target: host
+        ? { label: host.name, monitor_ids: host.monitor_ids ?? [], ci_ids: host.ci_ids ?? (host.ci_id ? [host.ci_id] : []) }
+        : null,
+    })
+  }, [])
+  const hostOptions = useMemo<HostOption[]>(
+    () =>
+      (data?.groups ?? [])
+        .flatMap((g) => g.hosts)
+        .map((h) => ({
+          key: h.name + (h.address ?? ''),
+          label: h.stage && h.stage !== 'General' ? `${h.name} (${h.stage})` : h.name,
+          monitor_ids: h.monitor_ids ?? [],
+          ci_ids: h.ci_ids ?? (h.ci_id ? [h.ci_id] : []),
+        }))
+        .sort((a, b) => a.label.localeCompare(b.label)),
+    [data],
+  )
 
   const setPref = useCallback(<K extends keyof Prefs>(key: K, value: Prefs[K]) => {
     persistPref(key, value)
@@ -1183,7 +1281,25 @@ export default function PluginApp() {
       {/* Centered control column */}
       <div style={{ maxWidth: 1280, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 16 }}>
         <HeaderCard stats={data?.stats ?? null} />
-        <Toolbar prefs={prefs} setPref={setPref} onRefresh={() => void fetchOverview(true)} />
+        <OverridesPanel
+          refreshKey={overridesKey}
+          onChanged={() => {
+            nextAllowedAt.current = 0
+            void fetchOverview(true)
+          }}
+        />
+        <Toolbar prefs={prefs} setPref={setPref} onRefresh={() => void fetchOverview(true)} onMaintenance={() => openMaintenance()} />
+        <MaintenanceDialog
+          open={dialog.open}
+          target={dialog.target}
+          hosts={hostOptions}
+          onClose={() => setDialog({ open: false, target: null })}
+          onDone={() => {
+            setOverridesKey((k) => k + 1)
+            nextAllowedAt.current = 0
+            void fetchOverview(true)
+          }}
+        />
         {error && (
           <div
             style={{
@@ -1228,7 +1344,7 @@ export default function PluginApp() {
           prefs.view_mode === 'table' ? (
             <TableView rows={data.rows} prefs={prefs} />
           ) : prefs.view_mode === 'split' ? (
-            <SplitView rows={data.rows} groups={data.groups} prefs={prefs} />
+            <SplitView rows={data.rows} groups={data.groups} prefs={prefs} onMaintenance={openMaintenance} />
           ) : (
             <CardsView groups={data.groups} prefs={prefs} />
           )

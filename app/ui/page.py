@@ -36,20 +36,21 @@ async def render_monitoring_page(ctx, svc):
                             "timelines and optional IaC inventory sync."
                         ).classes(UIStyles.TEXT_MUTED)
 
-                # Stats grid — 2 cols on mobile, 3 on sm, 5 on lg.
+                # Stats grid — 2 cols on mobile, 3 on sm, 6 on lg.
                 stat_labels: dict = {}
                 with ui.element("div").classes(
-                    "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 w-full gap-2 sm:gap-3"
+                    "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 w-full gap-2 sm:gap-3"
                 ):
                     # Colour mapping mirrors the React HeaderCard (src/ui/PluginApp.tsx)
                     # exactly, so both stacks converge on the same --lx-* tokens instead
                     # of drifting Tailwind literals.
                     for label, key, accent_cls in [
-                        ("Monitors", "monitor_count", "text-[var(--lx-accent)]"),
-                        ("Up",       "up_count",      "text-[var(--lx-state-up)]"),
-                        ("Down",     "down_count",    "text-[var(--lx-state-down)]"),
-                        ("Paused",   "paused_count",  "text-[var(--lx-state-paused)]"),
-                        ("Uptime",   "uptime_all",    "text-[var(--lx-accent-2)]"),
+                        ("Monitors",    "monitor_count",     "text-[var(--lx-accent)]"),
+                        ("Up",          "up_count",          "text-[var(--lx-state-up)]"),
+                        ("Down",        "down_count",        "text-[var(--lx-state-down)]"),
+                        ("Maintenance", "maintenance_count", "text-[var(--lx-state-maintenance,var(--lx-state-paused))]"),
+                        ("Paused",      "paused_count",      "text-[var(--lx-state-paused)]"),
+                        ("Uptime",      "uptime_all",        "text-[var(--lx-accent-2)]"),
                     ]:
                         with ui.card().classes(
                             UIStyles.CARD_BASE

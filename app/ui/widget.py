@@ -23,9 +23,14 @@ async def render_dashboard_widget(ctx, service: MonitoringService | None):
     up      = int(data.get("up_count", 0))
     down    = int(data.get("down_count", 0))
     paused  = int(data.get("paused_count", 0))
-    unknown = max(0, total - up - down - paused)
+    maint   = int(data.get("maintenance_count", 0))
+    unknown = max(0, total - up - down - paused - maint)
 
-    overall     = "DOWN" if down else ("UP" if up else ("PAUSED" if paused else "UNKNOWN"))
+    # Same precedence as aggregate_state(): DOWN > UNKNOWN > MAINTENANCE > UP > PAUSED.
+    overall = (
+        "DOWN" if down else "UNKNOWN" if unknown else "MAINTENANCE" if maint else "UP" if up
+        else "PAUSED" if paused else "UNKNOWN"
+    )
     pulse_color = state_color(overall)
 
     with ui.row().classes("w-full items-center justify-between"):
@@ -52,6 +57,12 @@ async def render_dashboard_widget(ctx, service: MonitoringService | None):
         with ui.column().classes("items-center gap-0"):
             ui.label(str(down)).classes("text-2xl font-black text-[var(--lx-state-down)]")
             ui.label("Down").classes(UIStyles.LABEL_MINI)
+        if maint:
+            with ui.column().classes("items-center gap-0"):
+                ui.label(str(maint)).classes(
+                    "text-2xl font-black text-[var(--lx-state-maintenance,var(--lx-state-paused))]"
+                )
+                ui.label("Maintenance").classes(UIStyles.LABEL_MINI)
         if paused:
             with ui.column().classes("items-center gap-0"):
                 ui.label(str(paused)).classes("text-2xl font-black text-[var(--lx-state-paused)]")

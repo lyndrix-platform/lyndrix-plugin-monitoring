@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 from contextlib import asynccontextmanager, nullcontext, suppress
-from datetime import timedelta
+from datetime import timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -12,14 +12,17 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from core.api import db_instance
 
 from ..model.models import (
+    UPTIME_EXCLUDED_STATES,
     AdminOverride,
     InventorySyncPayload,
+    MaintenanceWindowRecord,
     MonitorDailyAggregate,
     MonitorHeartbeat,
     MonitorRecord,
     MonitorState,
     MonitorType,
     MonitorUpsert,
+    OutageRecord,
     PassiveResult,
     _aggregate_uptime_percent,
     _day_start,
@@ -30,6 +33,7 @@ from ..model.models import (
     _utc_now,
 )
 from ..ui.styles import aggregate_state
+from .maintenance import CHANGE_REASON, MaintenanceManager, MaintenanceStore
 from .scheduler import SimpleAsyncScheduler
 from .provider.http import is_http_target, run_http_probe
 from .provider.icmp import run_icmp_probe
@@ -115,6 +119,10 @@ class MonitoringService:
         self._host_circuit_base = 30.0                    # circuit backoff base (seconds)
         self._host_circuit_max = 1800.0                   # circuit backoff cap (seconds)
 
+        # Maintenance windows / overrides / outage rule (1.7.0, core API >= 1.13):
+        # shared tables + a per-instance in-memory cache the heartbeat path reads.
+        self.maintenance = MaintenanceManager(self)
+
     def _session(self):
         if not db_instance.is_connected or not db_instance.SessionLocal:
             return None
@@ -196,8 +204,23 @@ class MonitoringService:
         self.scheduler.add_interval_job(
             self._housekeeping(self.refresh_uptime_windows), seconds=3600, id="monitoring:uptime_hourly", initial_delay=1800
         )
+        # Outage clock: every probing instance evaluates the open outages of the
+        # monitors it owns (lease: all; sharded: its shard) once a minute.
+        self.scheduler.add_interval_job(
+            self.evaluate_outages,
+            seconds=MaintenanceManager.OUTAGE_INTERVAL_SECONDS,
+            id=MaintenanceManager.OUTAGE_JOB_ID,
+            initial_delay=30,
+        )
         self.scheduler.start()
         self._scheduler_started = True
+
+    async def evaluate_outages(self) -> Dict[str, int]:
+        """Scheduler job (``monitoring:outages``): run the outage evaluator off the
+        loop; the events it emits are marshalled back by ``_emit``."""
+        if self._stopping or not self._probing:
+            return {}
+        return await asyncio.to_thread(self.maintenance.evaluate_outages)
 
     def housekeeping_here(self) -> bool:
         """Global housekeeping (prune, rollups, uptime windows) runs on one
@@ -442,8 +465,21 @@ class MonitoringService:
             return
         if payload.get("reason") == "probe_all":
             self.request_full_probe()
+        elif payload.get("reason") == CHANGE_REASON:
+            # A peer stored windows/overrides: re-read the maintenance cache (every
+            # instance — standbys answer the API from it), no probe-job resync.
+            self.request_maintenance_reload()
         else:
             self.request_resync()
+
+    def request_maintenance_reload(self) -> None:
+        """Reload the maintenance cache off the loop (any instance, any thread)."""
+        def _start() -> None:
+            task = asyncio.create_task(asyncio.to_thread(self.maintenance.reload), name="monitoring:maintenance_reload")
+            task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+
+        if not self._call_on_loop(_start):
+            self.maintenance.reload()  # no loop known (tests): synchronous
 
     def request_resync(self):
         """A peer changed the monitor set (cluster event): reload scheduler jobs
@@ -555,6 +591,9 @@ class MonitoringService:
         records = await asyncio.to_thread(self._snapshot_records_for_scheduler)
         self.sync_scheduler_jobs_from(records)
         self._view_cache.clear()
+        # The monitor → ci_id map changed with the inventory.
+        with suppress(Exception):
+            await asyncio.to_thread(self.maintenance.reload)
         await asyncio.sleep(0)
         self.enqueue_background_probe_refresh()
         self._notify_monitors_changed(reason, count=len(records or []))
@@ -642,6 +681,7 @@ class MonitoringService:
                 return
             self._store_heartbeat(session, record, state, latency_ms, error_message, "active_probe")
             session.commit()
+            self._flush_session_events(session)
         finally:
             session.close()
 
@@ -733,6 +773,12 @@ class MonitoringService:
             "ON monitoring_heartbeats (monitor_id, created_at)",
             "ALTER TABLE monitoring_daily_aggregates "
             "ADD COLUMN IF NOT EXISTS latency_samples INTEGER NOT NULL DEFAULT 0",
+            # 1.7.0 — maintenance windows: ci_id on monitors, maintenance samples.
+            "ALTER TABLE monitoring_monitors ADD COLUMN IF NOT EXISTS ci_id VARCHAR(36) NULL",
+            "ALTER TABLE monitoring_monitors ADD COLUMN IF NOT EXISTS host_ci_id VARCHAR(36) NULL",
+            "CREATE INDEX IF NOT EXISTS ix_monitoring_monitors_ci_id ON monitoring_monitors (ci_id)",
+            "ALTER TABLE monitoring_daily_aggregates "
+            "ADD COLUMN IF NOT EXISTS maintenance_samples INTEGER NOT NULL DEFAULT 0",
         ]
         for stmt in statements:
             try:
@@ -807,6 +853,7 @@ class MonitoringService:
                 keep.up_samples = sum(int(r.up_samples or 0) for r in rows)
                 keep.down_samples = sum(int(r.down_samples or 0) for r in rows)
                 keep.paused_samples = sum(int(r.paused_samples or 0) for r in rows)
+                keep.maintenance_samples = sum(int(r.maintenance_samples or 0) for r in rows)
                 keep.latency_samples = lat_n
                 if lat_n:
                     keep.avg_latency_ms = round(lat_sum / lat_n, 2)
@@ -834,6 +881,10 @@ class MonitoringService:
         await asyncio.sleep(0.1)
         with suppress(Exception):
             await asyncio.to_thread(self._ensure_tables_locked)
+        with suppress(Exception):
+            # Every instance (standbys serve the API from it): windows, overrides,
+            # monitor → ci map. Off the loop — a few small table scans.
+            await asyncio.to_thread(self.maintenance.reload)
         if not self._probing:
             # Standby instance: tables are there, routes serve reads; the prober
             # (lease holder) owns scheduler, sweeps and housekeeping.
@@ -897,7 +948,7 @@ class MonitoringService:
                 and self.owns(r.monitor_id)
                 and (
                     force
-                    or r.latest_state in {MonitorState.UNKNOWN.value, MonitorState.DOWN.value}
+                    or r.latest_state in {MonitorState.UNKNOWN.value, MonitorState.DOWN.value, MonitorState.MAINTENANCE.value}
                     or _is_stale(r)
                 )
             ]
@@ -1008,6 +1059,8 @@ class MonitoringService:
         if isinstance(raw_roles, (list, tuple, set)):
             raw_roles = ",".join(str(r) for r in raw_roles)
         self._probe_roles = {r.strip() for r in str(raw_roles).split(",") if r.strip()}
+        # Outage rule switches/defaults and override limits (maintenance.py).
+        self.maintenance.apply_settings(values)
 
     # ------------------------------------------------------------------
     # Inventory sync queue
@@ -1102,6 +1155,8 @@ class MonitoringService:
             aggregate.down_samples = (aggregate.down_samples or 0) + 1
         elif state == MonitorState.PAUSED:
             aggregate.paused_samples = (aggregate.paused_samples or 0) + 1
+        elif state == MonitorState.MAINTENANCE:
+            aggregate.maintenance_samples = (aggregate.maintenance_samples or 0) + 1
         if latency_ms is not None:
             n = aggregate.latency_samples or 0
             prev = float(aggregate.avg_latency_ms) if n > 0 and aggregate.avg_latency_ms is not None else 0.0
@@ -1128,11 +1183,13 @@ class MonitoringService:
         up = 1 if state == MonitorState.UP else 0
         down = 1 if state == MonitorState.DOWN else 0
         paused = 1 if state == MonitorState.PAUSED else 0
+        maintenance = 1 if state == MonitorState.MAINTENANCE else 0
         has_lat = 1 if latency_ms is not None else 0
         now = _utc_now()
         stmt = mysql_insert(MonitorDailyAggregate.__table__).values(
             monitor_id=monitor_id, day=day, total_samples=1, up_samples=up, down_samples=down,
-            paused_samples=paused, avg_latency_ms=(round(float(latency_ms), 2) if has_lat else None),
+            paused_samples=paused, maintenance_samples=maintenance,
+            avg_latency_ms=(round(float(latency_ms), 2) if has_lat else None),
             latency_samples=has_lat, updated_at=now,
         )
         t = MonitorDailyAggregate.__table__.c
@@ -1141,6 +1198,7 @@ class MonitoringService:
             ("up_samples", t.up_samples + up),
             ("down_samples", t.down_samples + down),
             ("paused_samples", t.paused_samples + paused),
+            ("maintenance_samples", t.maintenance_samples + maintenance),
         ]
         if has_lat:
             updates.append((
@@ -1173,6 +1231,7 @@ class MonitoringService:
         aggregate.up_samples = sum(1 for i in items if i.state == MonitorState.UP.value)
         aggregate.down_samples = sum(1 for i in items if i.state == MonitorState.DOWN.value)
         aggregate.paused_samples = sum(1 for i in items if i.state == MonitorState.PAUSED.value)
+        aggregate.maintenance_samples = sum(1 for i in items if i.state == MonitorState.MAINTENANCE.value)
         latencies = [i.latency_ms for i in items if i.latency_ms is not None]
         aggregate.avg_latency_ms = round(sum(latencies) / len(latencies), 2) if latencies else None
         aggregate.latency_samples = len(latencies)
@@ -1199,7 +1258,7 @@ class MonitoringService:
                 func.sum(case((MonitorHeartbeat.state == MonitorState.UP.value, 1), else_=0)),
             ).filter(
                 MonitorHeartbeat.created_at >= cutoff,
-                MonitorHeartbeat.state != MonitorState.PAUSED.value,
+                MonitorHeartbeat.state.notin_(UPTIME_EXCLUDED_STATES),
             ).group_by(MonitorHeartbeat.monitor_id).all()
             day = {
                 mid: (round((int(up or 0) / int(total)) * 100.0, 2) if total else 100.0)
@@ -1235,7 +1294,7 @@ class MonitoringService:
         (unlike stats(), which also computes uptime over MonitorHeartbeat)."""
         from sqlalchemy import func
         session = self._session()
-        result = {"monitor_count": 0, "up_count": 0, "down_count": 0, "paused_count": 0}
+        result = {"monitor_count": 0, "up_count": 0, "down_count": 0, "paused_count": 0, "maintenance_count": 0}
         if not session:
             return result
         try:
@@ -1244,37 +1303,41 @@ class MonitoringService:
                 .group_by(MonitorRecord.latest_state)
                 .all()
             )
-            for state, count in rows:
-                count = int(count or 0)
-                result["monitor_count"] += count
-                if state == MonitorState.UP.value:
-                    result["up_count"] = count
-                elif state == MonitorState.DOWN.value:
-                    result["down_count"] = count
-                elif state == MonitorState.PAUSED.value:
-                    result["paused_count"] = count
+            self._fill_state_counts(result, rows)
             return result
         finally:
             session.close()
 
+    _STATE_COUNT_KEYS = {
+        MonitorState.UP.value: "up_count",
+        MonitorState.DOWN.value: "down_count",
+        MonitorState.PAUSED.value: "paused_count",
+        MonitorState.MAINTENANCE.value: "maintenance_count",
+    }
+
+    @classmethod
+    def _fill_state_counts(cls, result: Dict[str, Any], rows) -> None:
+        for state, count in rows:
+            count = int(count or 0)
+            result["monitor_count"] += count
+            key = cls._STATE_COUNT_KEYS.get(state)
+            if key:
+                result[key] = count
+
     def stats(self) -> Dict[str, Any]:
         """Counts by state (one GROUP BY on the monitor table) plus the rolling
         ``UPTIME_ALL_DAYS`` uptime from daily aggregates. No heartbeat scan."""
+        empty = {
+            "monitor_count": 0, "up_count": 0, "down_count": 0, "paused_count": 0, "maintenance_count": 0,
+            "uptime_all": 100.0,
+        }
         session = self._session()
         if not session:
-            return {"monitor_count": 0, "up_count": 0, "down_count": 0, "paused_count": 0, "uptime_all": 100.0}
+            return empty
         try:
             rows = session.query(MonitorRecord.latest_state, func.count(MonitorRecord.monitor_id)).group_by(MonitorRecord.latest_state).all()
-            result = {"monitor_count": 0, "up_count": 0, "down_count": 0, "paused_count": 0, "uptime_all": 100.0}
-            for state, count in rows:
-                count = int(count or 0)
-                result["monitor_count"] += count
-                if state == MonitorState.UP.value:
-                    result["up_count"] = count
-                elif state == MonitorState.DOWN.value:
-                    result["down_count"] = count
-                elif state == MonitorState.PAUSED.value:
-                    result["paused_count"] = count
+            result = dict(empty)
+            self._fill_state_counts(result, rows)
             monitor_ids = [r[0] for r in session.query(MonitorRecord.monitor_id).all()]
             uptime_map = _uptime_from_aggregates(session, monitor_ids, days=self.UPTIME_ALL_DAYS)
             if uptime_map:
@@ -1290,10 +1353,13 @@ class MonitoringService:
         try:
             items = session.query(MonitorRecord).order_by(MonitorRecord.logical_group, MonitorRecord.name).all()
             uptime_map = _uptime_from_aggregates(session, [i.monitor_id for i in items], days=self.UPTIME_ALL_DAYS)
+            outages = {r.monitor_id: MaintenanceStore.outage_to_dict(r) for r in session.query(OutageRecord).all()}
+            now = _utc_now()
             serialized = []
             for item in items:
                 payload = _serialize_monitor(item)
                 payload["uptime_all"] = uptime_map.get(item.monitor_id, 100.0)
+                self.maintenance.decorate(payload, item, outages, now)
                 serialized.append(payload)
             return serialized
         finally:
@@ -1305,7 +1371,13 @@ class MonitoringService:
             return None
         try:
             item = self._get_monitor(session, monitor_id)
-            return _serialize_monitor(item) if item else None
+            if not item:
+                return None
+            payload = _serialize_monitor(item)
+            outage = session.get(OutageRecord, monitor_id)
+            outages = {monitor_id: MaintenanceStore.outage_to_dict(outage)} if outage else {}
+            self.maintenance.decorate(payload, item, outages, _utc_now())
+            return payload
         finally:
             session.close()
 
@@ -1464,6 +1536,8 @@ class MonitoringService:
             return
         self._view_cache.clear()  # a state change must show up on the next poll
         # Runs in to_thread workers (probe writes, passive results) → marshal.
+        # Emitted before the commit (cache/UI signal only) — the outage events
+        # in maintenance.py are the ones with transactional guarantees.
         self._emit(
             "monitoring:state_changed",
             {
@@ -1472,6 +1546,8 @@ class MonitoringService:
                 "new_state": record.latest_state,
                 "timestamp": _utc_now().isoformat(),
                 "error_message": error_message,
+                "ci_id": getattr(record, "ci_id", None),
+                "maintenance": record.latest_state == MonitorState.MAINTENANCE.value,
             },
         )
 
@@ -1485,9 +1561,25 @@ class MonitoringService:
         source: str,
         timestamp=None,
     ):
+        """Every heartbeat (active probe, passive result) goes through here.
+
+        A DOWN inside an active maintenance window/override is stored as
+        MAINTENANCE (a successful probe stays UP; ``latest_error`` is kept for
+        diagnosis). The outage clock (``monitoring_outages``) is updated in the
+        same transaction; recovery events are queued on the session and emitted
+        by the caller after ``commit()`` (``_flush_session_events``).
+        """
         current_time = timestamp or _utc_now()
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
         previous_state = record.latest_state
-        record.latest_state = state.value
+        effective = state
+        ms = None
+        if state == MonitorState.DOWN:
+            ms = self.maintenance.cache.state_for(record, current_time)
+            if ms.active:
+                effective = MonitorState.MAINTENANCE
+        record.latest_state = effective.value
         record.latest_latency_ms = latency_ms
         record.latest_error = error_message
         record.last_checked_at = current_time
@@ -1495,15 +1587,20 @@ class MonitoringService:
         session.add(
             MonitorHeartbeat(
                 monitor_id=record.monitor_id,
-                state=state.value,
+                state=effective.value,
                 latency_ms=latency_ms,
                 error_message=error_message,
                 source=source,
                 created_at=current_time,
             )
         )
-        self._bump_daily_aggregate(session, record, state, latency_ms)
+        self._bump_daily_aggregate(session, record, effective, latency_ms)
+        self.maintenance.track_outage(session, record, effective, current_time, ms, error_message)
         self._emit_transition(record, previous_state, error_message)
+
+    def _flush_session_events(self, session) -> int:
+        """Emit the outage events queued during ``_store_heartbeat`` — after commit."""
+        return MaintenanceManager.flush_session_events(session, self._emit)
 
     # ------------------------------------------------------------------
     # Scheduler sync
@@ -1666,6 +1763,8 @@ class MonitoringService:
                 record.source_hash = data.source_hash
                 record.config_hash = desired_hash
                 record.metadata_json = metadata_json
+                record.ci_id = data.ci_id
+                record.host_ci_id = data.host_ci_id
                 record.updated_at = _utc_now()
                 if not data.enabled:
                     record.latest_state = MonitorState.PAUSED.value
@@ -1686,6 +1785,8 @@ class MonitoringService:
                     source_hash=data.source_hash,
                     config_hash=desired_hash,
                     metadata_json=metadata_json,
+                    ci_id=data.ci_id,
+                    host_ci_id=data.host_ci_id,
                     latest_state=MonitorState.UNKNOWN.value if data.enabled else MonitorState.PAUSED.value,
                     created_at=_utc_now(),
                     updated_at=_utc_now(),
@@ -1693,6 +1794,7 @@ class MonitoringService:
                 session.add(record)
             session.commit()
             session.refresh(record)
+            self.maintenance.cache.note_monitor(record)  # host → ci map for service fallbacks
             if sync_scheduler:
                 self._sync_job_for_monitor(record)
                 self._notify_monitors_changed("upsert", count=1)
@@ -1715,6 +1817,8 @@ class MonitoringService:
                 record.enabled = False
                 record.latest_state = MonitorState.PAUSED.value
                 record.latest_error = None
+                # A paused monitor has no outage clock (nothing is probed).
+                MaintenanceStore.delete_outages_in(session, [record.monitor_id])
                 self._emit_transition(record, previous_state, None)
             elif request.action == "resume":
                 record.enabled = True
@@ -1751,6 +1855,7 @@ class MonitoringService:
                 payload.error_message, payload.source, self._parse_timestamp(payload.timestamp)
             )
             session.commit()
+            self._flush_session_events(session)
             session.refresh(record)
             return _serialize_monitor(record)
         finally:
@@ -1814,6 +1919,7 @@ class MonitoringService:
 
             def _rest() -> None:
                 session.query(MonitorDailyAggregate).delete(synchronize_session=False)
+                MaintenanceStore.delete_outages_in(session, None)  # clocks restart with the states
                 session.query(MonitorRecord).update(
                     {
                         MonitorRecord.latest_state: MonitorState.UNKNOWN.value,
@@ -1948,6 +2054,12 @@ class MonitoringService:
                 def _rest() -> int:
                     n = session.query(MonitorDailyAggregate).filter(
                         MonitorDailyAggregate.monitor_id.in_(chunk)
+                    ).delete(synchronize_session=False)
+                    MaintenanceStore.delete_outages_in(session, chunk)
+                    # Manual windows pinned to a deleted monitor go with it; CI-level
+                    # windows stay (the CI may come back under a new monitor).
+                    session.query(MaintenanceWindowRecord).filter(
+                        MaintenanceWindowRecord.monitor_id.in_(chunk)
                     ).delete(synchronize_session=False)
                     session.query(MonitorRecord).filter(MonitorRecord.monitor_id.in_(chunk)).delete(
                         synchronize_session=False
@@ -2153,6 +2265,10 @@ class MonitoringService:
     # ------------------------------------------------------------------
 
     def ingest_inventory_snapshot(self, payload: InventorySyncPayload) -> Dict[str, int]:
+        def _ci(value: Any) -> Optional[str]:
+            text_value = str(value).strip() if value is not None else ""
+            return text_value[:36] or None
+
         upserts = 0
         for host in payload.hosts:
             host_name = host.get("host_name") or host.get("hostname")
@@ -2170,6 +2286,8 @@ class MonitoringService:
                     host_name=host_name,
                     logical_group=host.get("site") or host.get("stage") or "iac",
                     source_hash=payload.source_revision,
+                    # Entity-Registry id attached by the orchestrator (>= 1.6.0); empty before.
+                    ci_id=_ci(host.get("ci_id")),
                     metadata={
                         "stage": host.get("stage"),
                         "groups": host.get("groups") or host.get("ansible_groups") or [],
@@ -2203,6 +2321,8 @@ class MonitoringService:
                     logical_group=svc.get("site") or svc.get("stage") or "iac",
                     source_hash=payload.source_revision,
                     enabled=bool(target),
+                    ci_id=_ci(svc.get("ci_id")),
+                    host_ci_id=_ci(svc.get("host_ci_id")),
                     metadata={
                         "site": svc.get("site"),
                         "stage": svc.get("stage"),
@@ -2253,6 +2373,10 @@ class MonitoringService:
                     ).delete(synchronize_session=False)
                     session_stale.query(MonitorDailyAggregate).filter(
                         MonitorDailyAggregate.monitor_id.in_(stale_ids)
+                    ).delete(synchronize_session=False)
+                    MaintenanceStore.delete_outages_in(session_stale, stale_ids)
+                    session_stale.query(MaintenanceWindowRecord).filter(
+                        MaintenanceWindowRecord.monitor_id.in_(stale_ids)
                     ).delete(synchronize_session=False)
                     session_stale.query(MonitorRecord).filter(
                         MonitorRecord.monitor_id.in_(stale_ids)

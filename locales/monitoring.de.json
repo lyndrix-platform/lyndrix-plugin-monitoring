@@ -20,6 +20,7 @@
     "online": "Online",
     "offline": "Offline",
     "paused": "Pausiert",
+    "maintenance": "Wartung",
     "uptime_avg": "Uptime ø"
   },
   "hstat": {
@@ -27,13 +28,16 @@
     "up": "Online",
     "down": "Offline",
     "paused": "Pausiert",
+    "maintenance": "Wartung",
     "uptime": "Uptime"
   },
   "state": {
     "up": "Online",
     "down": "Offline",
     "paused": "Pausiert",
-    "unknown": "Unbekannt"
+    "unknown": "Unbekannt",
+    "maintenance": "Wartung",
+    "until": "bis {{time}}"
   },
   "monitor": {
     "manual_override": "manuell",
@@ -61,7 +65,8 @@
     "toggle_services": "Dienste im Host",
     "toggle_paused": "Pausierte Monitore",
     "toggle_unknown": "Unbekannte Monitore",
-    "refresh": "Jetzt aktualisieren"
+    "refresh": "Jetzt aktualisieren",
+    "maintenance": "Wartung…"
   },
   "host": {
     "standalone": "Eigenständiger Host",
@@ -69,7 +74,8 @@
     "service_other": "{{count}} Dienste",
     "uptime_24h": "24h {{value}}%",
     "uptime_all": "gesamt {{value}}%",
-    "host_monitor": "Host-Monitor"
+    "host_monitor": "Host-Monitor",
+    "maintenance_button": "Wartung"
   },
   "group": {
     "offline_count_one": "{{count}} offline",
@@ -103,5 +109,49 @@
     "hours_ago": "vor {{value}} h",
     "days_ago_one": "vor {{count}} Tag",
     "days_ago_other": "vor {{count}} Tagen"
+  },
+  "maintenance": {
+    "title": "Wartung",
+    "target": "{{label}} · {{count}} Monitore",
+    "no_target": "Wähle die Hosts, die in Wartung gehen sollen.",
+    "pick_hosts": "Mindestens einen Host auswählen.",
+    "hosts": "Hosts",
+    "mode_override": "Jetzt (Override)",
+    "mode_window": "Wiederkehrendes / geplantes Fenster",
+    "duration": "Dauer",
+    "minutes": "{{count}} min",
+    "max_minutes": "max. {{count}} min",
+    "reason": "Grund",
+    "reason_placeholder": "z. B. Kernel-Update",
+    "kind_weekly": "Wöchentlich",
+    "kind_once": "Einmalig",
+    "days": "Tage",
+    "day_mon": "Mo",
+    "day_tue": "Di",
+    "day_wed": "Mi",
+    "day_thu": "Do",
+    "day_fri": "Fr",
+    "day_sat": "Sa",
+    "day_sun": "So",
+    "start": "Beginn",
+    "end": "Ende",
+    "timezone": "Zeitzone",
+    "over_midnight": "Ein Ende vor dem Beginn bedeutet „über Mitternacht“.",
+    "note": "Notiz",
+    "cancel": "Abbrechen",
+    "start_override": "Override starten",
+    "save_window": "Fenster speichern"
+  },
+  "overrides": {
+    "title": "Aktive Wartungs-Overrides",
+    "no_reason": "(kein Grund)",
+    "source": "von {{source}}",
+    "ci_count_one": "{{count}} CI",
+    "ci_count_other": "{{count}} CIs",
+    "monitor_count_one": "{{count}} Monitor",
+    "monitor_count_other": "{{count}} Monitore",
+    "until": "bis {{time}}",
+    "lingering_until": "endet, Nachlauf bis {{time}}",
+    "end": "Beenden"
   }
 }

@@ -102,4 +102,67 @@ export const pluginApi = {
       method: 'POST',
       body: body !== undefined ? JSON.stringify(body) : undefined,
     }),
+
+  del: <T>(subpath: string) =>
+    apiFetch<T>(`/api/plugins/${PLUGIN_ID_PREFIX}/${subpath}`, { method: 'DELETE' }),
+}
+
+// ─── Maintenance windows / overrides (1.7.0) ────────────────────────────────────
+
+export interface MaintenanceEffective {
+  active: boolean
+  until: string | null
+  source: 'window' | 'override' | null
+  next_start: string | null
+  note?: string | null
+  error?: string
+}
+
+export interface MaintenanceWindow {
+  id: number
+  ci_id: string | null
+  monitor_id: string | null
+  source: string
+  kind: string
+  name: string
+  windows: Record<string, unknown>[]
+  note: string | null
+  effective?: MaintenanceEffective
+}
+
+export interface MaintenanceOverride {
+  override_id: string
+  source: string
+  ci_ids: string[]
+  ci_names?: string[]
+  monitor_ids: string[]
+  until: string
+  started_at: string
+  ended_at: string | null
+  linger_minutes: number
+  reason: string
+  active: boolean
+  until_effective: string
+  own: boolean
+}
+
+export interface OverridesResponse {
+  items: MaintenanceOverride[]
+  defaults: { default_minutes: number; max_minutes: number; linger_minutes: number }
+}
+
+export const maintenanceApi = {
+  listOverrides: (activeOnly = true) => pluginApi.get<OverridesResponse>(`overrides?active=${activeOnly}`),
+  createOverride: (body: { ci_ids?: string[]; monitor_ids?: string[]; minutes?: number; reason?: string }) =>
+    pluginApi.post<MaintenanceOverride>('overrides', body),
+  endOverride: (id: string) => pluginApi.del<{ status: string }>(`overrides/${encodeURIComponent(id)}`),
+  listWindows: (params: { ci_id?: string; monitor_id?: string; source?: string } = {}) => {
+    const q = new URLSearchParams()
+    for (const [k, v] of Object.entries(params)) if (v) q.set(k, v)
+    const qs = q.toString()
+    return pluginApi.get<{ items: MaintenanceWindow[] }>(`windows${qs ? `?${qs}` : ''}`)
+  },
+  createWindow: (body: { ci_id?: string; monitor_id?: string; windows: Record<string, unknown>[]; note?: string }) =>
+    pluginApi.post<MaintenanceWindow>('windows', body),
+  deleteWindow: (id: number) => pluginApi.del<{ status: string }>(`windows/${id}`),
 }

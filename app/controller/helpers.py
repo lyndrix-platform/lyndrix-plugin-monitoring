@@ -184,6 +184,10 @@ def build_grouped_overview(
                 "states": [],
                 "uptimes": [],
                 "uptimes_all": [],
+                "monitor_ids": [],
+                "ci_ids": [],
+                "ci_id": None,
+                "maintenance_untils": [],
             },
         )
 
@@ -194,6 +198,11 @@ def build_grouped_overview(
         host_entry["uptimes"].append(float(monitor.get("uptime_24h") or 0.0))
         host_entry["uptimes_all"].append(float(monitor.get("uptime_all") or 0.0))
         host_entry["address"] = host_entry.get("address") or monitor.get("address")
+        host_entry["monitor_ids"].append(monitor["monitor_id"])
+        if monitor.get("ci_id") and monitor["ci_id"] not in host_entry["ci_ids"]:
+            host_entry["ci_ids"].append(monitor["ci_id"])
+        if monitor.get("in_maintenance") and monitor.get("maintenance_until"):
+            host_entry["maintenance_untils"].append(str(monitor["maintenance_until"]))
 
         monitor_view = {
             "monitor_id": monitor["monitor_id"],
@@ -206,10 +215,12 @@ def build_grouped_overview(
             "target": monitor.get("target") or monitor.get("address"),
             "type": monitor.get("monitor_type"),
             "latest_error": monitor.get("latest_error"),
+            **_maintenance_fields(monitor),
         }
 
         if monitor.get("monitor_type") == MonitorType.SERVER.value and monitor.get("host_name"):
             host_entry["host_monitor"] = monitor_view
+            host_entry["ci_id"] = monitor.get("ci_id")
         else:
             host_entry["services"].append(monitor_view)
 
@@ -232,6 +243,7 @@ def build_grouped_overview(
                 services = sorted(
                     host_entry["services"], key=lambda i: (i["state"], i["display_name"])
                 )
+                untils = host_entry.get("maintenance_untils") or []
                 host_list.append({
                     "name": host_entry["name"],
                     "address": host_entry.get("address"),
@@ -243,6 +255,12 @@ def build_grouped_overview(
                     "host_monitor": host_entry.get("host_monitor"),
                     "services": services,
                     "service_count": len(services),
+                    # Maintenance (1.7.0): targets for the dialog + roll-up badge.
+                    "monitor_ids": host_entry["monitor_ids"],
+                    "ci_id": host_entry.get("ci_id"),
+                    "ci_ids": host_entry["ci_ids"],
+                    "in_maintenance": bool(untils),
+                    "maintenance_until": max(untils) if untils else None,
                 })
                 host_states.append(agg_state)
                 host_timelines.append(agg_timeline)
@@ -305,6 +323,19 @@ def flatten_monitors(
             "timeline": timeline,
             "target": m.get("target") or m.get("address"),
             "latest_error": m.get("latest_error"),
+            **_maintenance_fields(m),
         })
     rows.sort(key=lambda r: (r["site"], r["host"], r["type"] != "server", r["name"]))
     return rows
+
+
+def _maintenance_fields(monitor: Dict[str, Any]) -> Dict[str, Any]:
+    """Whitelisted maintenance/outage fields a serialised monitor carries (set by
+    ``MaintenanceManager.decorate``); absent keys read as "not in maintenance"."""
+    return {
+        "ci_id": monitor.get("ci_id"),
+        "in_maintenance": bool(monitor.get("in_maintenance")),
+        "maintenance_until": monitor.get("maintenance_until"),
+        "maintenance_source": monitor.get("maintenance_source"),
+        "outage_since": monitor.get("outage_since"),
+    }

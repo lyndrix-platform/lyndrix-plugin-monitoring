@@ -46,13 +46,13 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="1.6.2",
+    version="1.7.0",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
     type="PLUGIN",
-    # settings_schema kind="action" (maintenance buttons) needs the 1.6 settings API.
-    min_core_version="1.6.0",
+    # core.api.maintenance (windows/overrides/outage contract) ships with core 1.11 (API 1.13).
+    min_core_version="1.11.0",
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-monitoring",
     i18n_namespace="monitoring",
@@ -84,6 +84,42 @@ manifest = ModuleManifest(
         {"key": "probe_nodes", "label": "Probe nodes", "kind": "int",
          "category": "Probing", "default": "1",
          "description": "Cluster only (core API >= 1.8): number of instances that share the probing (rendezvous sharding, each monitor has one owner). 1 = single prober via lease. Changing between 1 and >1 takes effect after a plugin reload; other changes apply at once."},
+        # Outage rule (1.7.0): a monitor DOWN for offline_minutes outside any
+        # maintenance window/override emits monitoring:outage_persisted (→ ITSM).
+        # Kinds are the Entity-Registry kinds and open — the known ones get a
+        # switch, every other kind is silenced via outage_rules_disabled_kinds.
+        {"key": "outage_rules_enabled", "label": "Outage rules enabled", "kind": "bool",
+         "category": "Incidents", "default": "true",
+         "description": "Master switch: emit monitoring:outage_persisted / outage_recovered for monitors that are down outside maintenance. Off = no outage events at all."},
+        {"key": "outage_rules_enabled_hypervisor", "label": "Outage rules: hypervisors", "kind": "bool",
+         "category": "Incidents", "default": "true", "description": "Report outages of CIs of kind 'hypervisor'."},
+        {"key": "outage_rules_enabled_host", "label": "Outage rules: hosts", "kind": "bool",
+         "category": "Incidents", "default": "true", "description": "Report outages of CIs of kind 'host' (VMs, LXCs)."},
+        {"key": "outage_rules_enabled_service", "label": "Outage rules: services", "kind": "bool",
+         "category": "Incidents", "default": "true", "description": "Report outages of CIs of kind 'service'."},
+        {"key": "outage_rules_enabled_container", "label": "Outage rules: containers", "kind": "bool",
+         "category": "Incidents", "default": "false", "description": "Report outages of CIs of kind 'container'."},
+        {"key": "outage_rules_disabled_kinds", "label": "Silent kinds", "kind": "str",
+         "category": "Incidents", "default": "",
+         "description": "Comma-separated Entity-Registry kinds WITHOUT a switch above that must not report outages, e.g. 'network,generic'. Unknown kinds not listed here are reported."},
+        {"key": "outage_default_offline_minutes", "label": "Default offline minutes", "kind": "int",
+         "category": "Incidents", "default": "10",
+         "description": "Minutes a monitor must be down outside maintenance before its outage is reported — when neither the CI nor its host published an incidents rule. 0 disables the default rule."},
+        {"key": "outage_default_severity", "label": "Default severity", "kind": "select",
+         "options": ["critical", "high", "medium", "low"], "category": "Incidents", "default": "high",
+         "description": "Severity carried in outage_persisted when no rule was published for the CI."},
+        {"key": "outage_default_auto_resolve", "label": "Default auto-resolve", "kind": "bool",
+         "category": "Incidents", "default": "true",
+         "description": "Whether a consumer (ITSM) may resolve the incident automatically on outage_recovered — default rule only."},
+        {"key": "override_default_minutes", "label": "Manual override: default minutes", "kind": "int",
+         "category": "Maintenance windows", "default": "60",
+         "description": "Duration preselected in the maintenance dialog for a manual override."},
+        {"key": "override_max_minutes", "label": "Manual override: maximum minutes", "kind": "int",
+         "category": "Maintenance windows", "default": "240",
+         "description": "Upper bound of a manual override (longer requests are capped)."},
+        {"key": "override_linger_minutes", "label": "Override linger minutes", "kind": "int",
+         "category": "Maintenance windows", "default": "15",
+         "description": "After an override ends, probes settle for this many minutes before DOWN counts again (manual overrides emitted by this plugin)."},
         # Maintenance jobs (core API >= 1.6, kind="action"): buttons in the same
         # dialog that call the write-gated /maintenance/* routes in app/controller/api.py.
         {"key": "action_prune", "label": "Prune old heartbeats now", "kind": "action",
@@ -123,8 +159,24 @@ manifest = ModuleManifest(
             "plugin:settings_changed",
             # Core >= 1.6 (API 1.8): membership changed → recompute the probe shard.
             "cluster:changed",
+            # Core >= 1.11 (API 1.13): maintenance windows/overrides from the
+            # orchestrator (and later ITSM); emitted locally, persisted here.
+            "maintenance:windows_published",
+            "maintenance:override_started",
+            "maintenance:override_ended",
         ],
-        "emit": ["monitoring:state_changed", "monitoring:monitors_changed", "monitoring:quiesce"],
+        "emit": [
+            "monitoring:state_changed",
+            "monitoring:monitors_changed",
+            "monitoring:quiesce",
+            # Manual windows/overrides from this UI (source "monitoring") …
+            "maintenance:windows_published",
+            "maintenance:override_started",
+            "maintenance:override_ended",
+            # … and the outage rule (once per outage, after offline_minutes outside maintenance).
+            "monitoring:outage_persisted",
+            "monitoring:outage_recovered",
+        ],
     },
     # Identity 2.0: roles auto-mapped onto groups. Permissions are written
     # FULLY QUALIFIED (plugin:<id>:api:read / :api:write) rather than the bare
@@ -275,6 +327,7 @@ async def health(ctx) -> PluginHealthStatus:
         "monitors_configured": counts.get("monitor_count", 0),
         "monitors_up": counts.get("up_count", 0),
         "monitors_down": counts.get("down_count", 0),
+        "monitors_maintenance": counts.get("maintenance_count", 0),
     }
     # Loop alive + DB reachable, but nothing is being watched yet.
     if not counts.get("monitor_count"):
@@ -365,6 +418,31 @@ def setup(ctx):
             await asyncio.to_thread(service.apply_admin_override, AdminOverride(**payload))
         except Exception as exc:
             ctx.log.error(f"State Monitoring: admin override failed: {exc}")
+
+    # Maintenance windows (core API >= 1.13). Emitted LOCALLY by the publisher, so
+    # exactly one instance stores them; our own source ("monitoring") is skipped
+    # inside the handlers. DB work runs off the loop; the manager then reloads
+    # the local cache and tells the peers via monitoring:monitors_changed.
+    @ctx.subscribe("maintenance:windows_published")
+    async def on_windows_published(payload):
+        try:
+            await asyncio.to_thread(service.maintenance.on_windows_published, payload or {})
+        except Exception as exc:
+            ctx.log.error(f"State Monitoring: windows_published failed: {exc}")
+
+    @ctx.subscribe("maintenance:override_started")
+    async def on_override_started(payload):
+        try:
+            await asyncio.to_thread(service.maintenance.on_override_started, payload or {})
+        except Exception as exc:
+            ctx.log.error(f"State Monitoring: override_started failed: {exc}")
+
+    @ctx.subscribe("maintenance:override_ended")
+    async def on_override_ended(payload):
+        try:
+            await asyncio.to_thread(service.maintenance.on_override_ended, payload or {})
+        except Exception as exc:
+            ctx.log.error(f"State Monitoring: override_ended failed: {exc}")
 
     @ui.page("/monitoring")
     @main_layout("State Monitoring", wide=True)

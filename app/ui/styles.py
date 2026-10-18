@@ -10,6 +10,8 @@ _STATE_ACCENT_VAR = {
     MonitorState.DOWN.value:    "var(--lx-state-down)",
     MonitorState.PAUSED.value:  "var(--lx-state-paused)",
     MonitorState.UNKNOWN.value: "var(--lx-state-unknown)",
+    # Core >= 1.11 defines --lx-state-maintenance; older servers fall back to paused.
+    MonitorState.MAINTENANCE.value: "var(--lx-state-maintenance, var(--lx-state-paused))",
 }
 
 # Maps MonitorState values to the shared `.lx-badge--{state}` modifier suffix
@@ -23,6 +25,7 @@ _STATE_CLASS_SUFFIX = {
     MonitorState.DOWN.value: "down",
     MonitorState.PAUSED.value: "paused",
     MonitorState.UNKNOWN.value: "unknown",
+    MonitorState.MAINTENANCE.value: "maintenance",
 }
 _DEFAULT_SUFFIX = _STATE_CLASS_SUFFIX[MonitorState.UNKNOWN.value]
 
@@ -75,16 +78,21 @@ def state_strip_style(state: str) -> str:
     return f"height:4px;width:100%;background:{color};box-shadow:0 0 18px {glow}"
 
 
+# Group/host roll-up precedence: DOWN > UNKNOWN > MAINTENANCE > UP > PAUSED.
+_AGGREGATE_ORDER = (
+    MonitorState.DOWN.value,
+    MonitorState.UNKNOWN.value,
+    MonitorState.MAINTENANCE.value,
+    MonitorState.UP.value,
+    MonitorState.PAUSED.value,
+)
+
+
 def aggregate_state(states: List[str]) -> str:
     filtered = [s for s in states if s]
     if not filtered:
         return MonitorState.UNKNOWN.value
-    if MonitorState.DOWN.value in filtered:
-        return MonitorState.DOWN.value
-    if MonitorState.UNKNOWN.value in filtered:
-        return MonitorState.UNKNOWN.value
-    if MonitorState.UP.value in filtered:
-        return MonitorState.UP.value
-    if MonitorState.PAUSED.value in filtered:
-        return MonitorState.PAUSED.value
+    for state in _AGGREGATE_ORDER:
+        if state in filtered:
+            return state
     return MonitorState.UNKNOWN.value
