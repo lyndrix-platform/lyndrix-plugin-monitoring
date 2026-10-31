@@ -38,7 +38,7 @@ def test_manifest_fields():
     assert m.version == "1.7.0"
     assert m.repo_url == "https://github.com/lyndrix-platform/lyndrix-plugin-monitoring"
     assert m.id == "lyndrix.plugin.state_monitoring"
-    assert m.min_core_version == "1.11.0"
+    assert m.min_core_version == "1.13.0"
 
 
 def test_manifest_declares_maintenance_topics():

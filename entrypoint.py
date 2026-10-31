@@ -52,7 +52,7 @@ manifest = ModuleManifest(
     icon="monitor_heart",
     type="PLUGIN",
     # core.api.maintenance (windows/overrides/outage contract) ships with core 1.11 (API 1.13).
-    min_core_version="1.11.0",
+    min_core_version="1.13.0",   # core.api.maintenance (core API 1.13 = core 1.11.0)
     auto_enable_on_install=False,
     repo_url="https://github.com/lyndrix-platform/lyndrix-plugin-monitoring",
     i18n_namespace="monitoring",
