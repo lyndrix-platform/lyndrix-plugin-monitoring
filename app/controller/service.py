@@ -29,6 +29,9 @@ from ..model.models import (
     _hourly_state_counts,
     _safe_json_load,
     _serialize_monitor,
+    safe_error_text,
+    sanitize_metadata,
+    sanitized_metadata_json,
     _uptime_from_aggregates,
     _utc_now,
 )
@@ -623,7 +626,7 @@ class MonitoringService:
                 "host_name": record.host_name,
                 "latest_state": record.latest_state,
                 "timeout_seconds": record.timeout_seconds,
-                "metadata": _safe_json_load(record.metadata_json),
+                "metadata": sanitize_metadata(_safe_json_load(record.metadata_json)),
             }
         finally:
             session.close()
@@ -751,6 +754,70 @@ class MonitoringService:
             Base.metadata.create_all(bind=db_instance.engine, checkfirst=True)
             self._ensure_schema(db_instance.engine)
             self._ensure_daily_aggregate_unique(db_instance.engine)
+            try:
+                scrubbed = self.scrub_monitor_metadata()
+            except Exception as exc:
+                # Reads stay filtered (``_serialize_monitor``); the next bootstrap retries.
+                self.ctx.log.warning(f"State Monitoring: metadata scrub failed: {type(exc).__name__}")
+            else:
+                if scrubbed:
+                    self.ctx.log.warning(
+                        f"State Monitoring: removed non-allowlisted metadata from {scrubbed} monitor row(s). "
+                        "Rotate any credential an inventory publish may have stored there."
+                    )
+
+    METADATA_SCRUB_CHUNK = 200
+
+    def scrub_monitor_metadata(self) -> int:
+        """Idempotent data migration (MO-01): rewrite every ``metadata_json`` to
+        its allowlisted subset. Rows written before the allowlist hold whole
+        ``terraform`` / ``config`` blocks with credentials.
+
+        Runs at bootstrap under the cross-instance lock (``_ensure_tables_locked``).
+        Keyset pagination in chunks of ``METADATA_SCRUB_CHUNK`` with one short
+        committed transaction per chunk keeps every statement far below the
+        statement cap; each chunk retries on 1020/1205/1213 because probe writers
+        touch the same rows. A clean table costs one narrow scan and no write.
+        Values are never logged. Returns the number of rewritten rows."""
+        session = self._rc_session()
+        if not session:
+            return 0
+        rewritten = 0
+        try:
+            last_id = ""
+            while True:
+                rows = (
+                    session.query(MonitorRecord.monitor_id, MonitorRecord.metadata_json)
+                    .filter(MonitorRecord.monitor_id > last_id)
+                    .order_by(MonitorRecord.monitor_id)
+                    .limit(self.METADATA_SCRUB_CHUNK)
+                    .all()
+                )
+                session.commit()  # end the read transaction before the writes
+                if not rows:
+                    return rewritten
+                last_id = rows[-1][0]
+                dirty = {}
+                for monitor_id, raw in rows:
+                    clean = sanitized_metadata_json(raw)
+                    if clean != (raw or ""):
+                        dirty[monitor_id] = clean
+                if not dirty:
+                    continue
+
+                def _write(dirty=dirty) -> None:
+                    for monitor_id, clean in dirty.items():
+                        # Core UPDATE of the one column: no ORM state, no
+                        # version of the probe-written columns is overwritten.
+                        session.query(MonitorRecord).filter(
+                            MonitorRecord.monitor_id == monitor_id
+                        ).update({MonitorRecord.metadata_json: clean}, synchronize_session=False)
+                    session.commit()
+
+                self._retrying(session, _write)
+                rewritten += len(dirty)
+        finally:
+            session.close()
 
     def _ensure_tables_locked(self):
         """``ensure_tables`` under the core's cross-instance bootstrap lock (core
@@ -1739,8 +1806,12 @@ class MonitoringService:
             # No DDL here: bootstrap creates the tables under the cluster lock.
             record = self._get_monitor(session, data.monitor_id)
             payload = data.model_dump(exclude={"force"}, mode="json")
+            # Only the allowlisted subset is stored (and hashed): whatever else a
+            # caller sends in ``metadata`` never reaches the table (MO-01).
+            metadata = sanitize_metadata(data.metadata)
+            payload["metadata"] = metadata
             desired_hash = data.source_hash or self._canonical_hash(payload)
-            metadata_json = json.dumps(data.metadata, sort_keys=True)
+            metadata_json = json.dumps(metadata, sort_keys=True)
 
             if record:
                 if record.owner_source != data.owner_source and not data.force:
@@ -1748,6 +1819,13 @@ class MonitoringService:
                 if record.is_admin_overridden and record.owner_source == data.owner_source:
                     record.is_admin_overridden = False
                 if record.config_hash == desired_hash and record.owner_source == data.owner_source:
+                    stored_clean = sanitized_metadata_json(record.metadata_json)
+                    if record.metadata_json != stored_clean:
+                        # Unchanged config, but the row was written before the
+                        # allowlist existed (or by an older peer during a rolling
+                        # upgrade): scrub it now, not only at the next bootstrap.
+                        record.metadata_json = stored_clean
+                        session.commit()
                     return _serialize_monitor(record)
                 record.name = data.name
                 record.monitor_type = data.monitor_type.value
@@ -1833,7 +1911,7 @@ class MonitoringService:
                 if isinstance(metadata_patch, dict):
                     merged = _safe_json_load(record.metadata_json)
                     merged.update(metadata_patch)
-                    record.metadata_json = json.dumps(merged, sort_keys=True)
+                    record.metadata_json = json.dumps(sanitize_metadata(merged), sort_keys=True)
             session.commit()
             session.refresh(record)
             self._sync_job_for_monitor(record)
@@ -2288,18 +2366,22 @@ class MonitoringService:
                     source_hash=payload.source_revision,
                     # Entity-Registry id attached by the orchestrator (>= 1.6.0); empty before.
                     ci_id=_ci(host.get("ci_id")),
-                    metadata={
+                    # The publisher may send whole ``terraform`` blocks (provider
+                    # passwords/tokens): reduced to the allowlist right here so the
+                    # secret never enters a model, a hash, a log line or the table.
+                    metadata=sanitize_metadata({
+                        "site": host.get("site"),
                         "stage": host.get("stage"),
                         "groups": host.get("groups") or host.get("ansible_groups") or [],
                         "baseline_roles": host.get("baseline_roles") or [],
                         "profiles": host.get("profiles") or [],
                         "terraform": host.get("terraform") or {},
-                    },
+                    }),
                 ), sync_scheduler=False)
                 upserts += 1
             except Exception as exc:
                 if self.ctx:
-                    self.ctx.log.warning(f"Inventory sync: skipping host {host_name!r}: {exc}")
+                    self.ctx.log.warning(f"Inventory sync: skipping host {host_name!r}: {safe_error_text(exc)}")
 
         for svc in payload.services:
             host_name = svc.get("host_name") or svc.get("hostname")
@@ -2323,21 +2405,23 @@ class MonitoringService:
                     enabled=bool(target),
                     ci_id=_ci(svc.get("ci_id")),
                     host_ci_id=_ci(svc.get("host_ci_id")),
-                    metadata={
+                    # The service ``config`` block (env + secrets) and ``git_repo``
+                    # (URL may embed a token) are not taken over — nothing reads them.
+                    metadata=sanitize_metadata({
                         "site": svc.get("site"),
                         "stage": svc.get("stage"),
                         "groups": svc.get("groups") or svc.get("ansible_groups") or [],
                         "deploy_type": svc.get("deploy_type"),
                         "desired_state": svc.get("desired_state") or svc.get("state"),
-                        "git_repo": svc.get("git_repo"),
                         "git_version": svc.get("git_version"),
-                        "config": svc.get("config") or {},
-                    },
+                    }),
                 ), sync_scheduler=False)
                 upserts += 1
             except Exception as exc:
                 if self.ctx:
-                    self.ctx.log.warning(f"Inventory sync: skipping service {host_name!r}:{service_name!r}: {exc}")
+                    self.ctx.log.warning(
+                        f"Inventory sync: skipping service {host_name!r}:{service_name!r}: {safe_error_text(exc)}"
+                    )
 
         # Delete monitors that were previously owned by this source but are no
         # longer present in the current payload (host/service removed upstream).

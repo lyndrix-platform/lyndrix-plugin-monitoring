@@ -15,7 +15,7 @@ from nicegui import ui
 from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.controller.api import build_plugin_router
-from .app.model.models import AdminOverride, MonitorUpsert, PassiveResult
+from .app.model.models import AdminOverride, MonitorUpsert, PassiveResult, safe_error_text
 from .app.controller.service import MonitoringService
 from .app.ui.overview import render_overview_ui as _render_overview_ui
 from .app.ui.settings import render_settings_ui as _render_settings_ui
@@ -403,21 +403,21 @@ def setup(ctx):
         try:
             await asyncio.to_thread(service.upsert_monitor, MonitorUpsert(**payload))
         except Exception as exc:
-            ctx.log.error(f"State Monitoring: config upsert failed: {exc}")
+            ctx.log.error(f"State Monitoring: config upsert failed: {safe_error_text(exc)}")
 
     @ctx.subscribe("monitoring:passive_result")
     async def on_passive_result(payload):
         try:
             await asyncio.to_thread(service.ingest_passive_result, PassiveResult(**payload))
         except Exception as exc:
-            ctx.log.error(f"State Monitoring: passive result failed: {exc}")
+            ctx.log.error(f"State Monitoring: passive result failed: {safe_error_text(exc)}")
 
     @ctx.subscribe("monitoring:admin_override")
     async def on_admin_override(payload):
         try:
             await asyncio.to_thread(service.apply_admin_override, AdminOverride(**payload))
         except Exception as exc:
-            ctx.log.error(f"State Monitoring: admin override failed: {exc}")
+            ctx.log.error(f"State Monitoring: admin override failed: {safe_error_text(exc)}")
 
     # Maintenance windows (core API >= 1.13). Emitted LOCALLY by the publisher, so
     # exactly one instance stores them; our own source ("monitoring") is skipped
