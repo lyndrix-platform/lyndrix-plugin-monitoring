@@ -344,6 +344,15 @@ async def health(ctx) -> PluginHealthStatus:
             details={**details, "reason": "no_monitors_configured"},
             latency_ms=latency,
         )
+    if getattr(svc, "icmp_unavailable", False):
+        # The prober cannot ping: host monitors run on the TCP fallback, ping
+        # monitors read UNKNOWN. Working, but with reduced function.
+        return PluginHealthStatus(
+            status="degraded",
+            details={**details, "reason": "icmp_unavailable",
+                     "hint": "allow unprivileged ICMP on this instance or set probe_roles"},
+            latency_ms=latency,
+        )
     return PluginHealthStatus(status="ok", details=details, latency_ms=latency)
 
 

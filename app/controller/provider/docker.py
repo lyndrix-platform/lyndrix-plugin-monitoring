@@ -1,8 +1,13 @@
-import httpx
+import asyncio
+import json
+import time
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from ...model.models import MonitorState
-from ._ssrf import ProbeTargetError, assert_host_allowed
+from ._ssrf import ProbeTargetError
+from .http import PROBE_DEADLINE_GRACE_SECONDS, pinned_stream, read_capped
 
 
 def is_docker_host(metadata: Dict[str, Any]) -> bool:
@@ -70,25 +75,60 @@ def docker_container_score(container: Dict[str, Any], service_name: str) -> int:
     return best
 
 
+#: The container list of a busy Docker host is a few hundred kB; anything far
+#: beyond that is not a Docker API answer.
+MAX_DOCKER_BODY_BYTES = 8 * 1024 * 1024
+
+
 async def run_docker_service_probe(
     client: httpx.AsyncClient, host: str, service_name: str, timeout_seconds: int
 ) -> Dict[str, Any]:
-    # SSRF guard: the Docker API (plaintext :2375) requires a trusted endpoint;
-    # reject link-local/metadata hosts before forging the request.
+    """Container state from the host's Docker API (plaintext :2375).
+
+    Same guarantees as the HTTP probe: SSRF guard with the name resolved off
+    the loop and the request pinned to the validated address, one deadline for
+    the whole probe including the body, and a cap on the body size."""
+    timeout = max(1.0, float(timeout_seconds))
     try:
-        assert_host_allowed(host)
+        return await asyncio.wait_for(
+            _docker_service_state(client, host, service_name, timeout),
+            timeout=timeout + PROBE_DEADLINE_GRACE_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "state": MonitorState.DOWN, "latency_ms": None,
+            "error_message": f"Docker API probe deadline exceeded ({timeout:g} s)",
+        }
     except ProbeTargetError as exc:
         return {"state": MonitorState.DOWN, "latency_ms": None, "error_message": str(exc)}
+
+
+async def _docker_service_state(
+    client: httpx.AsyncClient, host: str, service_name: str, timeout: float
+) -> Dict[str, Any]:
     endpoint = f"http://{host}:2375/containers/json"
-    response = await client.get(endpoint, params={"all": 1}, timeout=httpx.Timeout(timeout_seconds))
-    latency_ms = round(response.elapsed.total_seconds() * 1000.0, 2)
-    if response.status_code >= 400:
+    started = time.perf_counter()
+    async with pinned_stream(client, endpoint, timeout, params={"all": 1}) as response:
+        status_code = response.status_code
+        body = await read_capped(response, MAX_DOCKER_BODY_BYTES) if status_code < 400 else b""
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+    if status_code >= 400:
         return {
             "state": MonitorState.DOWN,
             "latency_ms": latency_ms,
-            "error_message": f"Docker API HTTP {response.status_code}",
+            "error_message": f"Docker API HTTP {status_code}",
         }
-    containers = response.json()
+    try:
+        containers = json.loads(body)
+    except ValueError:
+        containers = None
+    if not isinstance(containers, list):
+        return {
+            "state": MonitorState.UNKNOWN,
+            "latency_ms": latency_ms,
+            "error_message": "Unexpected Docker API response",
+        }
+    containers = [c for c in containers if isinstance(c, dict)]
     matched = None
     matched_score = 0
     for container in containers:

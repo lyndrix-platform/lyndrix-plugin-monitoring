@@ -40,7 +40,8 @@ from .maintenance import CHANGE_REASON, MaintenanceManager, MaintenanceStore
 from .scheduler import SimpleAsyncScheduler
 from .provider.http import is_http_target, run_http_probe
 from .provider.icmp import run_icmp_probe
-from .provider.tcp import looks_like_network_target, run_tcp_probe, tcp_fallback_ports
+from .provider.tcp import looks_like_network_target, run_tcp_probe, split_host_port, tcp_fallback_ports
+from .provider._executor import shutdown_probe_executors
 from .provider.docker import run_docker_service_probe
 
 
@@ -124,6 +125,9 @@ class MonitoringService:
         self._host_circuit_threshold = 8                  # consecutive host fails before the host is paused
         self._host_circuit_base = 30.0                    # circuit backoff base (seconds)
         self._host_circuit_max = 1800.0                   # circuit backoff cap (seconds)
+        # Monotonic time since which ICMP is not permitted on this instance
+        # (None = usable). Reported by health() so the operator sets probe_roles.
+        self._icmp_unavailable_since: Optional[float] = None
 
         # Maintenance windows / overrides / outage rule (1.7.0, core API >= 1.13):
         # shared tables + a per-instance in-memory cache the heartbeat path reads.
@@ -644,17 +648,36 @@ class MonitoringService:
         metadata = rd["metadata"]
 
         if monitor_type in {MonitorType.PING.value, MonitorType.SERVER.value}:
-            result = await run_icmp_probe(target, timeout_seconds)
-            state = result["state"]
-            latency_ms = result["latency_ms"]
+            # ``host:port`` targets name the TCP port to fall back to; ICMP goes
+            # to the host part.
+            icmp_host, explicit_port = split_host_port(target)
+            result = await run_icmp_probe(icmp_host, timeout_seconds)
+            unavailable = self._note_icmp_result(result)
+            if result["state"] == MonitorState.UP:
+                return result["state"], result["latency_ms"], None
             error_message = result["error_message"]
-            if state != MonitorState.UP and monitor_type == MonitorType.SERVER.value and looks_like_network_target(target):
-                fallback_host = address or target.split(":", 1)[0]
-                for port in tcp_fallback_ports(metadata, target):
-                    tcp_result = await run_tcp_probe(fallback_host, port, timeout_seconds)
-                    if tcp_result["state"] == MonitorState.UP:
-                        return tcp_result["state"], tcp_result["latency_ms"], None
-            return state, latency_ms, error_message
+            if monitor_type == MonitorType.SERVER.value and looks_like_network_target(target):
+                fallback_host = address or icmp_host
+                # All fallback ports at once: the probe stays within one extra
+                # timeout instead of one per port.
+                tcp_results = await asyncio.gather(*(
+                    run_tcp_probe(fallback_host, port, timeout_seconds)
+                    for port in tcp_fallback_ports(metadata, target)
+                ))
+                reachable = [r for r in tcp_results if r["state"] == MonitorState.UP]
+                if reachable:
+                    best = min(reachable, key=lambda r: r["latency_ms"] if r["latency_ms"] is not None else 0.0)
+                    return MonitorState.UP, best["latency_ms"], None
+                if unavailable and explicit_port is None and any(r.get("refused") for r in tcp_results):
+                    # No ICMP here and no listener on the usual ports, but the
+                    # host actively refused a connection: it is alive.
+                    return MonitorState.UP, None, None
+                if unavailable:
+                    error_message = f"{error_message}; TCP fallback found no open port"
+            if unavailable:
+                # "Cannot probe from here" is never DOWN: no outage, no incident.
+                return MonitorState.UNKNOWN, None, error_message
+            return result["state"], result["latency_ms"], error_message
 
         if metadata.get("deploy_type") == "docker_compose" and address and service_name:
             result = await run_docker_service_probe(self.http_client, address, service_name, timeout_seconds)
@@ -665,10 +688,42 @@ class MonitoringService:
             return result["state"], result["latency_ms"], result["error_message"]
 
         if looks_like_network_target(target):
-            result = await run_icmp_probe(target, timeout_seconds)
+            result = await run_icmp_probe(split_host_port(target)[0], timeout_seconds)
+            self._note_icmp_result(result)
             return result["state"], result["latency_ms"], result["error_message"]
 
         return MonitorState.UNKNOWN, None, f"No supported probe strategy for target '{target}'"
+
+    def _note_icmp_result(self, result: Dict[str, Any]) -> bool:
+        """Remember whether ICMP is usable on this instance (health + one log
+        line per change). Returns True when this probe could not use ICMP."""
+        unavailable = bool(result.get("unavailable"))
+        if unavailable and self._icmp_unavailable_since is None:
+            self._icmp_unavailable_since = time.monotonic()
+            self.ctx.log.warning(
+                "State Monitoring: ICMP is not permitted on this instance — host monitors fall back to TCP, "
+                "ping monitors read UNKNOWN. Allow unprivileged ICMP (net.ipv4.ping_group_range) or set "
+                f"'probe_roles' to instances that can ping. ({result.get('error_message')})"
+            )
+        elif not unavailable and self._icmp_unavailable_since is not None:
+            self._icmp_unavailable_since = None
+            self.ctx.log.info("State Monitoring: ICMP is usable again on this instance.")
+        return unavailable
+
+    @property
+    def icmp_unavailable(self) -> bool:
+        return self._probing and self._icmp_unavailable_since is not None
+
+    @staticmethod
+    def _probe_deadline(timeout_seconds: Any) -> float:
+        """Hard upper bound for one whole probe: ICMP plus the TCP fallback (or
+        an HTTP probe with its own, tighter deadline) and some slack. Whatever a
+        provider does, the monitor's job and its semaphore slot come back."""
+        try:
+            timeout = max(1.0, float(timeout_seconds))
+        except (TypeError, ValueError):
+            timeout = 10.0
+        return 2 * timeout + 5.0
 
     def _save_probe_result(
         self,
@@ -744,9 +799,11 @@ class MonitoringService:
                 break
             await asyncio.sleep(0.1)
 
-        # Release the shared HTTP client
+        # Release the shared HTTP client and the probe thread pools (recreated
+        # lazily when this instance probes again).
         with suppress(Exception):
             await self.http_client.aclose()
+        shutdown_probe_executors()
 
         self._set_status("ready")
         self.ctx.log.info("State Monitoring: stopped cleanly.")
@@ -2324,7 +2381,13 @@ class MonitoringService:
             error_message = None
             try:
                 async with self._probe_semaphore:
-                    state, latency_ms, error_message = await self._dispatch_probe(record_data)
+                    state, latency_ms, error_message = await asyncio.wait_for(
+                        self._dispatch_probe(record_data),
+                        timeout=self._probe_deadline(record_data.get("timeout_seconds")),
+                    )
+            except asyncio.TimeoutError:
+                state = MonitorState.DOWN
+                error_message = "Probe deadline exceeded"
             except Exception as exc:
                 state = MonitorState.DOWN
                 error_message = str(exc)

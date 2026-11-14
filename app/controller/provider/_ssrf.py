@@ -11,15 +11,29 @@ schemes.
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
+from typing import List
 from urllib.parse import urlsplit
+
+from ._executor import run_blocking
 
 _ALLOWED_SCHEMES = {"http", "https"}
 
 
 class ProbeTargetError(ValueError):
     """Raised when a probe target is rejected by the SSRF guard."""
+
+
+class ProbeResolutionError(ProbeTargetError):
+    """The probe host could not be resolved (in time). Reported as a normal
+    DOWN result, like any other unreachable target."""
+
+
+#: Upper bound for one name lookup. The system resolver may hang much longer
+#: during a DNS outage (5 s × attempts × nameservers); the probe does not wait.
+DNS_TIMEOUT_SECONDS = 5.0
 
 
 def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
@@ -38,42 +52,68 @@ def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
     )
 
 
-def assert_host_allowed(host: str) -> None:
-    """Reject empty hosts and hosts that resolve to link-local/metadata ranges.
+def _lookup(host: str) -> list:
+    # Looked up through the module attribute so the blocking call is the one
+    # that runs in the worker (and tests can replace it).
+    return socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
 
-    Best-effort: a literal IP is checked directly; a hostname is resolved and
-    every returned address is checked. DNS failures are left to the probe
-    itself (they surface as a normal DOWN result).
-    """
+
+async def resolve_probe_host(host: str, *, timeout: float = DNS_TIMEOUT_SECONDS, enforce: bool = True) -> List[str]:
+    """Resolve ``host`` **off the event loop** and return its addresses, IPv4
+    first (monitored infrastructure is IPv4-first; a container often has no
+    IPv6 route).
+
+    The synchronous ``assert_host_allowed`` called ``socket.getaddrinfo`` on the
+    loop: during a DNS outage every hostname probe froze the whole core for the
+    resolver timeout (MO-05). Here the lookup runs on the dedicated ``dns``
+    pool and the wait is capped at ``timeout``.
+
+    With ``enforce`` every returned address must pass the SSRF guard, and the
+    caller connects to one of the returned addresses instead of resolving the
+    name a second time — so a DNS answer that changes between check and
+    connect (rebinding) cannot redirect the probe (MO-22).
+
+    Raises ``ProbeTargetError`` (blocked) or ``ProbeResolutionError``."""
     if not host:
         raise ProbeTargetError("Empty probe host")
-
-    candidates: list[ipaddress._BaseAddress] = []
+    literal = host.strip("[]").split("%", 1)[0]
     try:
-        candidates.append(ipaddress.ip_address(host))
+        ip = ipaddress.ip_address(literal)
     except ValueError:
-        # Hostname — resolve and check every address.
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except socket.gaierror:
-            return  # Unresolvable; the probe will report DOWN.
-        for info in infos:
-            addr = info[4][0]
-            try:
-                candidates.append(ipaddress.ip_address(addr.split("%", 1)[0]))
-            except ValueError:
-                continue
-
-    for ip in candidates:
-        if _is_blocked_ip(ip):
+        ip = None
+    if ip is not None:
+        if enforce and _is_blocked_ip(ip):
             raise ProbeTargetError(f"Probe target resolves to a blocked address: {ip}")
+        return [str(ip)]
+    try:
+        infos = await run_blocking("dns", _lookup, host, timeout=max(0.5, float(timeout)))
+    except asyncio.TimeoutError as exc:
+        raise ProbeResolutionError(f"DNS resolution of '{host}' timed out") from exc
+    except (socket.gaierror, UnicodeError) as exc:
+        raise ProbeResolutionError(f"DNS resolution of '{host}' failed: {exc}") from exc
+    addresses: List[ipaddress._BaseAddress] = []
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except ValueError:
+            continue
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise ProbeResolutionError(f"DNS resolution of '{host}' returned no address")
+    if enforce:
+        for address in addresses:
+            if _is_blocked_ip(address):
+                raise ProbeTargetError(f"Probe target resolves to a blocked address: {address}")
+    addresses.sort(key=lambda a: a.version)  # stable: IPv4 before IPv6
+    return [str(a) for a in addresses]
 
 
-def assert_url_allowed(url: str) -> None:
-    """Validate an HTTP probe URL: allowed scheme + host not link-local/metadata."""
+def assert_scheme_allowed(url: str) -> str:
+    """Scheme allowlist of an HTTP probe URL; returns the URL's host."""
     parts = urlsplit(url)
     if parts.scheme not in _ALLOWED_SCHEMES:
         raise ProbeTargetError(f"Unsupported probe scheme: {parts.scheme!r}")
     if not parts.hostname:
         raise ProbeTargetError("Probe URL has no host")
-    assert_host_allowed(parts.hostname)
+    return parts.hostname

@@ -1,9 +1,11 @@
 import asyncio
 import ipaddress
+import time
 from contextlib import suppress
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from ...model.models import MonitorState, _utc_now
+from ...model.models import MonitorState
+from ._ssrf import DNS_TIMEOUT_SECONDS, resolve_probe_host
 
 
 def looks_like_network_target(value: Optional[str]) -> bool:
@@ -23,27 +25,50 @@ def looks_like_network_target(value: Optional[str]) -> bool:
         return all(c.isalnum() or c in {"-", "."} for c in host)
 
 
+def split_host_port(target: str) -> Tuple[str, Optional[int]]:
+    """``"host:8200"`` → ``("host", 8200)``; anything else (bare host, IPv6
+    literal) → ``(target, None)``."""
+    raw = str(target).strip()
+    if raw.count(":") == 1:
+        host_part, port_part = raw.rsplit(":", 1)
+        if host_part and port_part.isdigit():
+            return host_part, int(port_part)
+    return raw, None
+
+
 async def run_tcp_probe(host: str, port: int, timeout_seconds: int) -> Dict[str, Any]:
-    started = _utc_now()
+    """TCP connect. ``refused: True`` marks an actively refused connection —
+    the port is closed, but the host answered."""
+    timeout = max(1, timeout_seconds)
+    started = time.perf_counter()
     try:
+        # Resolved on the probe DNS pool: ``open_connection`` with a name would
+        # resolve on the loop's shared default executor (MO-07).
+        addresses = await resolve_probe_host(host, timeout=min(DNS_TIMEOUT_SECONDS, timeout), enforce=False)
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=max(1, timeout_seconds)
+            asyncio.open_connection(addresses[0], port), timeout=timeout
         )
         writer.close()
         with suppress(Exception):
             await writer.wait_closed()
-        latency_ms = round((_utc_now() - started).total_seconds() * 1000.0, 2)
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
         return {"state": MonitorState.UP, "latency_ms": latency_ms, "error_message": None}
+    except asyncio.TimeoutError:
+        return {"state": MonitorState.DOWN, "latency_ms": None, "error_message": f"TCP {port}: timed out"}
+    except ConnectionRefusedError as exc:
+        return {
+            "state": MonitorState.DOWN, "latency_ms": None,
+            "error_message": f"TCP {port}: {exc}", "refused": True,
+        }
     except Exception as exc:
         return {"state": MonitorState.DOWN, "latency_ms": None, "error_message": f"TCP {port}: {exc}"}
 
 
 def tcp_fallback_ports(metadata: Dict[str, Any], target: str) -> List[int]:
     from .docker import is_docker_host
-    if ":" in str(target) and str(target).count(":") == 1:
-        host_part, port_part = str(target).rsplit(":", 1)
-        if port_part.isdigit() and host_part:
-            return [int(port_part)]
+    _host, explicit_port = split_host_port(target)
+    if explicit_port is not None:
+        return [explicit_port]
     ports: List[int] = []
     if is_docker_host(metadata):
         ports.append(2375)
