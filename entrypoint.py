@@ -84,6 +84,9 @@ manifest = ModuleManifest(
         {"key": "probe_nodes", "label": "Probe nodes", "kind": "int",
          "category": "Probing", "default": "1",
          "description": "Cluster only (core API >= 1.8): number of instances that share the probing (rendezvous sharding, each monitor has one owner). 1 = single prober via lease. Changing between 1 and >1 takes effect after a plugin reload; other changes apply at once."},
+        {"key": "inventory_max_stale_percent", "label": "Inventory: max. removed monitors (%)", "kind": "int",
+         "category": "Inventory", "default": "30",
+         "description": "An inventory import that would remove more than this share of the IaC-managed monitors (or that arrives empty) removes nothing; it is logged and raises a notification instead. The publisher can confirm an intended mass removal with allow_mass_delete=true. 0 = never remove without that confirmation, 100 = only an empty inventory is refused."},
         # Outage rule (1.7.0): a monitor DOWN for offline_minutes outside any
         # maintenance window/override emits monitoring:outage_persisted (→ ITSM).
         # Kinds are the Entity-Registry kinds and open — the known ones get a
@@ -143,6 +146,11 @@ manifest = ModuleManifest(
         {"key": "action_delete_all", "label": "Delete ALL monitors", "kind": "action",
          "action": "/maintenance/delete-monitors/all", "category": "Maintenance", "confirm": True, "danger": True,
          "description": "Removes every monitor including manually created ones, with all history."},
+    ],
+    notification_endpoints=[
+        {"name": "inventory_guard",
+         "description": "An inventory import was implausible (empty or shrank beyond the limit) and removed no monitors",
+         "default_active": True, "internal_toast": True, "internal_persist": True},
     ],
     permissions={
         "subscribe": [

@@ -76,6 +76,9 @@ class MonitoringService:
         # Operator settings (manifest settings_schema, applied on vault:ready_for_data).
         self._heartbeat_retention_days = 7
         self._overview_cache_seconds = 10
+        # Inventory guard (MO-15): share of the managed monitors one import may
+        # remove without ``allow_mass_delete`` (see _inventory_guard_reason).
+        self._inventory_max_stale_percent = 30
         # Set by stop(): sweep workers stop taking monitors, housekeeping stops.
         self._stopping = False
         # Cluster placement: True only on the instance holding the
@@ -1122,6 +1125,11 @@ class MonitoringService:
         self._initial_probe_worker_limit = _int("initial_probe_workers", 8, 1, 64)
         self._overview_cache_seconds = _int("overview_cache_seconds", 10, 0, 300)
         self._probe_nodes = _int("probe_nodes", 1, 1, 64)
+        try:  # 0 is a valid value here ("never remove automatically") — _int treats it as unset
+            raw_pct = values.get("inventory_max_stale_percent")
+            self._inventory_max_stale_percent = max(0, min(100, int(raw_pct))) if raw_pct not in (None, "") else 30
+        except (TypeError, ValueError):
+            self._inventory_max_stale_percent = 30
         raw_roles = values.get("probe_roles") or ""
         if isinstance(raw_roles, (list, tuple, set)):
             raw_roles = ",".join(str(r) for r in raw_roles)
@@ -1145,11 +1153,27 @@ class MonitoringService:
         """Synchronous inventory import (``POST /inventory-sync``): ingest, then
         give the new monitors probe jobs and announce the change — the bulk
         upserts run with ``sync_scheduler=False`` and never notify on their own."""
-        stats = await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
+        stats = await self._ingest_inventory_quiesced(payload)
         try:
             await self.apply_monitor_set_change("inventory")
         except Exception as exc:
             self.ctx.log.error(f"State Monitoring: resync after inventory import failed: {exc}")
+        return stats
+
+    async def _ingest_inventory_quiesced(self, payload: InventorySyncPayload) -> Dict[str, Any]:
+        """Import on the loop-driven paths: upserts first, then the removal of
+        monitors that left the inventory with their probe writers stopped
+        (``quiesced``: jobs dropped, in-flight probes drained, peers asked to
+        pause) — a probe writing into rows that are being deleted is what turned
+        the old single-transaction delete into MariaDB 1020 rollbacks (MO-15)."""
+        stats = await asyncio.to_thread(self.ingest_inventory_snapshot, payload, False)
+        stale_ids = stats.pop("stale_ids", [])
+        if stale_ids:
+            async with self.quiesced(stale_ids):
+                result = await asyncio.to_thread(self.delete_monitor_ids, stale_ids)
+            stats["stale_deleted"] = result["monitors"]
+            for mid in stale_ids:
+                self._consec_failures.pop(mid, None)
         return stats
 
     async def _process_inventory_sync_queue(self):
@@ -1159,7 +1183,7 @@ class MonitoringService:
             self._pending_inventory_payload = None
             try:
                 async with self.maintenance_window("Importing inventory"):
-                    await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
+                    await self._ingest_inventory_quiesced(payload)
                 await asyncio.sleep(0)
                 # The prober may be another instance (inventory arrives where the
                 # orchestrator runs) — this also tells it to reload its jobs.
@@ -2119,7 +2143,14 @@ class MonitoringService:
         monitor. The caller resyncs the scheduler on the loop afterwards
         (``sync_scheduler_jobs_from``) and calls ``reset_probe_state``.
         """
-        ids = self.monitor_ids_for_scope(scope)
+        return self.delete_monitor_ids(self.monitor_ids_for_scope(scope))
+
+    def delete_monitor_ids(self, ids: List[str]) -> Dict[str, int]:
+        """Delete the given monitors with heartbeats, aggregates, outage clocks and
+        monitor-pinned windows: READ COMMITTED, ``DELETE_CHUNK`` monitors per
+        committed transaction, heartbeats in ``PRUNE_BATCH`` statements, every
+        batch retried on 1020/1205/1213 — no statement near the 60 s cap."""
+        ids = list(ids)
         result = {"monitors": 0, "heartbeats": 0, "aggregates": 0}
         session = self._maintenance_session()
         if not session:
@@ -2342,11 +2373,92 @@ class MonitoringService:
     # Inventory sync
     # ------------------------------------------------------------------
 
-    def ingest_inventory_snapshot(self, payload: InventorySyncPayload) -> Dict[str, int]:
+    INVENTORY_OWNER_SOURCES = ("orchestrator_service", "iac_orchestrator")
+    #: Below this many removals the percentage says nothing (a fleet of 6 monitors
+    #: losing one host is 50 %) — small clean-ups always pass.
+    INVENTORY_GUARD_MIN_STALE = 5
+
+    def _managed_inventory_ids(self, owner_source: str) -> set:
+        """Ids of the monitors an inventory import of ``owner_source`` manages."""
+        session = self._session()
+        if not session:
+            return set()
+        try:
+            owners = {owner_source, *self.INVENTORY_OWNER_SOURCES}
+            rows = (
+                session.query(MonitorRecord.monitor_id)
+                .filter(
+                    MonitorRecord.owner_source.in_(owners),
+                    MonitorRecord.monitor_id.like("host:%") | MonitorRecord.monitor_id.like("service:%"),
+                )
+                .all()
+            )
+            return {r[0] for r in rows}
+        finally:
+            session.close()
+
+    def _inventory_guard_reason(self, payload: InventorySyncPayload, before: set, stale: set) -> Optional[str]:
+        """Why this import must NOT remove ``stale`` (None = removal is plausible).
+
+        An empty, truncated or half-generated inventory used to delete every
+        managed monitor with its history (MO-15). Removal now needs a plausible
+        payload or the publisher's explicit ``allow_mass_delete``."""
+        if not stale or payload.allow_mass_delete:
+            return None
+        if not payload.hosts and not payload.services:
+            return "the inventory is empty"
+        if not payload.hosts and any(mid.startswith("host:") for mid in before):
+            return "the inventory lists no hosts"
+        limit = self._inventory_max_stale_percent
+        share = 100.0 * len(stale) / max(1, len(before))
+        min_stale = 0 if limit == 0 else self.INVENTORY_GUARD_MIN_STALE
+        if len(stale) > min_stale and share > limit:
+            return f"it would remove {len(stale)} of {len(before)} managed monitors ({share:.0f} % > {limit} %)"
+        return None
+
+    def _report_inventory_guard(self, reason: str, stale: set, revision: Optional[str]) -> None:
+        """Log + operator notification instead of the delete."""
+        body = (
+            f"Inventory import{f' (revision {revision})' if revision else ''}: {reason}. "
+            f"{len(stale)} monitor(s) missing from it were kept. Publish a complete inventory, send "
+            "allow_mass_delete=true with the import, raise 'inventory_max_stale_percent', or use "
+            "'Delete IaC-managed monitors' in the plugin settings if the removal is intended."
+        )
+        self.ctx.log.warning(f"State Monitoring: {body}")
+        notify = getattr(self.ctx, "notify", None)
+        if not callable(notify):
+            return
+
+        def _do() -> None:
+            try:
+                notify(
+                    "inventory_guard",
+                    {"reason": reason, "kept": len(stale), "source_revision": revision},
+                    notification_id="monitoring:inventory_guard",
+                    title="State Monitoring: inventory import did not remove monitors",
+                    body=body,
+                    severity="warning",
+                )
+            except Exception as exc:  # undeclared endpoint on an old manifest, router down …
+                self.ctx.log.debug(f"State Monitoring: inventory guard notification failed: {exc}")
+
+        if not self._call_on_loop(_do):  # the router emits on the bus → loop thread
+            _do()
+
+    def ingest_inventory_snapshot(self, payload: InventorySyncPayload, delete_stale: bool = True) -> Dict[str, Any]:
+        """Upsert the inventory's monitors and remove the ones that left it.
+
+        ``delete_stale=False`` (the loop-driven import) only plans the removal and
+        returns the ids as ``stale_ids`` so the caller can stop the probe writers
+        first; the default deletes right away (sync callers, tests) — batched and
+        retried either way."""
         def _ci(value: Any) -> Optional[str]:
             text_value = str(value).strip() if value is not None else ""
             return text_value[:36] or None
 
+        # Taken before the upserts: the share that disappears is measured against
+        # what existed, not diluted by monitors this very import creates.
+        before_ids = self._managed_inventory_ids(payload.owner_source)
         upserts = 0
         for host in payload.hosts:
             host_name = host.get("host_name") or host.get("hostname")
@@ -2436,38 +2548,20 @@ class MonitoringService:
             if hn and sn:
                 fresh_ids.add(f"service:{hn}:{sn}")
 
-        stale_deleted = 0
-        legacy_owner_sources = {payload.owner_source, "orchestrator_service", "iac_orchestrator"}
-        session_stale = self._session()
-        if session_stale:
-            try:
-                stale = (
-                    session_stale.query(MonitorRecord)
-                    .filter(
-                        MonitorRecord.owner_source.in_(legacy_owner_sources),
-                        MonitorRecord.monitor_id.like("host:%")
-                        | MonitorRecord.monitor_id.like("service:%"),
-                    )
-                    .all()
-                )
-                stale_ids = [rec.monitor_id for rec in stale if rec.monitor_id not in fresh_ids]
-                if stale_ids:
-                    session_stale.query(MonitorHeartbeat).filter(
-                        MonitorHeartbeat.monitor_id.in_(stale_ids)
-                    ).delete(synchronize_session=False)
-                    session_stale.query(MonitorDailyAggregate).filter(
-                        MonitorDailyAggregate.monitor_id.in_(stale_ids)
-                    ).delete(synchronize_session=False)
-                    MaintenanceStore.delete_outages_in(session_stale, stale_ids)
-                    session_stale.query(MaintenanceWindowRecord).filter(
-                        MaintenanceWindowRecord.monitor_id.in_(stale_ids)
-                    ).delete(synchronize_session=False)
-                    session_stale.query(MonitorRecord).filter(
-                        MonitorRecord.monitor_id.in_(stale_ids)
-                    ).delete(synchronize_session=False)
-                    stale_deleted = len(stale_ids)
-                    session_stale.commit()
-            finally:
-                session_stale.close()
-
-        return {"upserts": upserts, "stale_deleted": stale_deleted, "source_revision": payload.source_revision}
+        stale = before_ids - fresh_ids
+        stats: Dict[str, Any] = {
+            "upserts": upserts, "stale_deleted": 0, "stale_skipped": 0,
+            "source_revision": payload.source_revision,
+        }
+        reason = self._inventory_guard_reason(payload, before_ids, stale)
+        if reason:
+            self._report_inventory_guard(reason, stale, payload.source_revision)
+            stats["stale_skipped"] = len(stale)
+            stats["stale_guard"] = reason
+            return stats
+        stale_ids = sorted(stale)
+        if not delete_stale:
+            stats["stale_ids"] = stale_ids
+        elif stale_ids:
+            stats["stale_deleted"] = self.delete_monitor_ids(stale_ids)["monitors"]
+        return stats

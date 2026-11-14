@@ -252,6 +252,9 @@ class InventorySyncPayload(BaseModel):
     source_revision: Optional[str] = None
     hosts: List[Dict[str, Any]] = Field(default_factory=list)
     services: List[Dict[str, Any]] = Field(default_factory=list)
+    # Explicit confirmation that this import may remove more managed monitors
+    # than the plausibility guard allows (empty inventory, large shrink).
+    allow_mass_delete: bool = False
 
 
 # ---------------------------------------------------------------------------
