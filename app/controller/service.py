@@ -116,6 +116,12 @@ class MonitoringService:
         # has monitors we know nothing about (UNKNOWN or stale) — re-probing a set
         # of persistently DOWN monitors after every restart is not a warm-up.
         self._sweep_blocking = True
+        # True while the sweep owns the core runtime status ("starting"), so a
+        # lease loss resets only its own status, never an API job's maintenance.
+        self._sweep_status_active = False
+        # Bumped whenever this instance stops probing: a probe that started
+        # before must not store its result afterwards (MO-20).
+        self._probe_epoch = 0
         # Single-flight cache for the computed views (see _cached()): N pollers
         # share one computation and re-use it for _overview_cache_seconds.
         self._view_cache: Dict[str, tuple] = {}
@@ -341,7 +347,7 @@ class MonitoringService:
             if self.is_sharded else
             "State Monitoring: prober lease lost — stopping probes on this instance."
         )
-        await self.stop()
+        await self.stop(probing_only=True)
         # stop() flags the background writers to stop; on a lease loss the
         # process lives on and the API (e.g. /maintenance/prune) must still work.
         self._stopping = False
@@ -804,18 +810,48 @@ class MonitoringService:
         finally:
             session.close()
 
-    async def stop(self):
-        """Cancel all background tasks and release resources for clean reload."""
+    def _lease_token(self) -> Any:
+        """Fencing token of the prober lease when the core provides one
+        (``ctx.lease_token``, newer cores); ``None`` otherwise."""
+        token = getattr(self.ctx, "lease_token", None)
+        if token is None:
+            return None
+        if callable(token):
+            try:
+                return token("monitoring:prober")
+            except Exception:
+                return None
+        return token
+
+    def _probe_fence(self) -> tuple:
+        """What a probe remembers when it starts; its result is stored only if
+        this is unchanged when it finishes (see ``run_scheduled_probe``)."""
+        return (self._probe_epoch, self._lease_token())
+
+    async def stop(self, probing_only: bool = False):
+        """Cancel background tasks and release resources.
+
+        Full stop (plugin unload/shutdown): everything named ``monitoring:*``.
+        ``probing_only`` (lease lost, the process lives on and keeps serving the
+        API): only what belongs to probing — the scheduler jobs, the sweep, the
+        resync and the bootstrap. An inventory import running on this instance,
+        the maintenance-cache reload and the placement task finish their work,
+        an API job's maintenance status stays, and nothing waits for in-flight
+        probes: their results are fenced off instead (MO-20)."""
         # Yield once so every task that was created-but-not-yet-started gets
         # its first event-loop step.  Without this, tasks cancelled before they
         # ever run trigger Python's "coroutine was never awaited" RuntimeWarning
         # during GC at process shutdown.
         self._stopping = True  # sweep workers stop taking monitors, housekeeping stops
+        self._probe_epoch += 1  # in-flight probes of this prober term no longer write
         await asyncio.sleep(0)
 
         # Collect explicitly tracked one-off tasks
         tasks_to_cancel: list = []
-        for attr in ("_bootstrap_task", "_background_probe_task", "_inventory_sync_task", "_startup_prune_task"):
+        tracked = ["_bootstrap_task", "_background_probe_task", "_startup_prune_task", "_resync_task"]
+        if not probing_only:
+            tracked.append("_inventory_sync_task")
+        for attr in tracked:
             t = getattr(self, attr, None)
             if t and not t.done():
                 tasks_to_cancel.append(t)
@@ -825,23 +861,26 @@ class MonitoringService:
             if not handle.task.done():
                 tasks_to_cancel.append(handle.task)
 
-        # Also sweep asyncio's own task registry for anything named
-        # "monitoring:*" that we might have missed (created between the
-        # snapshot above and now, e.g. during a concurrent sync).
-        tracked_ids = {id(t) for t in tasks_to_cancel}
-        current = asyncio.current_task()
-        for t in asyncio.all_tasks():
-            if t is current or t.done():
-                continue
-            name = t.get_name() or ""
-            if name.startswith("monitoring:") and id(t) not in tracked_ids:
-                tasks_to_cancel.append(t)
+        if not probing_only:
+            # Also sweep asyncio's own task registry for anything named
+            # "monitoring:*" that we might have missed (created between the
+            # snapshot above and now, e.g. during a concurrent sync).
+            tracked_ids = {id(t) for t in tasks_to_cancel}
+            current = asyncio.current_task()
+            for t in asyncio.all_tasks():
+                if t is current or t.done():
+                    continue
+                name = t.get_name() or ""
+                if name.startswith("monitoring:") and id(t) not in tracked_ids:
+                    tasks_to_cancel.append(t)
 
         # Clear scheduler state immediately so no new tasks are spawned
         self.scheduler._jobs.clear()
         self.scheduler._started = False
         self._scheduler_started = False
 
+        current = asyncio.current_task()
+        tasks_to_cancel = [t for t in tasks_to_cancel if t is not current]
         # Cancel everything, then wait briefly — the process is exiting anyway
         for t in tasks_to_cancel:
             t.cancel()
@@ -850,12 +889,13 @@ class MonitoringService:
             with suppress(Exception):
                 await asyncio.wait(tasks_to_cancel, timeout=0.5)
 
-        # Probes running in worker threads cannot be cancelled — give them up to
-        # 5 s to drain so a reload does not run two sweeps against the DB.
-        for _ in range(50):
-            if not self._inflight_probes:
-                break
-            await asyncio.sleep(0.1)
+        if not probing_only:
+            # Probes running in worker threads cannot be cancelled — give them up to
+            # 5 s to drain so a reload does not run two sweeps against the DB.
+            for _ in range(50):
+                if not self._inflight_probes:
+                    break
+                await asyncio.sleep(0.1)
 
         # Release the shared HTTP client and the probe thread pools (recreated
         # lazily when this instance probes again).
@@ -863,8 +903,13 @@ class MonitoringService:
             await self.http_client.aclose()
         shutdown_probe_executors()
 
-        self._set_status("ready")
-        self.ctx.log.info("State Monitoring: stopped cleanly.")
+        if not probing_only or self._sweep_status_active:
+            self._sweep_status_active = False
+            self._set_status("ready")
+        self.ctx.log.info(
+            "State Monitoring: probing stopped on this instance." if probing_only
+            else "State Monitoring: stopped cleanly."
+        )
 
     def ensure_tables(self):
         from core.api import Base
@@ -1140,9 +1185,17 @@ class MonitoringService:
             candidates.sort(key=lambda r: (self._probe_priority(r), r.updated_at or _utc_now()))
             if self._initial_probe_batch_limit > 0 and not force:
                 candidates = candidates[: self._initial_probe_batch_limit]
-            # A forced sweep re-probes known states → banner only, never a 503 window.
-            self._sweep_blocking = (not force) and any(
-                r.latest_state == MonitorState.UNKNOWN.value or _is_stale(r) for r in candidates
+            # The sweep blocks the plugin's routes (503 + warm-up panel) only when
+            # it is the genuine first one: there is nothing to show yet, no owned
+            # monitor has ever been probed (fresh install, first inventory import,
+            # after "reset states"). A lease handover, a shard change or an import
+            # that adds a few monitors re-probes on top of known states — banner
+            # only; the routes are plain DB reads that do not depend on it (MO-14).
+            owned = [r for r in records if (r.target or r.address) and self.owns(r.monitor_id)]
+            self._sweep_blocking = (
+                (not force)
+                and bool(candidates)
+                and all(r.latest_state == MonitorState.UNKNOWN.value and r.last_checked_at is None for r in owned)
             )
             return [r.monitor_id for r in candidates]
         finally:
@@ -1169,6 +1222,7 @@ class MonitoringService:
         message = f"Initial probe sweep: {total} monitors"
         blocking = self._sweep_blocking
         done = 0
+        self._sweep_status_active = True
         self._set_status("starting", message=message, progress=(0, total), blocking=blocking, retry_after=15)
 
         async def worker():
@@ -1184,6 +1238,7 @@ class MonitoringService:
         try:
             await asyncio.gather(*(worker() for _ in range(worker_count)), return_exceptions=True)
         finally:
+            self._sweep_status_active = False
             self._set_status("ready")
             self._view_cache.clear()
         self.ctx.log.info(f"State Monitoring: initial probe refresh finished ({done}/{total}).")
@@ -2535,6 +2590,7 @@ class MonitoringService:
             # not owned: sharded mode, another worker probes this monitor.
             return None
         self._inflight_probes.add(monitor_id)
+        fence = self._probe_fence()
         try:
             # Phase 1: read from DB in a worker thread so the event loop stays free.
             record_data = await asyncio.to_thread(self._load_probe_record, monitor_id)
@@ -2590,6 +2646,14 @@ class MonitoringService:
                     and record_data.get("latest_state") in (MonitorState.UP.value, None)
                 ):
                     return None
+
+            if fence != self._probe_fence():
+                # This instance stopped probing (lease lost, plugin stopping) or the
+                # lease changed hands while the probe ran: the new prober owns the
+                # monitor now. A late write from here would flip states between two
+                # vantage points and double the samples.
+                self.ctx.log.debug(f"State Monitoring: stale probe result for '{monitor_id}' discarded.")
+                return None
 
             # Phase 3: write result + aggregates in a worker thread.
             try:
