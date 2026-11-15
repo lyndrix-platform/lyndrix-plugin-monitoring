@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import pathlib
+import threading
 import time
 from datetime import timedelta
 from types import SimpleNamespace
@@ -314,6 +315,22 @@ def test_scheduled_evaluator_confirms_down_with_a_fresh_probe(svc, clock, monkey
         return MonitorState.DOWN, None, "still down"
 
     monkeypatch.setattr(svc, "_dispatch_probe", fake_dispatch)
+    # The two confirmation probes read/write from worker threads at the same
+    # time. The test DB is ONE shared sqlite connection (StaticPool): a reader's
+    # session.close() rolls back the other probe's uncommitted heartbeat (the
+    # UP result vanished in ~1 of 12 runs). MariaDB's pooled connections never
+    # interact like that, so serialise the DB access to keep the test about the
+    # evaluator.
+    db_lock = threading.Lock()
+
+    def serialised(fn):
+        def wrapper(*args, **kwargs):
+            with db_lock:
+                return fn(*args, **kwargs)
+        return wrapper
+
+    monkeypatch.setattr(svc, "_load_probe_record", serialised(svc._load_probe_record))
+    monkeypatch.setattr(svc, "_save_probe_result", serialised(svc._save_probe_result))
     svc._probing = True
     clock["now"] = NOW + 11 * MIN
     stats = asyncio.run(svc.evaluate_outages())
