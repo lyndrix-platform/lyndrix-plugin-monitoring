@@ -255,3 +255,82 @@ def test_permanently_failing_event_is_dropped_after_the_attempt_limit(svc, clock
     for minute in (12, 14, 16):
         mnt.deliver_outbox(now=NOW + minute * MIN)
     assert _outbox(svc) == [] and _persisted(svc) == []
+
+
+# ── MO-10: parent-down suppression ────────────────────────────────────────────
+
+WEB_CI = "44444444-4444-4444-8444-444444444444"
+DB_CI = "55555555-5555-4555-8555-555555555555"
+
+
+def _host_with_services(svc):
+    host = _host(svc, "host:h", ci_id=HOST_CI)
+    web = _service(svc, "service:h:web", "h", ci_id=WEB_CI, host_ci_id=HOST_CI)
+    db = _service(svc, "service:h:db", "h", ci_id=DB_CI, host_ci_id=HOST_CI)
+    shared = _service(svc, "service:h:legacy", "h")  # no own CI: borrows the host's
+    svc.maintenance.reload()
+    return host, [web, db, shared]
+
+
+def test_host_down_opens_one_outage_and_lists_its_services(svc, clock):
+    host, services = _host_with_services(svc)
+    for mid in [host, *services]:
+        _down(svc, mid)
+    stats = svc.maintenance.evaluate_outages(now=NOW + 10 * MIN)
+    assert stats["persisted"] == 1 and stats["held"] == 3
+    persisted = _persisted(svc)
+    assert [p["monitor_id"] for p in persisted] == [host]
+    assert persisted[0]["affected"] == [
+        {"monitor_id": "service:h:db", "name": "service:h:db", "ci_id": DB_CI},
+        {"monitor_id": "service:h:legacy", "name": "service:h:legacy", "ci_id": HOST_CI},
+        {"monitor_id": "service:h:web", "name": "service:h:web", "ci_id": WEB_CI},
+    ]
+    # still held on later passes while the host outage lasts
+    assert svc.maintenance.evaluate_outages(now=NOW + 40 * MIN)["persisted"] == 0
+    assert len(_persisted(svc)) == 1
+
+
+def test_service_still_down_after_the_host_recovered_reports_on_its_own(svc, clock):
+    host, services = _host_with_services(svc)
+    web = services[0]
+    for mid in [host, *services]:
+        _down(svc, mid)
+    mnt = svc.maintenance
+    mnt.evaluate_outages(now=NOW + 10 * MIN)
+    mnt.evaluate_outages(now=NOW + 30 * MIN)  # the evaluator keeps ticking while the host is down
+    clock["now"] = NOW + 30 * MIN
+    _up(svc, host)
+    for mid in services[1:]:
+        _up(svc, mid)  # db and legacy come back with the host, web does not
+    assert len(_recovered(svc)) == 1  # the host's; held services never reported anything
+    assert mnt.evaluate_outages(now=NOW + 39 * MIN)["persisted"] == 0  # clock restarted at host recovery
+    assert mnt.evaluate_outages(now=NOW + 40 * MIN)["persisted"] == 1
+    own = _persisted(svc)[-1]
+    assert own["monitor_id"] == web and own["ci_id"] == WEB_CI and own["host_ci_id"] == HOST_CI
+    assert own["since"] == "2026-10-20T12:00:00Z" and own["affected"] == []
+
+
+def test_service_down_on_a_healthy_host_is_not_held(svc, clock):
+    host, services = _host_with_services(svc)
+    _up(svc, host)
+    _down(svc, services[0])
+    stats = svc.maintenance.evaluate_outages(now=NOW + 10 * MIN)
+    assert stats["held"] == 0 and [p["monitor_id"] for p in _persisted(svc)] == [services[0]]
+
+
+def test_services_are_not_held_when_host_outages_are_switched_off(svc, clock):
+    host, services = _host_with_services(svc)
+    svc.apply_settings({"outage_rules_enabled_host": "false"})
+    for mid in [host, services[0]]:
+        _down(svc, mid)
+    stats = svc.maintenance.evaluate_outages(now=NOW + 10 * MIN)
+    assert stats["held"] == 0 and [p["monitor_id"] for p in _persisted(svc)] == [services[0]]
+
+
+def test_services_are_held_while_the_host_is_in_maintenance(svc, clock):
+    host, services = _host_with_services(svc)
+    _o._publish(svc, _o._item(HOST_CI, windows=[_o._once(NOW - MIN, NOW + 60 * MIN)]))
+    for mid in [host, services[0]]:
+        _down(svc, mid)  # the service CI itself has no window
+    stats = svc.maintenance.evaluate_outages(now=NOW + 30 * MIN)
+    assert stats["held"] == 1 and stats["suppressed"] == 1 and _persisted(svc) == []

@@ -1659,6 +1659,18 @@ class MaintenanceManager:
             target = naive(now_aware)
         else:
             return suppressed_until
+        return self._store_suppressed(session, monitor_id, target, suppressed_until, now_aware)
+
+    def _store_suppressed(
+        self,
+        session,
+        monitor_id: str,
+        target: datetime,
+        suppressed_until: Optional[datetime],
+        now_aware: datetime,
+    ) -> datetime:
+        """Write ``suppressed_until = target`` (naive UTC) on an OPEN outage
+        unless it already holds that value; returns it as aware UTC."""
         if suppressed_until is not None and naive(suppressed_until) == target:
             return suppressed_until
 
@@ -1725,7 +1737,9 @@ class MaintenanceManager:
         (direct callers that know the state is current)."""
         now_aware = aware(now) if now is not None else mw.utcnow()
         self.cache.reload_if_stale(self.CACHE_MAX_AGE_SECONDS)
-        stats: Dict[str, Any] = {"checked": 0, "persisted": 0, "suppressed": 0, "skipped": 0, "unconfirmed": 0}
+        stats: Dict[str, Any] = {
+            "checked": 0, "persisted": 0, "suppressed": 0, "skipped": 0, "unconfirmed": 0, "held": 0,
+        }
         due: List[Tuple[str, bool]] = []
         session = self.svc._rc_session()
         if session is None:
@@ -1740,6 +1754,7 @@ class MaintenanceManager:
                 .all()
             ]
             session.expunge_all()
+            down_hosts, open_children = self._outage_topology(session, {p[0] for p in pending})
             for monitor_id, down_since, suppressed_until, error in pending:
                 if not self._evaluates(monitor_id):
                     continue
@@ -1759,6 +1774,13 @@ class MaintenanceManager:
                 )
                 if ms.active:
                     stats["suppressed"] += 1
+                    continue
+                if self._held_by_host(record, down_hosts, now_aware):
+                    # Parent down (MO-10): the host outage covers this service.
+                    # Its own clock is re-marked like inside a maintenance window,
+                    # so it only starts counting once the host is back.
+                    stats["held"] += 1
+                    self._store_suppressed(session, monitor_id, naive(now_aware), suppressed_until, now_aware)
                     continue
                 rule = self.cache.rule_for(record)
                 if rule is None:
@@ -1844,6 +1866,13 @@ class MaintenanceManager:
                         "auto_resolve": rule.auto_resolve,
                     },
                     "error": error or record.latest_error,
+                    # Additive (MO-10): services of this host that are down with it
+                    # and therefore get no outage of their own while it lasts.
+                    "affected": (
+                        open_children.get(record.host_name or "", [])
+                        if record.monitor_type == MonitorType.SERVER.value
+                        else []
+                    ),
                 }
                 session.info.pop("monitoring_events", None)
                 if self.svc._retrying(session, _claim) != 1:
@@ -1861,6 +1890,60 @@ class MaintenanceManager:
         if stats["persisted"]:
             self.svc._view_cache.clear()
         return stats
+
+    def _outage_topology(
+        self, session, open_ids: Set[str]
+    ) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
+        """For parent-down suppression: ``(down_hosts, open_children)``.
+
+        ``down_hosts``: host_name → detached host (``server``) monitor that has an
+        outage row (open or reported). ``open_children``: host_name → the
+        non-host monitors on that host with an OPEN outage, as
+        ``{monitor_id, name, ci_id}`` for the host event's ``affected`` list."""
+        down_hosts: Dict[str, Any] = {}
+        open_children: Dict[str, List[Dict[str, Any]]] = {}
+        outage_states = dict(
+            session.query(OutageRecord.monitor_id, OutageRecord.state)
+            .filter(OutageRecord.state.in_([OUTAGE_OPEN, OUTAGE_PERSISTED]))
+            .all()
+        )
+        if not outage_states:
+            return down_hosts, open_children
+        ids = list(outage_states)
+        for start in range(0, len(ids), 500):
+            rows = (
+                session.query(MonitorRecord)
+                .filter(MonitorRecord.monitor_id.in_(ids[start:start + 500]), MonitorRecord.host_name.isnot(None))
+                .all()
+            )
+            for row in rows:
+                session.expunge(row)
+                if row.monitor_type == MonitorType.SERVER.value:
+                    row.outage_state = outage_states[row.monitor_id]  # plain attribute on the detached copy
+                    down_hosts[row.host_name] = row
+                elif row.monitor_id in open_ids:
+                    open_children.setdefault(row.host_name, []).append(
+                        {"monitor_id": row.monitor_id, "name": row.name, "ci_id": self.cache.resolve_ci(row)[0]}
+                    )
+        for children in open_children.values():
+            children.sort(key=lambda c: c["monitor_id"])
+        return down_hosts, open_children
+
+    def _held_by_host(self, record: MonitorRecord, down_hosts: Dict[str, Any], now_aware: datetime) -> bool:
+        """True when ``record`` is a service whose host is down and that host
+        outage is (or will be) the one reported: already reported, inside the
+        host's maintenance, or covered by an enabled host rule. With host outages
+        switched off the service keeps reporting on its own."""
+        if record.monitor_type == MonitorType.SERVER.value or not record.host_name:
+            return False
+        host = down_hosts.get(record.host_name)
+        if host is None or host.monitor_id == record.monitor_id:
+            return False
+        if getattr(host, "outage_state", None) == OUTAGE_PERSISTED:
+            return True
+        if self.cache.state_for(host, now_aware).active:
+            return True
+        return self.cache.rule_for(host) is not None and bool(self.cache.resolve_ci(host)[0])
 
     def list_outages(self) -> List[Dict[str, Any]]:
         now = mw.utcnow()

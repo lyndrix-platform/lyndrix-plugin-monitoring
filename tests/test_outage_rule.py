@@ -159,6 +159,7 @@ def test_persists_after_offline_minutes_outside_any_window(svc, clock):
         "duration_s",
         "rule",
         "error",
+        "affected",  # additive (MO-10)
     }
     assert p["outage_id"] == f"{HOST_CI}:2026-10-20T12:00:00Z" and p["ci_id"] == HOST_CI
     assert (
