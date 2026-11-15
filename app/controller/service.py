@@ -645,14 +645,28 @@ class MonitoringService:
         write (READ COMMITTED + 1020/1205/1213 retry)."""
         self.apply_quiesce(True)
         self._emit_cluster(self.QUIESCE_TOPIC, {"on": True, "ttl": self.QUIESCE_TTL_SECONDS})
+        # A job on millions of heartbeats outlives the TTL; without a renewal the
+        # peer's quiesce expires mid-job and its probes write into the tables
+        # being deleted (MO-18).
+        renewer = asyncio.create_task(self._renew_quiesce(), name="monitoring:quiesce_renew")
         try:
             await self.quiesce_monitors(monitor_ids)
             if not self._probing or self.is_sharded:  # other instances probe too
                 await asyncio.sleep(self.QUIESCE_GRACE_SECONDS)
             yield
         finally:
+            renewer.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await renewer
             self._quiesced_until = 0.0
             self._emit_cluster(self.QUIESCE_TOPIC, {"on": False})
+
+    async def _renew_quiesce(self) -> None:
+        """Re-assert the quiesce at half the TTL: locally and on the peers."""
+        while True:
+            await asyncio.sleep(self.QUIESCE_TTL_SECONDS / 2)
+            self.apply_quiesce(True)
+            self._emit_cluster(self.QUIESCE_TOPIC, {"on": True, "ttl": self.QUIESCE_TTL_SECONDS})
 
     async def resync_after_delete(self) -> None:
         """After monitors/states were removed: forget probe bookkeeping, reload
