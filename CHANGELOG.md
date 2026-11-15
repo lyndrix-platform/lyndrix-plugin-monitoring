@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+Proposed version: **1.8.0** (security and reliability audit 2026-11; the manifest version is not bumped yet).
+Minimum core unchanged (API 1.13); newer core APIs are used only behind `getattr`. No React bundle rebuild needed.
+Roll out together with (or right after) the IaC orchestrator release that stops sending raw `terraform`/`config`
+blocks, then rotate the credentials that were exposed (MO-01).
+
+### Security
+- **Inventory metadata is allow-listed (MO-01, critical).** The inventory sync copied the raw `terraform` block of every
+  host and the `config` block of every service into `metadata_json`, and `GET /dashboard` / `GET /monitors/{id}` returned
+  it to every reader. Only an allow-list of placement facts is stored now, and existing rows are scrubbed on start.
+- The SSRF guard covers ICMP and TCP monitors too; ICMP pings the validated address. A monitor on a loopback, link-local
+  or metadata address is DOWN ("blocked address"), never "refused". API replies show `target`/`address` without
+  `user:pw@` (MO-22).
+- `maintenance:override_started` from the bus is capped at start + max(`override_max_minutes`, 24 h);
+  `maintenance:windows_published` replaces the source's earlier windows only with an explicit `"replaces": true`
+  (it was the default); the origin of a quiesce request is logged (MO-17).
+- `POST /admin-override` (`update`) validates like an upsert: an interval below 10 s, a timeout of 0 or a wrong type is
+  HTTP 400 instead of being stored (MO-16).
+
+### Fixed
+- Probes have a hard deadline, DNS resolution runs off the event loop, probe kinds use their own pools, and an
+  unavailable ICMP socket is "unknown" instead of DOWN (MO-04, MO-05, MO-06, MO-07).
+- Alert suppression follows the current maintenance state, a DOWN is confirmed by a fresh probe before an outage is
+  persisted, and one `effective_state` is computed per CI (MO-02, MO-03, MO-12).
+- Every path that discards an outage emits `monitoring:outage_recovered`; outage events go through an outbox and survive
+  a restart between the state change and the emit (MO-08, MO-09).
+- A monitor whose parent is down is suppressed instead of opening its own outage (MO-10).
+- `health()` reports `probes_stale` when the prober stopped writing (MO-11).
+- The inventory stale-delete has a plausibility guard, deletes in batches and quiesces the prober first (MO-15).
+- The warm-up panel (503) is shown only for the very first sweep without data, afterwards a banner; losing the prober
+  lease stops probing only, and writes of probes started under the old lease are discarded (MO-14, MO-20).
+- The quiesce marker is renewed every TTL/2 (MO-18); naive timestamps are read as UTC (MO-19); the 00:05 roll-up
+  computes the day that ended (MO-21).
+
+### Changed
+- `GET /overview?hours=` rounds up to 24, 72 or 168 and returns the span it used in `hours`; the timeline aggregate is
+  computed once per span instead of per request (MO-13).
+
 ## [1.7.0] - 2026-10-18
 ### Added
 - Maintenance windows, overrides and the outage rule (core API ≥ 1.13, `core.api.maintenance`; `min_core_version` 1.11.0):
