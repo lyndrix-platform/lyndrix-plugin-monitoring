@@ -35,7 +35,7 @@ def test_manifest_fields():
 
     m = entrypoint.manifest
     # Keep these in sync with the manifest in entrypoint.py / the git tag.
-    assert m.version == "1.7.0"
+    assert m.version == "1.8.0"
     assert m.repo_url == "https://github.com/lyndrix-platform/lyndrix-plugin-monitoring"
     assert m.id == "lyndrix.plugin.state_monitoring"
     assert m.min_core_version == "1.13.0"

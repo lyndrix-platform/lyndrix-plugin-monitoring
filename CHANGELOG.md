@@ -5,11 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-Proposed version: **1.8.0** (security and reliability audit 2026-11; the manifest version is not bumped yet).
+## [1.8.0] - 2026-11-15
+Security and reliability audit 2026-11.
 Minimum core unchanged (API 1.13); newer core APIs are used only behind `getattr`. No React bundle rebuild needed.
 Roll out together with (or right after) the IaC orchestrator release that stops sending raw `terraform`/`config`
-blocks, then rotate the credentials that were exposed (MO-01).
+blocks. Recommendation, the owner decides: treat the credentials that were readable through the monitoring API as
+exposed (MO-01); the upgrade stops the exposure but does not invalidate them.
 
 ### Security
 - **Inventory metadata is allow-listed (MO-01, critical).** The inventory sync copied the raw `terraform` block of every
