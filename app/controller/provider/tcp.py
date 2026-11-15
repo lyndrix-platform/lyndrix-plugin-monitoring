@@ -42,9 +42,11 @@ async def run_tcp_probe(host: str, port: int, timeout_seconds: int) -> Dict[str,
     timeout = max(1, timeout_seconds)
     started = time.perf_counter()
     try:
+        # Same SSRF guard as the HTTP probe — a monitor on 127.0.0.1:8200 would be
+        # a port oracle for the core's own loopback services (MO-22).
         # Resolved on the probe DNS pool: ``open_connection`` with a name would
         # resolve on the loop's shared default executor (MO-07).
-        addresses = await resolve_probe_host(host, timeout=min(DNS_TIMEOUT_SECONDS, timeout), enforce=False)
+        addresses = await resolve_probe_host(host, timeout=min(DNS_TIMEOUT_SECONDS, timeout))
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(addresses[0], port), timeout=timeout
         )

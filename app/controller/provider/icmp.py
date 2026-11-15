@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 from ...model.models import MonitorState
 from ._executor import run_blocking
+from ._ssrf import DNS_TIMEOUT_SECONDS, ProbeResolutionError, ProbeTargetError, resolve_probe_host
 
 
 def _is_permission_error(exc: BaseException) -> bool:
@@ -37,6 +38,15 @@ async def run_icmp_probe(target: str, timeout_seconds: int) -> Dict[str, Any]:
     """One ICMP echo. Never raises for a probe outcome: ``state`` is UP, DOWN,
     or UNKNOWN with ``unavailable: True`` when this instance cannot ping at all."""
     timeout = max(1, int(timeout_seconds))
+    # Same guard as the HTTP probe: loopback/link-local/metadata targets are no
+    # legitimate monitoring subject, and the ping goes to the validated address
+    # (no second lookup between check and use) (MO-22).
+    try:
+        target = (await resolve_probe_host(target, timeout=min(DNS_TIMEOUT_SECONDS, float(timeout))))[0]
+    except ProbeResolutionError as exc:
+        return _down(f"ICMP probe failed: {exc}")  # the target did not resolve: a regular failed check
+    except ProbeTargetError as exc:
+        return _down(f"ICMP probe refused: {exc}")
     try:
         from icmplib import ping as icmp_ping
     except ModuleNotFoundError:

@@ -398,14 +398,30 @@ def safe_error_text(exc: BaseException) -> str:
     return str(exc)
 
 
+def strip_url_userinfo(value: Optional[str]) -> Optional[str]:
+    """``https://user:pw@host/x`` → ``https://host/x``. The plugin has no
+    credential fields, so basic-auth credentials can only sit in the URL; the
+    probe still uses the stored value, viewers never see it (MO-22)."""
+    if not value or "@" not in value or "://" not in value:
+        return value
+    scheme, rest = value.split("://", 1)
+    # The authority ends at the first "/", "?" or "#" — an "@" after that is part
+    # of the path or query, not userinfo.
+    end = next((i for i, ch in enumerate(rest) if ch in "/?#"), len(rest))
+    authority, tail = rest[:end], rest[end:]
+    if "@" not in authority:
+        return value
+    return f"{scheme}://{authority.rsplit('@', 1)[1]}{tail}"
+
+
 def _serialize_monitor(record: MonitorRecord) -> Dict[str, Any]:
     return {
         "monitor_id": record.monitor_id,
         "name": record.name,
         "monitor_type": record.monitor_type,
         "owner_source": record.owner_source,
-        "target": record.target,
-        "address": record.address,
+        "target": strip_url_userinfo(record.target),
+        "address": strip_url_userinfo(record.address),
         "host_name": record.host_name,
         "service_name": record.service_name,
         "logical_group": record.logical_group,

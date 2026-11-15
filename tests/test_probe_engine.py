@@ -345,7 +345,7 @@ def test_icmp_probes_do_not_occupy_the_default_executor(monkeypatch):
     assert _executor._pools == {}
 
 
-def test_tcp_probe_resolves_on_the_probe_dns_pool(monkeypatch):
+def test_tcp_probe_resolves_on_the_probe_dns_pool(monkeypatch, allow_loopback):
     from app.controller.provider import tcp as tcp_mod
     from app.model.models import MonitorState
 
@@ -463,10 +463,10 @@ def test_icmp_errors_that_are_about_the_target_stay_down(monkeypatch):
         pass
 
     def fake_ping(*a, **k):
-        raise NameLookupError("The name 'gone.lan' cannot be resolved")
+        raise NameLookupError("The name 'gone.lan' cannot be resolved")  # raised by icmplib itself
 
     monkeypatch.setitem(sys.modules, "icmplib", types.SimpleNamespace(ping=fake_ping))
-    result = asyncio.run(run_icmp_probe("gone.lan", 1))
+    result = asyncio.run(run_icmp_probe("10.0.0.9", 1))
     assert result["state"] == MonitorState.DOWN and "unavailable" not in result
 
 
@@ -490,3 +490,67 @@ def test_health_is_degraded_while_icmp_is_unavailable(svc, monkeypatch):
     before, degraded, after = asyncio.run(run())
     assert before.status == "ok" and after.status == "ok"
     assert degraded.status == "degraded" and degraded.details["reason"] == "icmp_unavailable"
+
+
+# ── MO-22: the SSRF guard covers every probe type ─────────────────────────────
+
+
+@pytest.mark.parametrize("target", ["127.0.0.1", "169.254.169.254", "::1", "0.0.0.0"])
+def test_tcp_probe_refuses_blocked_targets_without_connecting(monkeypatch, target):
+    from app.controller.provider import tcp as tcp_mod
+    from app.model.models import MonitorState
+
+    def boom(*a, **k):
+        raise AssertionError("must not connect")
+
+    monkeypatch.setattr(asyncio, "open_connection", boom)
+    result = asyncio.run(tcp_mod.run_tcp_probe(target, 8200, 2))
+    assert result["state"] == MonitorState.DOWN and "blocked address" in result["error_message"]
+    assert not result.get("refused")  # no port-oracle: "refused" would reveal a closed port
+
+
+@pytest.mark.parametrize("target", ["127.0.0.1", "169.254.169.254", "::1"])
+def test_icmp_probe_refuses_blocked_targets_without_pinging(monkeypatch, target):
+    from app.controller.provider.icmp import run_icmp_probe
+    from app.model.models import MonitorState
+
+    def boom(*a, **k):
+        raise AssertionError("must not ping")
+
+    monkeypatch.setitem(sys.modules, "icmplib", types.SimpleNamespace(ping=boom))
+    result = asyncio.run(run_icmp_probe(target, 1))
+    assert result["state"] == MonitorState.DOWN and "blocked address" in result["error_message"]
+    assert "unavailable" not in result
+
+
+def test_icmp_pings_the_validated_address_not_the_name(monkeypatch):
+    from app.controller.provider.icmp import run_icmp_probe
+    from app.model.models import MonitorState
+
+    _fake_dns(monkeypatch, {"gw.lan": ["10.4.4.4", "127.0.0.1"]})  # a second lookup would be a rebinding
+    seen = []
+
+    def fake_ping(target, count, timeout, privileged):
+        seen.append(target)
+        return types.SimpleNamespace(is_alive=True, avg_rtt=1.0, min_rtt=1.0)
+
+    monkeypatch.setitem(sys.modules, "icmplib", types.SimpleNamespace(ping=fake_ping))
+    result = asyncio.run(run_icmp_probe("gw.lan", 1))
+    assert result["state"] == MonitorState.UP and seen == ["10.4.4.4"]  # one lookup, the ping goes to its answer
+
+
+def test_url_userinfo_is_not_shown_to_viewers(svc):
+    from app.model.models import MonitorType, MonitorUpsert, strip_url_userinfo
+
+    assert strip_url_userinfo("https://user:p@ss@nas.lan:5001/x?a=b@c") == "https://nas.lan:5001/x?a=b@c"
+    assert strip_url_userinfo("https://nas.lan?next=a@b") == "https://nas.lan?next=a@b"  # no userinfo
+    assert strip_url_userinfo("10.0.0.1:22") == "10.0.0.1:22" and strip_url_userinfo(None) is None
+    svc.upsert_monitor(MonitorUpsert(monitor_id="service:nas", name="nas", monitor_type=MonitorType.SERVICE,
+                                     target="https://admin:dummy-token-not-real@nas.lan/status"), sync_scheduler=False)
+    item = svc.get_monitor("service:nas")
+    assert item["target"] == "https://nas.lan/status"
+    assert "dummy-token-not-real" not in str(svc.list_monitors()) and "dummy-token-not-real" not in str(item)
+    with svc._session() as s:  # the probe itself still uses the stored URL
+        from app.model.models import MonitorRecord
+
+        assert "dummy-token-not-real" in s.get(MonitorRecord, "service:nas").target
