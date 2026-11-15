@@ -18,7 +18,7 @@ exposed (MO-01); the upgrade stops the exposure but does not invalidate them.
   it to every reader. Only an allow-list of placement facts is stored now, and existing rows are scrubbed on start.
 - The SSRF guard covers ICMP and TCP monitors too; ICMP pings the validated address. A monitor on a loopback, link-local
   or metadata address is DOWN ("blocked address"), never "refused". API replies show `target`/`address` without
-  `user:pw@` (MO-22).
+  `user:pw@` (MO-22). Probe error texts (`latest_error`, heartbeats, outages, logs, bus events) lose `user:pw@` too.
 - `maintenance:override_started` from the bus is capped at start + max(`override_max_minutes`, 24 h);
   `maintenance:windows_published` replaces the source's earlier windows only with an explicit `"replaces": true`
   (it was the default); the origin of a quiesce request is logged (MO-17).

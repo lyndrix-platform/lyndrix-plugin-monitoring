@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -414,6 +415,21 @@ def strip_url_userinfo(value: Optional[str]) -> Optional[str]:
     return f"{scheme}://{authority.rsplit('@', 1)[1]}{tail}"
 
 
+_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/?#]*@")
+
+
+def redact_url_userinfo(text: Optional[str]) -> Optional[str]:
+    """Drop ``user:pw@`` from every URL inside free text (error messages).
+
+    ``strip_url_userinfo`` handles a bare URL field; probe failures echo the
+    probe URL inside a sentence (httpx/OS errors, "target '…'"), and that text
+    is persisted, logged and emitted — it must never carry credentials (MO-22).
+    """
+    if not text or "@" not in text:
+        return text
+    return _URL_USERINFO_RE.sub(r"\1", str(text))
+
+
 def _serialize_monitor(record: MonitorRecord) -> Dict[str, Any]:
     return {
         "monitor_id": record.monitor_id,
@@ -436,7 +452,7 @@ def _serialize_monitor(record: MonitorRecord) -> Dict[str, Any]:
         "host_ci_id": record.host_ci_id,
         "latest_state": record.latest_state,
         "latest_latency_ms": record.latest_latency_ms,
-        "latest_error": record.latest_error,
+        "latest_error": redact_url_userinfo(record.latest_error),
         "last_checked_at": record.last_checked_at.isoformat() if record.last_checked_at else None,
         "is_admin_overridden": record.is_admin_overridden,
         "uptime_24h": round(record.uptime_24h or 0.0, 2),

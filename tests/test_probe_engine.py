@@ -554,3 +554,62 @@ def test_url_userinfo_is_not_shown_to_viewers(svc):
         from app.model.models import MonitorRecord
 
         assert "dummy-token-not-real" in s.get(MonitorRecord, "service:nas").target
+
+
+# ── MO-22 leftover: URL userinfo never reaches stored/returned/logged/emitted error text ──
+
+_SECRET = "dummy-pass-not-real"
+
+
+def _failing(kind):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if kind == "status":
+            return httpx.Response(503)
+        # Real transport errors often echo the request URL (with userinfo).
+        exc = {"connect": httpx.ConnectError, "timeout": httpx.ConnectTimeout,
+               "tls": httpx.ConnectError}[kind]
+        text = f"[SSL: CERTIFICATE_VERIFY_FAILED] for {request.url}" if kind == "tls" else f"failed to reach {request.url}"
+        raise exc(text, request=request)
+    return handler
+
+
+@pytest.mark.parametrize("kind", ["connect", "timeout", "tls", "status", "generic"])
+def test_probe_errors_never_carry_url_credentials(svc, monkeypatch, kind):
+    from app.model.models import MonitorHeartbeat, MonitorType, MonitorUpsert
+
+    _fake_dns(monkeypatch, {"probe.example.test": "10.1.2.3"})
+    logs = []
+    svc.ctx.log = types.SimpleNamespace(**{n: (lambda m, *a, **k: logs.append(str(m)))
+                                           for n in ("info", "warning", "debug", "error")})
+    url = f"https://user:{_SECRET}@probe.example.test/health?next=a@b"
+    svc.upsert_monitor(MonitorUpsert(monitor_id="svc:cred", name="cred", monitor_type=MonitorType.HTTP,
+                                     target=url), sync_scheduler=False)
+    for _ in range(2):  # a DOWN monitor is not flap-dampened
+        _base._beat(svc, "svc:cred", "DOWN")
+
+    if kind == "generic":
+        async def boom(*a, **k):
+            raise RuntimeError(f"unexpected failure talking to {url}")
+        monkeypatch.setattr("app.controller.service.run_http_probe", boom)
+        svc.http_client = httpx.AsyncClient()
+    else:
+        svc.http_client = httpx.AsyncClient(transport=httpx.MockTransport(_failing(kind)))
+    asyncio.run(svc.run_scheduled_probe("svc:cred", force=True))
+
+    item = svc.get_monitor("svc:cred")
+    assert item["latest_state"] == "DOWN" and item["latest_error"]
+    with svc._session() as s:
+        rows = [h.error_message for h in s.query(MonitorHeartbeat).filter(MonitorHeartbeat.monitor_id == "svc:cred")]
+    assert any(rows)
+    blobs = [repr(item), repr(svc.list_monitors()), repr(rows), repr(svc.ctx.events), *logs]
+    assert not any(_SECRET in b or "user:" in b for b in blobs), blobs
+    if kind in {"connect", "tls"}:
+        assert "probe" in item["latest_error"] or "10.1.2.3" in item["latest_error"]  # still diagnosable
+
+
+def test_redact_url_userinfo_edge_cases():
+    from app.model.models import redact_url_userinfo as r
+
+    assert r(None) is None and r("plain error") == "plain error"
+    assert r("x https://u:p@h:8/p?q=a@b y http://v@w/") == "x https://h:8/p?q=a@b y http://w/"
+    assert r("mail me at a@b.de") == "mail me at a@b.de"

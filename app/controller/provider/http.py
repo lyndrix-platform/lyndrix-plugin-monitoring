@@ -6,7 +6,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from ...model.models import MonitorState
+from ...model.models import MonitorState, redact_url_userinfo
 from ._ssrf import DNS_TIMEOUT_SECONDS, ProbeTargetError, assert_scheme_allowed, resolve_probe_host
 
 # Redirect hops we will manually follow per probe (mirrors a sane
@@ -25,7 +25,7 @@ def is_http_target(value: Optional[str]) -> bool:
 
 
 def _down(message: str, latency_ms: Optional[float] = None) -> Dict[str, Any]:
-    return {"state": MonitorState.DOWN, "latency_ms": latency_ms, "error_message": message}
+    return {"state": MonitorState.DOWN, "latency_ms": latency_ms, "error_message": redact_url_userinfo(message)}
 
 
 async def pin_request(url: str, timeout_seconds: float) -> Tuple[httpx.URL, Dict[str, str], Dict[str, Any]]:
@@ -106,6 +106,11 @@ async def run_http_probe(client: httpx.AsyncClient, target: str, timeout_seconds
     except ProbeTargetError as exc:
         # Blocked by the SSRF guard or unresolvable — a check failure.
         return _down(str(exc))
+    except httpx.HTTPError as exc:
+        # Transport errors (connect, TLS, timeout, protocol) may echo the URL;
+        # report the class plus the redacted text instead of letting the raw
+        # exception reach the generic handler.
+        return _down(f"{type(exc).__name__}: {exc}".rstrip(": "))
 
 
 async def _walk_redirects(client: httpx.AsyncClient, target: str, timeout: float) -> Dict[str, Any]:

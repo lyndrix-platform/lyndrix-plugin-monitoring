@@ -36,6 +36,7 @@ from ..model.models import (
     sanitized_metadata_json,
     _uptime_from_aggregates,
     _utc_now,
+    redact_url_userinfo,
 )
 from ..ui.styles import aggregate_state
 from .maintenance import (
@@ -777,7 +778,7 @@ class MonitoringService:
             self._note_icmp_result(result)
             return result["state"], result["latency_ms"], result["error_message"]
 
-        return MonitorState.UNKNOWN, None, f"No supported probe strategy for target '{target}'"
+        return MonitorState.UNKNOWN, None, f"No supported probe strategy for target '{redact_url_userinfo(target)}'"
 
     def _note_icmp_result(self, result: Dict[str, Any]) -> bool:
         """Remember whether ICMP is usable on this instance (health + one log
@@ -1950,6 +1951,9 @@ class MonitoringService:
         same transaction; recovery events are queued on the session and emitted
         by the caller after ``commit()`` (``_flush_session_events``).
         """
+        # Single chokepoint for everything persisted or emitted from a result
+        # (heartbeat, latest_error, outage row, bus events), probe or passive.
+        error_message = redact_url_userinfo(error_message)
         current_time = timestamp or _utc_now()
         if current_time.tzinfo is None:
             current_time = current_time.replace(tzinfo=timezone.utc)
@@ -2690,7 +2694,7 @@ class MonitoringService:
                 error_message = "Probe deadline exceeded"
             except Exception as exc:
                 state = MonitorState.DOWN
-                error_message = str(exc)
+                error_message = redact_url_userinfo(str(exc))
 
             if state != MonitorState.DOWN:
                 # Recovery: clear this monitor's and its host's failure state.

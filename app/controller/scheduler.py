@@ -5,7 +5,7 @@ from datetime import timedelta
 from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
-from ..model.models import _utc_now
+from ..model.models import _utc_now, redact_url_userinfo as _redact
 
 
 @dataclass
@@ -118,7 +118,7 @@ class SimpleAsyncScheduler:
             raise
         except Exception as exc:
             try:
-                self._log.warning(f"State Monitoring: scheduled job '{job_id}' failed: {exc}")
+                self._log.warning(f"State Monitoring: scheduled job '{job_id}' failed: {_redact(str(exc))}")
             except Exception:
                 pass
             return False
