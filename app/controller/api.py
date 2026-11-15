@@ -68,7 +68,7 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
                 status_code=400,
                 detail=f"Unknown group_by '{group_by}' (expected one of {', '.join(sorted(_GROUP_ICONS))})",
             )
-        hours = max(1, min(int(hours), 168))
+        hours = service.normalize_timeline_hours(hours)
         return await service.overview(
             group_by=group_by, hours=hours,
             include_paused=include_paused, include_unknown=include_unknown,

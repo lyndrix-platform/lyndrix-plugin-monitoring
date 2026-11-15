@@ -1788,18 +1788,44 @@ class MonitoringService:
     # Computed views (React UI) — cached, single-flight
     # ------------------------------------------------------------------
 
+    # The timeline aggregate is the expensive part of a view (monitors × hours ×
+    # samples rows touched), so callers may only pick from a few spans. Anything
+    # else snaps UP to the next one: every distinct value used to be its own
+    # multi-million-row query (MO-13).
+    TIMELINE_HOURS = (24, 72, 168)
+
+    @classmethod
+    def normalize_timeline_hours(cls, hours: Any) -> int:
+        try:
+            wanted = int(hours)
+        except (TypeError, ValueError):
+            return cls.TIMELINE_HOURS[0]
+        return next((h for h in cls.TIMELINE_HOURS if wanted <= h), cls.TIMELINE_HOURS[-1])
+
+    async def timelines(self, monitor_ids: List[str], hours: int = 24) -> Dict[str, List[str]]:
+        """Cached ``get_timelines``. The key holds ``hours`` only — the buckets do
+        not depend on grouping or filters, so every ``group_by`` variant and
+        every UI shares one aggregate per span."""
+        hours = self.normalize_timeline_hours(hours)
+
+        async def _compute() -> Dict[str, List[str]]:
+            return await asyncio.to_thread(self.get_timelines, monitor_ids, hours)
+
+        return await self._cached(f"timelines|{hours}", _compute)
+
     async def overview(self, *, group_by: str = "site", hours: int = 24,
                        include_paused: bool = True, include_unknown: bool = True) -> Dict[str, Any]:
         """Grouped + flat overview for the React UI. Reuses the pure helpers the
         NiceGUI dashboard uses, with timelines bucketed in SQL."""
         from .helpers import build_grouped_overview, flatten_monitors
 
+        hours = self.normalize_timeline_hours(hours)
         key = f"overview|{group_by}|{hours}|{include_paused}|{include_unknown}"
 
         async def _compute() -> Dict[str, Any]:
             monitors = await asyncio.to_thread(self.list_monitors)
             ids = [m["monitor_id"] for m in monitors]
-            timelines = await asyncio.to_thread(self.get_timelines, ids, hours)
+            timelines = await self.timelines(ids, hours)
             groups = build_grouped_overview(
                 monitors, {}, group_by=group_by, include_paused=include_paused,
                 include_unknown=include_unknown, timelines=timelines,

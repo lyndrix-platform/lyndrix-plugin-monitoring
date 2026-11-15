@@ -482,6 +482,10 @@ def _uptime_from_aggregates(session, monitor_ids: List[str], days: int = 30) -> 
     return percentages
 
 
+# TODO(agent): MO-13 — make ix_monitoring_heartbeats_monitor_created covering
+# (monitor_id, created_at, state) and drop the redundant single-column monitor_id
+# index. Needs a guarded online migration (create_all never alters existing
+# tables), so it is not part of this change.
 def _hourly_state_counts(session, monitor_ids: List[str], hours: int = 24) -> Dict[str, List[Dict[str, int]]]:
     """Per monitor, ``hours`` buckets (oldest first) of heartbeat counts by state,
     bucketed by the database: ``{monitor_id: [{"UP": n, "DOWN": n, ...}, ...]}``.

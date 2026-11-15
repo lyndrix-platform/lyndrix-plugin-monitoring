@@ -15,7 +15,7 @@ from .views.table import render_table_view
 async def render_monitoring_page(ctx, svc):
     prefs = load_prefs()
     # Shared cache so prefs changes can re-render without re-fetching.
-    data_cache: dict = {"monitors": [], "histories": {}, "loaded": False}
+    data_cache: dict = {"monitors": [], "timelines": {}, "loaded": False}
 
     # ── Centered header strip (max-w-7xl) ───────────────────────────────
     # The header card + stats + toolbar stay in a centered column so
@@ -83,29 +83,29 @@ async def render_monitoring_page(ctx, svc):
             return
         data_container.clear()
         with data_container:
-            _dispatch(prefs, data_cache["monitors"], data_cache["histories"])
+            _dispatch(prefs, data_cache["monitors"], data_cache["timelines"])
 
-    def _dispatch(p, monitors, histories) -> None:
+    def _dispatch(p, monitors, timelines) -> None:
+        # Timelines are bucketed in SQL (service.timelines, cached per span);
+        # the views get no raw heartbeats (MO-13).
         if p.view_mode == "table":
-            render_table_view(ctx, svc, monitors, histories, p)
+            render_table_view(ctx, svc, monitors, {}, p, timelines=timelines)
         elif p.view_mode == "split":
-            render_split_view(ctx, svc, monitors, histories, p)
+            render_split_view(ctx, svc, monitors, {}, p, timelines=timelines)
         else:
-            render_cards_view(ctx, svc, monitors, histories, p)
+            render_cards_view(ctx, svc, monitors, {}, p, timelines=timelines)
 
     async def _fetch_and_render() -> None:
         stats_map, monitors_data = await asyncio.gather(
             asyncio.to_thread(svc.stats),
             asyncio.to_thread(svc.list_monitors),
         )
-        histories_data = await asyncio.to_thread(
-            svc.get_histories, [m["monitor_id"] for m in monitors_data], 24
-        )
+        timelines_data = await svc.timelines([m["monitor_id"] for m in monitors_data], 24)
         for key, lbl in stat_labels.items():
             v = stats_map.get(key, 0)
             lbl.set_text(f"{v:.1f}%" if key == "uptime_all" else str(v))
         data_cache["monitors"] = monitors_data
-        data_cache["histories"] = histories_data
+        data_cache["timelines"] = timelines_data
         data_cache["loaded"] = True
         _rerender()
 
