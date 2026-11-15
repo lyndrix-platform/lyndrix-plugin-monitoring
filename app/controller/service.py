@@ -627,6 +627,12 @@ class MonitoringService:
         payload = payload or {}
         if not payload.get("_origin"):
             return  # our own request was applied locally already
+        # Any plugin may emit this topic (permissions are self-declared), so every
+        # request leaves a trace of who asked (MO-17).
+        self.ctx.log.info(
+            f"State Monitoring: quiesce {'on' if payload.get('on') else 'off'} requested by "
+            f"{payload.get('_origin')} (ttl={payload.get('ttl')})."
+        )
         self.apply_quiesce(bool(payload.get("on")), payload.get("ttl"))
 
     @asynccontextmanager

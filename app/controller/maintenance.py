@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, overload
 
@@ -51,6 +51,8 @@ MANUAL_SOURCE = "monitoring"
 #: peers to reload their maintenance cache (``"maintenance"`` already means
 #: "destructive maintenance ran, reload your probe jobs").
 CHANGE_REASON = "maintenance_windows"
+# Floor for the cap on overrides that arrive over the bus (see on_override_started).
+BUS_OVERRIDE_MIN_CAP_MINUTES = 24 * 60
 #: Kinds with a dedicated on/off setting; every other kind is governed by
 #: ``outage_rules_disabled_kinds`` (kinds are open, decision A).
 SWITCHED_KINDS = ("hypervisor", "host", "service", "container")
@@ -1067,7 +1069,10 @@ class MaintenanceManager:
             normalize_item(it, log=self.log) for it in (payload.get("items") or [])
         ]
         valid = [it for it in items if it is not None]
-        if payload.get("replaces", True):
+        # Replacing is opt-in: a publisher that forgets the flag (or a bug in an
+        # unrelated plugin using someone else's source name) must not wipe that
+        # source's earlier windows (MO-17).
+        if payload.get("replaces") is True:
             n = self.store.replace_windows(source, valid)
         else:
             n = self.store.upsert_items(source, valid)
@@ -1082,6 +1087,16 @@ class MaintenanceManager:
         if payload.get("source") == MANUAL_SOURCE:
             return False
         override = mw.override_from_payload(payload)
+        # Manual overrides are capped at override_max_minutes; bus overrides get a
+        # generous cap of their own so a publisher bug (no end, until=2099) cannot
+        # silence a CI's outages indefinitely (MO-17).
+        cap = timedelta(minutes=max(self.settings.override_max_minutes, BUS_OVERRIDE_MIN_CAP_MINUTES))
+        if override.until > override.started_at + cap:
+            self.log.warning(
+                f"State Monitoring: override '{override.override_id}' from "
+                f"'{override.source or '?'}' ends after {cap} — capped."
+            )
+            override = replace(override, until=override.started_at + cap)
         self.store.upsert_override(override)
         self.after_local_change()
         return True
