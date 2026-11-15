@@ -36,7 +36,14 @@ from ..model.models import (
     _utc_now,
 )
 from ..ui.styles import aggregate_state
-from .maintenance import CHANGE_REASON, MaintenanceManager, MaintenanceStore
+from .maintenance import (
+    CHANGE_REASON,
+    RECOVERY_PAUSED,
+    RECOVERY_REMOVED,
+    RECOVERY_RESET,
+    MaintenanceManager,
+    MaintenanceStore,
+)
 from .scheduler import SimpleAsyncScheduler
 from .provider.http import is_http_target, run_http_probe
 from .provider.icmp import run_icmp_probe
@@ -1945,6 +1952,9 @@ class MonitoringService:
                 record.updated_at = _utc_now()
                 if not data.enabled:
                     record.latest_state = MonitorState.PAUSED.value
+                    # A disabled monitor is not probed: no outage clock, and a
+                    # reported outage is closed (nobody would ever recover it).
+                    self.maintenance.close_outages(session, [record.monitor_id], RECOVERY_PAUSED)
             else:
                 record = MonitorRecord(
                     monitor_id=data.monitor_id,
@@ -1970,6 +1980,7 @@ class MonitoringService:
                 )
                 session.add(record)
             session.commit()
+            self._flush_session_events(session)
             session.refresh(record)
             self.maintenance.cache.note_monitor(record)  # host → ci map for service fallbacks
             if sync_scheduler:
@@ -1994,8 +2005,9 @@ class MonitoringService:
                 record.enabled = False
                 record.latest_state = MonitorState.PAUSED.value
                 record.latest_error = None
-                # A paused monitor has no outage clock (nothing is probed).
-                MaintenanceStore.delete_outages_in(session, [record.monitor_id])
+                # A paused monitor has no outage clock (nothing is probed); a
+                # reported outage is closed with outage_recovered(reason=paused).
+                self.maintenance.close_outages(session, [record.monitor_id], RECOVERY_PAUSED)
                 self._emit_transition(record, previous_state, None)
             elif request.action == "resume":
                 record.enabled = True
@@ -2012,6 +2024,7 @@ class MonitoringService:
                     merged.update(metadata_patch)
                     record.metadata_json = json.dumps(sanitize_metadata(merged), sort_keys=True)
             session.commit()
+            self._flush_session_events(session)
             session.refresh(record)
             self._sync_job_for_monitor(record)
             self._notify_monitors_changed("override", count=1)
@@ -2095,8 +2108,10 @@ class MonitoringService:
             deleted = self._delete_heartbeats_for(session, None)
 
             def _rest() -> None:
+                session.info.pop("monitoring_events", None)  # a retried attempt queues again
                 session.query(MonitorDailyAggregate).delete(synchronize_session=False)
-                MaintenanceStore.delete_outages_in(session, None)  # clocks restart with the states
+                # Clocks restart with the states; reported outages are closed.
+                self.maintenance.close_outages(session, None, RECOVERY_RESET)
                 session.query(MonitorRecord).update(
                     {
                         MonitorRecord.latest_state: MonitorState.UNKNOWN.value,
@@ -2111,6 +2126,7 @@ class MonitoringService:
                 session.commit()
 
             self._retrying(session, _rest)
+            self._flush_session_events(session)
             return deleted
         finally:
             session.close()
@@ -2236,10 +2252,11 @@ class MonitoringService:
                 result["heartbeats"] += self._delete_heartbeats_for(session, chunk)
 
                 def _rest() -> int:
+                    session.info.pop("monitoring_events", None)  # a retried attempt queues again
                     n = session.query(MonitorDailyAggregate).filter(
                         MonitorDailyAggregate.monitor_id.in_(chunk)
                     ).delete(synchronize_session=False)
-                    MaintenanceStore.delete_outages_in(session, chunk)
+                    self.maintenance.close_outages(session, chunk, RECOVERY_REMOVED)
                     # Manual windows pinned to a deleted monitor go with it; CI-level
                     # windows stay (the CI may come back under a new monitor).
                     session.query(MaintenanceWindowRecord).filter(
@@ -2252,6 +2269,7 @@ class MonitoringService:
                     return n
 
                 result["aggregates"] += self._retrying(session, _rest)
+                self._flush_session_events(session)
             result["monitors"] = len(ids)
             return result
         finally:

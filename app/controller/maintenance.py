@@ -58,6 +58,14 @@ OUTAGE_OPEN = "open"
 OUTAGE_PERSISTED = "persisted"
 OUTAGE_RECOVERED = "recovered"
 
+#: ``reason`` of ``monitoring:outage_recovered`` (additive payload field): the
+#: monitor answered again, or the reported outage was dropped for another cause
+#: — a consumer must close its incident either way (MO-08).
+RECOVERY_RECOVERED = "recovered"
+RECOVERY_PAUSED = "paused"
+RECOVERY_REMOVED = "monitor_removed"
+RECOVERY_RESET = "reset"
+
 
 # --------------------------------------------------------------------------- #
 # Time helpers — tables hold naive UTC, core.api.maintenance wants aware UTC
@@ -1416,22 +1424,57 @@ class MaintenanceManager:
                 )
             )
             if n == 1 and row.outage_id and row.ci_id:
-                since = aware(row.down_since)
-                session.info.setdefault("monitoring_events", []).append(
-                    (
-                        mw.TOPIC_OUTAGE_RECOVERED,
-                        {
-                            "outage_id": row.outage_id,
-                            "ci_id": row.ci_id,
-                            "since": mw.iso(since),
-                            "recovered_at": mw.iso(aware(now)),
-                            "duration_s": int((aware(now) - since).total_seconds()),
-                        },
-                    )
+                self.queue_event(
+                    session,
+                    mw.TOPIC_OUTAGE_RECOVERED,
+                    self.recovered_payload(row, aware(now), RECOVERY_RECOVERED),
                 )
         session.query(OutageRecord).filter(
             OutageRecord.monitor_id == record.monitor_id
         ).delete(synchronize_session=False)
+
+    @staticmethod
+    def recovered_payload(row: OutageRecord, now: datetime, reason: str) -> Dict[str, Any]:
+        since = aware(row.down_since)
+        return {
+            "outage_id": row.outage_id,
+            "ci_id": row.ci_id,
+            "since": mw.iso(since),
+            "recovered_at": mw.iso(now),
+            "duration_s": max(0, int((now - since).total_seconds())),
+            "reason": reason,
+        }
+
+    @staticmethod
+    def queue_event(session, topic: str, payload: Dict[str, Any]) -> None:
+        """Queue an outage event on the caller's transaction; it is emitted by
+        ``flush_session_events`` after the commit (never for a rolled-back change)."""
+        session.info.setdefault("monitoring_events", []).append((topic, payload))
+
+    def close_outages(
+        self,
+        session,
+        monitor_ids: Optional[Sequence[str]],
+        reason: str,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Drop the outage clocks of ``monitor_ids`` (``None`` = all) inside the
+        caller's transaction. A REPORTED outage is closed with
+        ``monitoring:outage_recovered`` (``reason`` says why) — pausing, deleting
+        or resetting a monitor used to delete the row silently and the ITSM
+        incident stayed open forever (MO-08). Returns the rows removed."""
+        if monitor_ids is not None and not monitor_ids:
+            return 0
+        now_aware = aware(now) if now is not None else mw.utcnow()
+        q = session.query(OutageRecord).filter(OutageRecord.state == OUTAGE_PERSISTED)
+        if monitor_ids is not None:
+            q = q.filter(OutageRecord.monitor_id.in_(list(monitor_ids)))
+        for row in q.all():
+            if row.outage_id and row.ci_id:
+                self.queue_event(
+                    session, mw.TOPIC_OUTAGE_RECOVERED, self.recovered_payload(row, now_aware, reason)
+                )
+        return self.store.delete_outages_in(session, monitor_ids)
 
     @staticmethod
     def flush_session_events(session, emit) -> int:
