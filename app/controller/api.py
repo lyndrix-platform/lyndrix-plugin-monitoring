@@ -122,6 +122,8 @@ def build_plugin_router(service: MonitoringService) -> APIRouter:
             return await asyncio.to_thread(service.apply_admin_override, payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"Unknown monitor: {payload.monitor_id}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/inventory-sync")
     async def inventory_sync(

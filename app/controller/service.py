@@ -11,6 +11,7 @@ from sqlalchemy import case, func, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from core.api import db_instance
+from pydantic import ValidationError
 
 from ..model.models import (
     UPTIME_EXCLUDED_STATES,
@@ -2202,9 +2203,24 @@ class MonitoringService:
                     record.latest_state = MonitorState.UNKNOWN.value
             elif request.action == "update":
                 allowed = {"name", "target", "address", "host_name", "service_name", "logical_group", "interval_seconds", "timeout_seconds", "enabled"}
-                for key, value in request.patch.items():
-                    if key in allowed:
-                        setattr(record, key, value)
+                patch = {k: v for k, v in request.patch.items() if k in allowed}
+                # The patch gets the same bounds and types as an upsert: an interval
+                # of 1 s is a write storm, "60" as a string unschedules the monitor
+                # silently, a timeout of 0 is a permanent DOWN (MO-16).
+                try:
+                    # Only the patched keys are checked (and copied back): rows stored
+                    # before the bounds existed must stay patchable in other fields.
+                    checked = MonitorUpsert(**{
+                        "monitor_id": record.monitor_id, "name": record.name,
+                        "monitor_type": MonitorType(record.monitor_type), **patch,
+                    })
+                except ValidationError as exc:
+                    problems = "; ".join(
+                        f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}" for e in exc.errors()
+                    )
+                    raise ValueError(f"Invalid patch: {problems}") from None
+                for key in patch:
+                    setattr(record, key, getattr(checked, key))
                 metadata_patch = request.patch.get("metadata")
                 if isinstance(metadata_patch, dict):
                     merged = _safe_json_load(record.metadata_json)
