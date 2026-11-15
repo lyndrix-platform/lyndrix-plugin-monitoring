@@ -314,7 +314,8 @@ async def health(ctx) -> PluginHealthStatus:
         )
 
     try:
-        counts = await asyncio.to_thread(svc.status_counts)
+        # Both are single narrow reads of the monitor table (never heartbeats).
+        counts, freshness = await asyncio.to_thread(lambda: (svc.status_counts(), svc.probe_freshness()))
     except Exception as exc:
         return PluginHealthStatus(
             status="error",
@@ -336,12 +337,25 @@ async def health(ctx) -> PluginHealthStatus:
         "monitors_up": counts.get("up_count", 0),
         "monitors_down": counts.get("down_count", 0),
         "monitors_maintenance": counts.get("maintenance_count", 0),
+        "last_probe_at": freshness.get("last_probe_at"),
+        "last_probe_age_s": freshness.get("last_probe_age_s"),
+        "monitors_stale": freshness.get("stale", 0),
     }
     # Loop alive + DB reachable, but nothing is being watched yet.
     if not counts.get("monitor_count"):
         return PluginHealthStatus(
             status="degraded",
             details={**details, "reason": "no_monitors_configured"},
+            latency_ms=latency,
+        )
+    if freshness.get("probes_stale"):
+        # Read from the shared DB, so a standby reports it too: nobody (or not
+        # everybody) is probing — no live prober, probe_roles matching no
+        # instance, a dead shard owner or a wedged prober. States shown are old.
+        return PluginHealthStatus(
+            status="degraded",
+            details={**details, "reason": "probes_stale",
+                     "hint": "no recent probe results — check the prober instance / probe_roles"},
             latency_ms=latency,
         )
     if getattr(svc, "icmp_unavailable", False):

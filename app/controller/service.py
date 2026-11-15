@@ -1514,6 +1514,68 @@ class MonitoringService:
         finally:
             session.close()
 
+    #: A monitor counts as stale when nothing was stored for it for this many
+    #: probe intervals (plus the longest circuit-breaker pause, during which a
+    #: service on a dead host is legitimately not probed).
+    STALE_PROBE_INTERVALS = 3
+    #: Share of stale monitors from which health() reports ``probes_stale``.
+    STALE_PROBE_SHARE = 0.2
+
+    def probe_freshness(self) -> Dict[str, Any]:
+        """Is anybody probing? Read from the shared monitor table, so every
+        instance — also a standby that never probes — sees it (MO-11): no prober
+        alive, ``probe_roles`` matching no instance or a wedged prober all leave
+        ``last_checked_at`` standing still while every state stays "UP".
+
+        One narrow query (three columns of the enabled monitors); cheap enough
+        for health(). Passive-only and paused monitors are not expected to move."""
+        result: Dict[str, Any] = {"probeable": 0, "stale": 0, "last_probe_at": None, "last_probe_age_s": None,
+                                  "probes_stale": False}
+        session = self._session()
+        if not session:
+            return result
+        try:
+            rows = (
+                session.query(
+                    MonitorRecord.interval_seconds, MonitorRecord.last_checked_at, MonitorRecord.created_at,
+                    MonitorRecord.target, MonitorRecord.address,
+                )
+                .filter(MonitorRecord.enabled.is_(True), MonitorRecord.latest_state != MonitorState.PAUSED.value)
+                .all()
+            )
+        finally:
+            session.close()
+
+        def _aware(value):
+            if value is None:
+                return None
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+        now = _utc_now()
+        slack = self._circuit_cap()
+        newest = None
+        for interval, last_checked, created, target, address in rows:
+            if not (target or address):
+                continue  # passive monitor: fed by reporters, not by us
+            result["probeable"] += 1
+            last_checked = _aware(last_checked)
+            if last_checked is not None and (newest is None or last_checked > newest):
+                newest = last_checked
+            # A monitor that was never probed is measured from its creation.
+            reference = last_checked or _aware(created) or now
+            limit = self.STALE_PROBE_INTERVALS * max(10, int(interval or 60)) + slack
+            if (now - reference).total_seconds() > limit:
+                result["stale"] += 1
+        if newest is not None:
+            result["last_probe_at"] = newest.isoformat()
+            result["last_probe_age_s"] = max(0, int((now - newest).total_seconds()))
+        if result["stale"]:
+            result["probes_stale"] = (
+                result["stale"] == result["probeable"]
+                or result["stale"] >= max(1.0, self.STALE_PROBE_SHARE * result["probeable"])
+            )
+        return result
+
     _STATE_COUNT_KEYS = {
         MonitorState.UP.value: "up_count",
         MonitorState.DOWN.value: "down_count",
