@@ -230,7 +230,22 @@ class MonitoringService:
         loop; the events it emits are marshalled back by ``_emit``."""
         if self._stopping or not self._probing:
             return {}
-        return await asyncio.to_thread(self.maintenance.evaluate_outages)
+        # An outage is only reported for a DOWN that a fresh probe just confirmed:
+        # the stored state can be minutes old (host circuit breaker, a probe that
+        # was skipped while quiesced) and the host may be back (MO-03).
+        dry = await asyncio.to_thread(lambda: self.maintenance.evaluate_outages(dry_run=True))
+        due = dry.get("due") or []
+        if not due:
+            return dry
+        confirmed = {mid for mid, probeable in due if not probeable}  # passive monitors: nothing to probe
+        probeable = [mid for mid, can_probe in due if can_probe]
+        results = await asyncio.gather(
+            *(self.run_scheduled_probe(mid, force=True) for mid in probeable), return_exceptions=True
+        )
+        confirmed.update(mid for mid, state in zip(probeable, results) if state == MonitorState.DOWN)
+        if not confirmed:
+            return dry
+        return await asyncio.to_thread(lambda: self.maintenance.evaluate_outages(confirmed=confirmed))
 
     def housekeeping_here(self) -> bool:
         """Global housekeeping (prune, rollups, uptime windows) runs on one
@@ -634,6 +649,9 @@ class MonitoringService:
                 "latest_state": record.latest_state,
                 "timeout_seconds": record.timeout_seconds,
                 "metadata": sanitize_metadata(_safe_json_load(record.metadata_json)),
+                # For the maintenance lookup of the circuit breaker (state_for).
+                "ci_id": record.ci_id,
+                "host_ci_id": record.host_ci_id,
             }
         finally:
             session.close()
@@ -2344,7 +2362,36 @@ class MonitoringService:
         parts = monitor_id.split(":")
         return parts[1] if len(parts) >= 2 and parts[1] else monitor_id
 
-    async def run_scheduled_probe(self, monitor_id: str):
+    def _circuit_cap(self) -> float:
+        """Longest pause of an open host circuit. Half the default outage delay
+        (``offline_minutes``), so a host that came back is probed again well
+        before its outage would be reported — the fixed 30 min cap left hosts
+        unprobed far beyond that (MO-03)."""
+        minutes = self.maintenance.settings.default_offline_minutes
+        if minutes <= 0:
+            return self._host_circuit_max
+        return min(self._host_circuit_max, max(60.0, minutes * 60.0 / 2))
+
+    def _circuit_bypass(self, record_data: Dict[str, Any], host_key: str) -> bool:
+        """Whether a probe runs although its host circuit is open.
+
+        * The host's own (``server``) monitor is the breaker's canary: it is
+          probed every interval, and its first success closes the circuit for
+          the dependent service monitors. Skipping it too meant nobody noticed
+          the host coming back for up to the whole backoff.
+        * A monitor still shown as MAINTENANCE whose maintenance is over: the
+          failures that opened the circuit happened inside the window. Close the
+          circuit and look again now, before the outage clock runs out."""
+        if record_data.get("monitor_type") == MonitorType.SERVER.value:
+            return True
+        if record_data.get("latest_state") == MonitorState.MAINTENANCE.value:
+            if not self.maintenance.cache.state_for(record_data, _utc_now()).active:
+                self._host_failures.pop(host_key, None)
+                self._host_circuit_until.pop(host_key, None)
+                return True
+        return False
+
+    async def run_scheduled_probe(self, monitor_id: str, force: bool = False) -> Optional[MonitorState]:
         """Run a single probe without blocking the event loop.
 
         Phase 1 – DB read  (thread): load record fields.
@@ -2355,25 +2402,28 @@ class MonitoringService:
         failing (so a broken backend can't flood the loop), and flap dampening
         suppresses a single transient failure (no DB write / no state_changed
         emit) until ``_flap_threshold`` consecutive failures are seen.
+
+        ``force`` (outage confirmation) ignores the circuit breaker. Returns the
+        probed state, or ``None`` when no probe ran or its result was not stored.
         """
         if monitor_id in self._inflight_probes or self.is_quiesced or not self.owns(monitor_id):
             # quiesced: a destructive maintenance job runs somewhere in the cluster;
             # not owned: sharded mode, another worker probes this monitor.
-            return
+            return None
         self._inflight_probes.add(monitor_id)
         try:
             # Phase 1: read from DB in a worker thread so the event loop stays free.
             record_data = await asyncio.to_thread(self._load_probe_record, monitor_id)
             if not record_data:
-                return
+                return None
 
             host_key = self._host_key_for(monitor_id, record_data.get("host_name"))
             now = time.monotonic()
 
-            # Circuit breaker: while a host is in backoff, skip the probe entirely.
+            # Circuit breaker: while a host is in backoff, skip its dependent probes.
             deadline = self._host_circuit_until.get(host_key, 0.0)
-            if deadline and now < deadline:
-                return
+            if deadline and now < deadline and not force and not self._circuit_bypass(record_data, host_key):
+                return None
 
             # Phase 2: async network probe (already non-blocking).
             state = MonitorState.UNKNOWN
@@ -2406,7 +2456,7 @@ class MonitoringService:
                 host_fails = self._host_failures[host_key]
                 if host_fails >= self._host_circuit_threshold:
                     n = host_fails - self._host_circuit_threshold
-                    delay = min(self._host_circuit_max, self._host_circuit_base * (2 ** min(n, 16)))
+                    delay = min(self._circuit_cap(), self._host_circuit_base * (2 ** min(n, 16)))
                     self._host_circuit_until[host_key] = now + delay
 
                 # Flap dampening: suppress a transient DOWN until confirmed. Never
@@ -2415,7 +2465,7 @@ class MonitoringService:
                     self._consec_failures[monitor_id] < self._flap_threshold
                     and record_data.get("latest_state") in (MonitorState.UP.value, None)
                 ):
-                    return
+                    return None
 
             # Phase 3: write result + aggregates in a worker thread.
             try:
@@ -2429,6 +2479,8 @@ class MonitoringService:
                 if code not in (1020, 1205, 1213):
                     raise
                 self.ctx.log.debug(f"State Monitoring: probe write for '{monitor_id}' skipped (MariaDB {code}).")
+                return None
+            return state
         finally:
             self._inflight_probes.discard(monitor_id)
 
