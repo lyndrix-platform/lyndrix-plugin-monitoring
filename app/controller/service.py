@@ -250,7 +250,7 @@ class MonitoringService:
         if self._scheduler_started:
             return
         self.scheduler.add_daily_job(self._housekeeping(self.prune_heartbeats), hour=0, minute=0, id="monitoring:prune")
-        self.scheduler.add_daily_job(self._housekeeping(self.refresh_rollups), hour=0, minute=5, id="monitoring:rollups")
+        self.scheduler.add_daily_job(self._housekeeping(self._nightly_rollup), hour=0, minute=5, id="monitoring:rollups")
         # Housekeeping that must not depend on the process surviving until
         # midnight (every restart used to reset the daily jobs → heartbeats grew
         # for months). First runs are delayed so they never compete with the
@@ -1495,10 +1495,10 @@ class MonitoringService:
         updates.append(("updated_at", now))
         session.execute(stmt.on_duplicate_key_update(updates))
 
-    def _recompute_daily_aggregate(self, session, monitor: MonitorRecord):
-        """Full recompute of today's aggregate from heartbeats (daily rollup job —
-        self-heals the incremental counters)."""
-        day = _day_start(_utc_now())
+    def _recompute_daily_aggregate(self, session, monitor: MonitorRecord, days_back: int = 0):
+        """Full recompute of one day's aggregate from heartbeats (``days_back`` 0 =
+        today, 1 = yesterday) — self-heals the incremental counters."""
+        day = _day_start(_utc_now() - timedelta(days=days_back))
         next_day = day + timedelta(days=1)
         items = session.query(MonitorHeartbeat).filter(
             MonitorHeartbeat.monitor_id == monitor.monitor_id,
@@ -2553,11 +2553,18 @@ class MonitoringService:
         self.request_full_probe()
         self._notify_monitors_changed("probe_all")
 
-    async def refresh_rollups(self):
-        await asyncio.to_thread(self._refresh_rollups_sync)
+    async def refresh_rollups(self, days_back: tuple = (0,)):
+        await asyncio.to_thread(self._refresh_rollups_sync, days_back)
 
-    def _refresh_rollups_sync(self):
-        """Recompute today's aggregates, ROLLUP_CHUNK monitors per committed READ
+    async def _nightly_rollup(self):
+        """The 00:05 job heals the day that just ENDED. Recomputing the brand-new
+        day (what it did before) healed nothing — and overwrote increments that
+        concurrent probes wrote between the read and the commit (MO-21). The
+        finished day takes no more writes, so its recompute cannot lose any."""
+        await self.refresh_rollups(days_back=(1,))
+
+    def _refresh_rollups_sync(self, days_back: tuple = (0,)):
+        """Recompute the aggregates of the given days (default: today), ROLLUP_CHUNK monitors per committed READ
         COMMITTED transaction (retried on 1020/1205/1213, and on 1062 when a
         concurrent writer inserted today's row first), then the uptime windows."""
         session = self._rc_session()
@@ -2571,7 +2578,8 @@ class MonitoringService:
 
                 def _write(chunk=chunk) -> None:
                     for record in session.query(MonitorRecord).filter(MonitorRecord.monitor_id.in_(chunk)).all():
-                        self._recompute_daily_aggregate(session, record)
+                        for back in days_back:
+                            self._recompute_daily_aggregate(session, record, back)
                     session.commit()
 
                 self._retrying(session, _write, extra_codes=(1062,))
