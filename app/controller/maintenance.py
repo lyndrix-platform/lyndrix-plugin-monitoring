@@ -1193,7 +1193,14 @@ class MaintenanceManager:
             if not isinstance(schedule, mw.CronSchedule):
                 continue
             running = mw.next_window([schedule], now, horizon=cls.ENDLESS_CRON_PROBE)
-            if running is not None and running.start <= now and running.end >= now + cls.ENDLESS_CRON_PROBE:
+            endless = running is not None and running.start <= now and running.end >= now + cls.ENDLESS_CRON_PROBE
+            if not endless:
+                # Cores with ``MaintenanceState.open_ended`` (≥ 1.12) stop
+                # coalescing after a bounded chain, so ``running.end`` is only a
+                # lower bound there and never reaches the probe horizon. The
+                # flag is the authoritative "no gap" answer on those cores.
+                endless = bool(getattr(mw.effective_state([schedule], [], now), "open_ended", False))
+            if endless:
                 raise ValueError(
                     f"cron window '{schedule.expr}' with duration_minutes={schedule.duration_minutes} never ends "
                     "(the duration reaches the next firing) — shorten the duration, or pause the monitor / "
