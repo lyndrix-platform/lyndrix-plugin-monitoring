@@ -177,9 +177,13 @@ def timeline_from_history(history: List[Dict[str, Any]], hours: int = 24) -> Lis
         if not raw_ts:
             continue
         try:
-            ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+            ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
         except Exception:
             continue
+        # Heartbeats are stored as naive UTC wall time. ``astimezone()`` on a
+        # naive value would read it as HOST-LOCAL time and shift every bucket by
+        # the host's UTC offset (MO-19) — a naive timestamp is UTC here.
+        ts = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
         if ts < start:
             continue
         idx = int((ts - start).total_seconds() // 3600)

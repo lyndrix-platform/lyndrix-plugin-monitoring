@@ -1649,6 +1649,17 @@ class MonitoringService:
         finally:
             session.close()
 
+    @staticmethod
+    def _iso_utc(value) -> Optional[str]:
+        """ISO timestamp WITH the UTC offset. The DB hands heartbeat times back
+        as naive UTC; without an offset a client (``new Date()`` in a browser,
+        ``astimezone()`` in Python) reads them as local time (MO-19)."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+
     def get_history(self, monitor_id: str, limit_hours: int = 24) -> List[Dict[str, Any]]:
         session = self._session()
         if not session:
@@ -1665,7 +1676,7 @@ class MonitoringService:
                     "latency_ms": i.latency_ms,
                     "error_message": i.error_message,
                     "source": i.source,
-                    "timestamp": i.created_at.isoformat() if i.created_at else None,
+                    "timestamp": self._iso_utc(i.created_at),
                 }
                 for i in items
             ]
@@ -1692,7 +1703,7 @@ class MonitoringService:
                         "latency_ms": i.latency_ms,
                         "error_message": i.error_message,
                         "source": i.source,
-                        "timestamp": i.created_at.isoformat() if i.created_at else None,
+                        "timestamp": self._iso_utc(i.created_at),
                     }
                 )
             return grouped
