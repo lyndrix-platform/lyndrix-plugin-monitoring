@@ -180,6 +180,28 @@ class OutageRecord(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class OutageEventRecord(Base):
+    """Outbox of ``monitoring:outage_persisted`` / ``outage_recovered`` (MO-09).
+
+    The row is written in the SAME transaction as the outage state change and
+    deleted once the event was emitted. A process that dies between commit and
+    emit, or an emit that fails, leaves the row behind and the probing instance
+    delivers it on its next evaluator pass. Delivery is at-least-once; consumers
+    dedupe on ``outage_id`` (ITSM: ``external_id``)."""
+
+    __tablename__ = "monitoring_outage_events"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    topic = Column(String(64), nullable=False)
+    outage_id = Column(String(128), nullable=False, index=True)
+    payload_json = Column(Text, nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    # Delivery claim: another instance leaves the row alone until this passes.
+    claimed_until = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 # ---------------------------------------------------------------------------
 # Pydantic schemas
 # ---------------------------------------------------------------------------

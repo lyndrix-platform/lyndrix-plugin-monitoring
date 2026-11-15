@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import time
 from contextlib import asynccontextmanager, nullcontext, suppress
@@ -202,6 +203,38 @@ class MonitoringService:
         if not self._call_on_loop(_do):
             _do()  # no loop known (tests / sync callers): emit directly
 
+    def _emit_checked(self, topic: str, payload: Dict[str, Any], timeout: float = 10.0) -> bool:
+        """``ctx.emit`` from any thread, reporting whether the emit went through
+        (the outbox keeps an event until this returns True). Off the loop the
+        call is handed to the loop and its outcome awaited."""
+        def _do() -> None:
+            self.ctx.emit(topic, payload)
+
+        loop = self._loop
+        if not self._on_loop_thread() and loop is not None and loop.is_running() and not loop.is_closed():
+            done: concurrent.futures.Future = concurrent.futures.Future()
+
+            def _run() -> None:
+                try:
+                    _do()
+                except Exception as exc:
+                    done.set_exception(exc)
+                else:
+                    done.set_result(True)
+
+            loop.call_soon_threadsafe(_run)
+            try:
+                return bool(done.result(timeout=timeout))
+            except Exception as exc:
+                self.ctx.log.warning(f"State Monitoring: emit {topic} failed: {type(exc).__name__}: {exc}")
+                return False
+        try:
+            _do()  # on the loop thread, or no running loop known (tests / sync callers)
+            return True
+        except Exception as exc:
+            self.ctx.log.warning(f"State Monitoring: emit {topic} failed: {type(exc).__name__}: {exc}")
+            return False
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -243,6 +276,8 @@ class MonitoringService:
         dry = await asyncio.to_thread(lambda: self.maintenance.evaluate_outages(dry_run=True))
         due = dry.get("due") or []
         if not due:
+            # Nothing to report; still deliver pending outbox events and purge.
+            await asyncio.to_thread(self.maintenance.outage_housekeeping)
             return dry
         confirmed = {mid for mid, probeable in due if not probeable}  # passive monitors: nothing to probe
         probeable = [mid for mid, can_probe in due if can_probe]
@@ -250,8 +285,6 @@ class MonitoringService:
             *(self.run_scheduled_probe(mid, force=True) for mid in probeable), return_exceptions=True
         )
         confirmed.update(mid for mid, state in zip(probeable, results) if state == MonitorState.DOWN)
-        if not confirmed:
-            return dry
         return await asyncio.to_thread(lambda: self.maintenance.evaluate_outages(confirmed=confirmed))
 
     def housekeeping_here(self) -> bool:
@@ -1773,7 +1806,7 @@ class MonitoringService:
 
     def _flush_session_events(self, session) -> int:
         """Emit the outage events queued during ``_store_heartbeat`` — after commit."""
-        return MaintenanceManager.flush_session_events(session, self._emit)
+        return self.maintenance.flush_session_events(session)
 
     # ------------------------------------------------------------------
     # Scheduler sync

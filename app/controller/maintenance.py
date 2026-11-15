@@ -38,6 +38,7 @@ from ..model.models import (
     MonitorRecord,
     MonitorState,
     MonitorType,
+    OutageEventRecord,
     OutageRecord,
     OverrideCreate,
     WindowCreate,
@@ -1447,8 +1448,18 @@ class MaintenanceManager:
 
     @staticmethod
     def queue_event(session, topic: str, payload: Dict[str, Any]) -> None:
-        """Queue an outage event on the caller's transaction; it is emitted by
-        ``flush_session_events`` after the commit (never for a rolled-back change)."""
+        """Write an outage event to the outbox inside the caller's transaction
+        (it exists exactly when the state change committed) and remember it on
+        the session; ``flush_session_events`` delivers it right after the commit."""
+        session.add(
+            OutageEventRecord(
+                topic=topic,
+                outage_id=str(payload.get("outage_id") or "")[:128],
+                payload_json=json.dumps(payload, sort_keys=True),
+                attempts=0,
+                created_at=naive(mw.utcnow()),
+            )
+        )
         session.info.setdefault("monitoring_events", []).append((topic, payload))
 
     def close_outages(
@@ -1476,13 +1487,121 @@ class MaintenanceManager:
                 )
         return self.store.delete_outages_in(session, monitor_ids)
 
-    @staticmethod
-    def flush_session_events(session, emit) -> int:
-        """Emit the events queued by ``track_outage`` — call after ``commit()``."""
+    def flush_session_events(self, session, now: Optional[datetime] = None) -> int:
+        """Deliver the events queued on ``session`` — call after ``commit()``.
+        Whatever cannot be emitted now stays in the outbox for the evaluator."""
         events = session.info.pop("monitoring_events", None) or []
-        for topic, payload in events:
-            emit(topic, payload)
-        return len(events)
+        if not events:
+            return 0
+        outage_ids = sorted({str(payload.get("outage_id") or "") for _topic, payload in events})
+        try:
+            return self.deliver_outbox(outage_ids=outage_ids, now=now)
+        except Exception as exc:  # the state change is committed; delivery is retried
+            self.log.warning(f"State Monitoring: outage event delivery deferred: {type(exc).__name__}: {exc}")
+            return 0
+
+    # -- outbox delivery ------------------------------------------------------------------
+
+    #: How long a delivery attempt owns a row; a crashed or failed attempt is
+    #: retried by the evaluator once this has passed.
+    OUTBOX_CLAIM_SECONDS = 60
+    OUTBOX_BATCH = 200
+    #: An event that could not be emitted this often is dropped with an error
+    #: log (a permanent fault, e.g. an undeclared topic) instead of looping forever.
+    OUTBOX_MAX_ATTEMPTS = 60
+
+    def deliver_outbox(self, outage_ids: Optional[Sequence[str]] = None, now: Optional[datetime] = None) -> int:
+        """Emit pending outage events in the order they were written; returns the
+        number delivered. Sync — call off the loop.
+
+        Each row is claimed with a conditional UPDATE (one deliverer at a time),
+        emitted, and deleted only after the emit succeeded. A row that cannot be
+        claimed or emitted blocks the later events of the same outage in this
+        run, so ``outage_recovered`` never overtakes its ``outage_persisted``."""
+        now_naive = naive(aware(now) if now is not None else mw.utcnow())
+        session = self.svc._rc_session()
+        if session is None:
+            return 0
+        delivered = 0
+        try:
+            q = session.query(
+                OutageEventRecord.id, OutageEventRecord.topic, OutageEventRecord.outage_id,
+                OutageEventRecord.payload_json, OutageEventRecord.attempts,
+            )
+            if outage_ids is not None:
+                if not outage_ids:
+                    return 0
+                q = q.filter(OutageEventRecord.outage_id.in_(list(outage_ids)))
+            pending = q.order_by(OutageEventRecord.id).limit(self.OUTBOX_BATCH).all()
+            session.commit()
+            blocked: Set[str] = set()
+            for event_id, topic, outage_id, payload_json, attempts in pending:
+                if outage_id in blocked:
+                    continue
+
+                def _claim(event_id=event_id) -> int:
+                    n = (
+                        session.query(OutageEventRecord)
+                        .filter(
+                            OutageEventRecord.id == event_id,
+                            OutageEventRecord.claimed_until.is_(None)
+                            | (OutageEventRecord.claimed_until <= now_naive),
+                        )
+                        .update(
+                            {
+                                OutageEventRecord.claimed_until: now_naive
+                                + timedelta(seconds=self.OUTBOX_CLAIM_SECONDS),
+                                OutageEventRecord.attempts: OutageEventRecord.attempts + 1,
+                            },
+                            synchronize_session=False,
+                        )
+                    )
+                    session.commit()
+                    return int(n or 0)
+
+                def _done(event_id=event_id) -> None:
+                    session.query(OutageEventRecord).filter(OutageEventRecord.id == event_id).delete(
+                        synchronize_session=False
+                    )
+                    session.commit()
+
+                if self.svc._retrying(session, _claim) != 1:
+                    blocked.add(outage_id)  # another instance delivers it right now
+                    continue
+                payload = _loads(payload_json, None)
+                if not isinstance(payload, dict):
+                    self.log.error(f"State Monitoring: outage event {event_id} unreadable — dropped.")
+                    self.svc._retrying(session, _done)
+                    continue
+                if self.svc._emit_checked(topic, payload):
+                    self.svc._retrying(session, _done)
+                    delivered += 1
+                elif int(attempts or 0) + 1 >= self.OUTBOX_MAX_ATTEMPTS:
+                    self.log.error(
+                        f"State Monitoring: {topic} for outage {outage_id} could not be emitted "
+                        f"after {self.OUTBOX_MAX_ATTEMPTS} attempts — dropped."
+                    )
+                    self.svc._retrying(session, _done)
+                else:
+                    blocked.add(outage_id)  # keeps its claim as back-off; retried later
+            return delivered
+        finally:
+            session.close()
+
+    def outage_housekeeping(self, now: Optional[datetime] = None) -> None:
+        """Once per evaluator pass on the housekeeping instance: deliver what is
+        left in the outbox and purge long-expired overrides. Never raises."""
+        if not self.svc.housekeeping_here():
+            return
+        now_aware = aware(now) if now is not None else mw.utcnow()
+        try:
+            self.deliver_outbox(now=now_aware)
+        except Exception as exc:
+            self.log.warning(f"State Monitoring: outbox delivery failed: {type(exc).__name__}: {exc}")
+        try:
+            self.store.purge_expired(now_aware)
+        except Exception as exc:  # housekeeping only — never fail the evaluation
+            self.log.debug(f"State Monitoring: override purge skipped: {exc}")
 
     # -- outage evaluator (60 s job on the probing instance) ----------------------------
 
@@ -1681,6 +1800,7 @@ class MaintenanceManager:
                     ci_id=ci_id,
                     rule_dict=rule_dict,
                 ) -> int:
+                    session.info.pop("monitoring_events", None)  # a retried attempt queues again
                     n = (
                         session.query(OutageRecord)
                         .filter(
@@ -1701,13 +1821,13 @@ class MaintenanceManager:
                             synchronize_session=False,
                         )
                     )
+                    if n == 1:
+                        # Same transaction as the claim: the event exists exactly
+                        # when this instance won it (MO-09).
+                        self.queue_event(session, mw.TOPIC_OUTAGE_PERSISTED, payload)
                     session.commit()
                     return int(n or 0)
 
-                if self.svc._retrying(session, _claim) != 1:
-                    continue  # another instance reported it first
-                stats["persisted"] += 1
-                self._warned_no_ci.discard(monitor_id)
                 payload: Dict[str, Any] = {
                     "outage_id": outage_id,
                     "ci_id": ci_id,
@@ -1725,17 +1845,19 @@ class MaintenanceManager:
                     },
                     "error": error or record.latest_error,
                 }
-                self.svc._emit(mw.TOPIC_OUTAGE_PERSISTED, payload)
+                session.info.pop("monitoring_events", None)
+                if self.svc._retrying(session, _claim) != 1:
+                    session.info.pop("monitoring_events", None)
+                    continue  # another instance reported it first
+                stats["persisted"] += 1
+                self._warned_no_ci.discard(monitor_id)
+                self.flush_session_events(session, now=now_aware)
         finally:
             session.close()
         if dry_run:
             stats["due"] = due
             return stats
-        if self.svc.housekeeping_here():
-            try:
-                self.store.purge_expired(now_aware)
-            except Exception as exc:  # housekeeping only — never fail the evaluation
-                self.log.debug(f"State Monitoring: override purge skipped: {exc}")
+        self.outage_housekeeping(now_aware)
         if stats["persisted"]:
             self.svc._view_cache.clear()
         return stats
