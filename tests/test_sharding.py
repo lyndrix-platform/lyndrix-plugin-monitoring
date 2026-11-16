@@ -72,6 +72,16 @@ def _jobs(s):
 
 
 async def _settle(svcs, t=0.4):
+    """Let the background sync tasks finish. A fixed sleep alone was a deadline:
+    on a loaded host a service had not computed its first shard after 0.4 s
+    (``_shard is None`` → sporadic TypeError). Wait for the first shard of every
+    sharded service (bounded), then give follow-up recomputations the old pause."""
+    deadline = asyncio.get_running_loop().time() + 10
+    while (
+        any(s._probe_mode == "sharded" and s._shard is None for s in svcs)
+        and asyncio.get_running_loop().time() < deadline
+    ):
+        await asyncio.sleep(0.02)
     await asyncio.sleep(t)
 
 

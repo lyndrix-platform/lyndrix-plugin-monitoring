@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import time
 from contextlib import asynccontextmanager, nullcontext, suppress
@@ -10,6 +11,7 @@ from sqlalchemy import case, func, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from core.api import db_instance
+from pydantic import ValidationError
 
 from ..model.models import (
     UPTIME_EXCLUDED_STATES,
@@ -29,15 +31,27 @@ from ..model.models import (
     _hourly_state_counts,
     _safe_json_load,
     _serialize_monitor,
+    safe_error_text,
+    sanitize_metadata,
+    sanitized_metadata_json,
     _uptime_from_aggregates,
     _utc_now,
+    redact_url_userinfo,
 )
 from ..ui.styles import aggregate_state
-from .maintenance import CHANGE_REASON, MaintenanceManager, MaintenanceStore
+from .maintenance import (
+    CHANGE_REASON,
+    RECOVERY_PAUSED,
+    RECOVERY_REMOVED,
+    RECOVERY_RESET,
+    MaintenanceManager,
+    MaintenanceStore,
+)
 from .scheduler import SimpleAsyncScheduler
 from .provider.http import is_http_target, run_http_probe
 from .provider.icmp import run_icmp_probe
-from .provider.tcp import looks_like_network_target, run_tcp_probe, tcp_fallback_ports
+from .provider.tcp import looks_like_network_target, run_tcp_probe, split_host_port, tcp_fallback_ports
+from .provider._executor import shutdown_probe_executors
 from .provider.docker import run_docker_service_probe
 
 
@@ -73,6 +87,9 @@ class MonitoringService:
         # Operator settings (manifest settings_schema, applied on vault:ready_for_data).
         self._heartbeat_retention_days = 7
         self._overview_cache_seconds = 10
+        # Inventory guard (MO-15): share of the managed monitors one import may
+        # remove without ``allow_mass_delete`` (see _inventory_guard_reason).
+        self._inventory_max_stale_percent = 30
         # Set by stop(): sweep workers stop taking monitors, housekeeping stops.
         self._stopping = False
         # Cluster placement: True only on the instance holding the
@@ -101,6 +118,12 @@ class MonitoringService:
         # has monitors we know nothing about (UNKNOWN or stale) — re-probing a set
         # of persistently DOWN monitors after every restart is not a warm-up.
         self._sweep_blocking = True
+        # True while the sweep owns the core runtime status ("starting"), so a
+        # lease loss resets only its own status, never an API job's maintenance.
+        self._sweep_status_active = False
+        # Bumped whenever this instance stops probing: a probe that started
+        # before must not store its result afterwards (MO-20).
+        self._probe_epoch = 0
         # Single-flight cache for the computed views (see _cached()): N pollers
         # share one computation and re-use it for _overview_cache_seconds.
         self._view_cache: Dict[str, tuple] = {}
@@ -118,6 +141,9 @@ class MonitoringService:
         self._host_circuit_threshold = 8                  # consecutive host fails before the host is paused
         self._host_circuit_base = 30.0                    # circuit backoff base (seconds)
         self._host_circuit_max = 1800.0                   # circuit backoff cap (seconds)
+        # Monotonic time since which ICMP is not permitted on this instance
+        # (None = usable). Reported by health() so the operator sets probe_roles.
+        self._icmp_unavailable_since: Optional[float] = None
 
         # Maintenance windows / overrides / outage rule (1.7.0, core API >= 1.13):
         # shared tables + a per-instance in-memory cache the heartbeat path reads.
@@ -185,6 +211,38 @@ class MonitoringService:
         if not self._call_on_loop(_do):
             _do()  # no loop known (tests / sync callers): emit directly
 
+    def _emit_checked(self, topic: str, payload: Dict[str, Any], timeout: float = 10.0) -> bool:
+        """``ctx.emit`` from any thread, reporting whether the emit went through
+        (the outbox keeps an event until this returns True). Off the loop the
+        call is handed to the loop and its outcome awaited."""
+        def _do() -> None:
+            self.ctx.emit(topic, payload)
+
+        loop = self._loop
+        if not self._on_loop_thread() and loop is not None and loop.is_running() and not loop.is_closed():
+            done: concurrent.futures.Future = concurrent.futures.Future()
+
+            def _run() -> None:
+                try:
+                    _do()
+                except Exception as exc:
+                    done.set_exception(exc)
+                else:
+                    done.set_result(True)
+
+            loop.call_soon_threadsafe(_run)
+            try:
+                return bool(done.result(timeout=timeout))
+            except Exception as exc:
+                self.ctx.log.warning(f"State Monitoring: emit {topic} failed: {type(exc).__name__}: {exc}")
+                return False
+        try:
+            _do()  # on the loop thread, or no running loop known (tests / sync callers)
+            return True
+        except Exception as exc:
+            self.ctx.log.warning(f"State Monitoring: emit {topic} failed: {type(exc).__name__}: {exc}")
+            return False
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -193,7 +251,7 @@ class MonitoringService:
         if self._scheduler_started:
             return
         self.scheduler.add_daily_job(self._housekeeping(self.prune_heartbeats), hour=0, minute=0, id="monitoring:prune")
-        self.scheduler.add_daily_job(self._housekeeping(self.refresh_rollups), hour=0, minute=5, id="monitoring:rollups")
+        self.scheduler.add_daily_job(self._housekeeping(self._nightly_rollup), hour=0, minute=5, id="monitoring:rollups")
         # Housekeeping that must not depend on the process surviving until
         # midnight (every restart used to reset the daily jobs → heartbeats grew
         # for months). First runs are delayed so they never compete with the
@@ -220,7 +278,22 @@ class MonitoringService:
         loop; the events it emits are marshalled back by ``_emit``."""
         if self._stopping or not self._probing:
             return {}
-        return await asyncio.to_thread(self.maintenance.evaluate_outages)
+        # An outage is only reported for a DOWN that a fresh probe just confirmed:
+        # the stored state can be minutes old (host circuit breaker, a probe that
+        # was skipped while quiesced) and the host may be back (MO-03).
+        dry = await asyncio.to_thread(lambda: self.maintenance.evaluate_outages(dry_run=True))
+        due = dry.get("due") or []
+        if not due:
+            # Nothing to report; still deliver pending outbox events and purge.
+            await asyncio.to_thread(self.maintenance.outage_housekeeping)
+            return dry
+        confirmed = {mid for mid, probeable in due if not probeable}  # passive monitors: nothing to probe
+        probeable = [mid for mid, can_probe in due if can_probe]
+        results = await asyncio.gather(
+            *(self.run_scheduled_probe(mid, force=True) for mid in probeable), return_exceptions=True
+        )
+        confirmed.update(mid for mid, state in zip(probeable, results) if state == MonitorState.DOWN)
+        return await asyncio.to_thread(lambda: self.maintenance.evaluate_outages(confirmed=confirmed))
 
     def housekeeping_here(self) -> bool:
         """Global housekeeping (prune, rollups, uptime windows) runs on one
@@ -276,7 +349,7 @@ class MonitoringService:
             if self.is_sharded else
             "State Monitoring: prober lease lost — stopping probes on this instance."
         )
-        await self.stop()
+        await self.stop(probing_only=True)
         # stop() flags the background writers to stop; on a lease loss the
         # process lives on and the API (e.g. /maintenance/prune) must still work.
         self._stopping = False
@@ -555,6 +628,12 @@ class MonitoringService:
         payload = payload or {}
         if not payload.get("_origin"):
             return  # our own request was applied locally already
+        # Any plugin may emit this topic (permissions are self-declared), so every
+        # request leaves a trace of who asked (MO-17).
+        self.ctx.log.info(
+            f"State Monitoring: quiesce {'on' if payload.get('on') else 'off'} requested by "
+            f"{payload.get('_origin')} (ttl={payload.get('ttl')})."
+        )
         self.apply_quiesce(bool(payload.get("on")), payload.get("ttl"))
 
     @asynccontextmanager
@@ -567,14 +646,28 @@ class MonitoringService:
         write (READ COMMITTED + 1020/1205/1213 retry)."""
         self.apply_quiesce(True)
         self._emit_cluster(self.QUIESCE_TOPIC, {"on": True, "ttl": self.QUIESCE_TTL_SECONDS})
+        # A job on millions of heartbeats outlives the TTL; without a renewal the
+        # peer's quiesce expires mid-job and its probes write into the tables
+        # being deleted (MO-18).
+        renewer = asyncio.create_task(self._renew_quiesce(), name="monitoring:quiesce_renew")
         try:
             await self.quiesce_monitors(monitor_ids)
             if not self._probing or self.is_sharded:  # other instances probe too
                 await asyncio.sleep(self.QUIESCE_GRACE_SECONDS)
             yield
         finally:
+            renewer.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await renewer
             self._quiesced_until = 0.0
             self._emit_cluster(self.QUIESCE_TOPIC, {"on": False})
+
+    async def _renew_quiesce(self) -> None:
+        """Re-assert the quiesce at half the TTL: locally and on the peers."""
+        while True:
+            await asyncio.sleep(self.QUIESCE_TTL_SECONDS / 2)
+            self.apply_quiesce(True)
+            self._emit_cluster(self.QUIESCE_TOPIC, {"on": True, "ttl": self.QUIESCE_TTL_SECONDS})
 
     async def resync_after_delete(self) -> None:
         """After monitors/states were removed: forget probe bookkeeping, reload
@@ -623,7 +716,10 @@ class MonitoringService:
                 "host_name": record.host_name,
                 "latest_state": record.latest_state,
                 "timeout_seconds": record.timeout_seconds,
-                "metadata": _safe_json_load(record.metadata_json),
+                "metadata": sanitize_metadata(_safe_json_load(record.metadata_json)),
+                # For the maintenance lookup of the circuit breaker (state_for).
+                "ci_id": record.ci_id,
+                "host_ci_id": record.host_ci_id,
             }
         finally:
             session.close()
@@ -638,17 +734,36 @@ class MonitoringService:
         metadata = rd["metadata"]
 
         if monitor_type in {MonitorType.PING.value, MonitorType.SERVER.value}:
-            result = await run_icmp_probe(target, timeout_seconds)
-            state = result["state"]
-            latency_ms = result["latency_ms"]
+            # ``host:port`` targets name the TCP port to fall back to; ICMP goes
+            # to the host part.
+            icmp_host, explicit_port = split_host_port(target)
+            result = await run_icmp_probe(icmp_host, timeout_seconds)
+            unavailable = self._note_icmp_result(result)
+            if result["state"] == MonitorState.UP:
+                return result["state"], result["latency_ms"], None
             error_message = result["error_message"]
-            if state != MonitorState.UP and monitor_type == MonitorType.SERVER.value and looks_like_network_target(target):
-                fallback_host = address or target.split(":", 1)[0]
-                for port in tcp_fallback_ports(metadata, target):
-                    tcp_result = await run_tcp_probe(fallback_host, port, timeout_seconds)
-                    if tcp_result["state"] == MonitorState.UP:
-                        return tcp_result["state"], tcp_result["latency_ms"], None
-            return state, latency_ms, error_message
+            if monitor_type == MonitorType.SERVER.value and looks_like_network_target(target):
+                fallback_host = address or icmp_host
+                # All fallback ports at once: the probe stays within one extra
+                # timeout instead of one per port.
+                tcp_results = await asyncio.gather(*(
+                    run_tcp_probe(fallback_host, port, timeout_seconds)
+                    for port in tcp_fallback_ports(metadata, target)
+                ))
+                reachable = [r for r in tcp_results if r["state"] == MonitorState.UP]
+                if reachable:
+                    best = min(reachable, key=lambda r: r["latency_ms"] if r["latency_ms"] is not None else 0.0)
+                    return MonitorState.UP, best["latency_ms"], None
+                if unavailable and explicit_port is None and any(r.get("refused") for r in tcp_results):
+                    # No ICMP here and no listener on the usual ports, but the
+                    # host actively refused a connection: it is alive.
+                    return MonitorState.UP, None, None
+                if unavailable:
+                    error_message = f"{error_message}; TCP fallback found no open port"
+            if unavailable:
+                # "Cannot probe from here" is never DOWN: no outage, no incident.
+                return MonitorState.UNKNOWN, None, error_message
+            return result["state"], result["latency_ms"], error_message
 
         if metadata.get("deploy_type") == "docker_compose" and address and service_name:
             result = await run_docker_service_probe(self.http_client, address, service_name, timeout_seconds)
@@ -659,10 +774,42 @@ class MonitoringService:
             return result["state"], result["latency_ms"], result["error_message"]
 
         if looks_like_network_target(target):
-            result = await run_icmp_probe(target, timeout_seconds)
+            result = await run_icmp_probe(split_host_port(target)[0], timeout_seconds)
+            self._note_icmp_result(result)
             return result["state"], result["latency_ms"], result["error_message"]
 
-        return MonitorState.UNKNOWN, None, f"No supported probe strategy for target '{target}'"
+        return MonitorState.UNKNOWN, None, f"No supported probe strategy for target '{redact_url_userinfo(target)}'"
+
+    def _note_icmp_result(self, result: Dict[str, Any]) -> bool:
+        """Remember whether ICMP is usable on this instance (health + one log
+        line per change). Returns True when this probe could not use ICMP."""
+        unavailable = bool(result.get("unavailable"))
+        if unavailable and self._icmp_unavailable_since is None:
+            self._icmp_unavailable_since = time.monotonic()
+            self.ctx.log.warning(
+                "State Monitoring: ICMP is not permitted on this instance — host monitors fall back to TCP, "
+                "ping monitors read UNKNOWN. Allow unprivileged ICMP (net.ipv4.ping_group_range) or set "
+                f"'probe_roles' to instances that can ping. ({result.get('error_message')})"
+            )
+        elif not unavailable and self._icmp_unavailable_since is not None:
+            self._icmp_unavailable_since = None
+            self.ctx.log.info("State Monitoring: ICMP is usable again on this instance.")
+        return unavailable
+
+    @property
+    def icmp_unavailable(self) -> bool:
+        return self._probing and self._icmp_unavailable_since is not None
+
+    @staticmethod
+    def _probe_deadline(timeout_seconds: Any) -> float:
+        """Hard upper bound for one whole probe: ICMP plus the TCP fallback (or
+        an HTTP probe with its own, tighter deadline) and some slack. Whatever a
+        provider does, the monitor's job and its semaphore slot come back."""
+        try:
+            timeout = max(1.0, float(timeout_seconds))
+        except (TypeError, ValueError):
+            timeout = 10.0
+        return 2 * timeout + 5.0
 
     def _save_probe_result(
         self,
@@ -685,18 +832,48 @@ class MonitoringService:
         finally:
             session.close()
 
-    async def stop(self):
-        """Cancel all background tasks and release resources for clean reload."""
+    def _lease_token(self) -> Any:
+        """Fencing token of the prober lease when the core provides one
+        (``ctx.lease_token``, newer cores); ``None`` otherwise."""
+        token = getattr(self.ctx, "lease_token", None)
+        if token is None:
+            return None
+        if callable(token):
+            try:
+                return token("monitoring:prober")
+            except Exception:
+                return None
+        return token
+
+    def _probe_fence(self) -> tuple:
+        """What a probe remembers when it starts; its result is stored only if
+        this is unchanged when it finishes (see ``run_scheduled_probe``)."""
+        return (self._probe_epoch, self._lease_token())
+
+    async def stop(self, probing_only: bool = False):
+        """Cancel background tasks and release resources.
+
+        Full stop (plugin unload/shutdown): everything named ``monitoring:*``.
+        ``probing_only`` (lease lost, the process lives on and keeps serving the
+        API): only what belongs to probing — the scheduler jobs, the sweep, the
+        resync and the bootstrap. An inventory import running on this instance,
+        the maintenance-cache reload and the placement task finish their work,
+        an API job's maintenance status stays, and nothing waits for in-flight
+        probes: their results are fenced off instead (MO-20)."""
         # Yield once so every task that was created-but-not-yet-started gets
         # its first event-loop step.  Without this, tasks cancelled before they
         # ever run trigger Python's "coroutine was never awaited" RuntimeWarning
         # during GC at process shutdown.
         self._stopping = True  # sweep workers stop taking monitors, housekeeping stops
+        self._probe_epoch += 1  # in-flight probes of this prober term no longer write
         await asyncio.sleep(0)
 
         # Collect explicitly tracked one-off tasks
         tasks_to_cancel: list = []
-        for attr in ("_bootstrap_task", "_background_probe_task", "_inventory_sync_task", "_startup_prune_task"):
+        tracked = ["_bootstrap_task", "_background_probe_task", "_startup_prune_task", "_resync_task"]
+        if not probing_only:
+            tracked.append("_inventory_sync_task")
+        for attr in tracked:
             t = getattr(self, attr, None)
             if t and not t.done():
                 tasks_to_cancel.append(t)
@@ -706,23 +883,26 @@ class MonitoringService:
             if not handle.task.done():
                 tasks_to_cancel.append(handle.task)
 
-        # Also sweep asyncio's own task registry for anything named
-        # "monitoring:*" that we might have missed (created between the
-        # snapshot above and now, e.g. during a concurrent sync).
-        tracked_ids = {id(t) for t in tasks_to_cancel}
-        current = asyncio.current_task()
-        for t in asyncio.all_tasks():
-            if t is current or t.done():
-                continue
-            name = t.get_name() or ""
-            if name.startswith("monitoring:") and id(t) not in tracked_ids:
-                tasks_to_cancel.append(t)
+        if not probing_only:
+            # Also sweep asyncio's own task registry for anything named
+            # "monitoring:*" that we might have missed (created between the
+            # snapshot above and now, e.g. during a concurrent sync).
+            tracked_ids = {id(t) for t in tasks_to_cancel}
+            current = asyncio.current_task()
+            for t in asyncio.all_tasks():
+                if t is current or t.done():
+                    continue
+                name = t.get_name() or ""
+                if name.startswith("monitoring:") and id(t) not in tracked_ids:
+                    tasks_to_cancel.append(t)
 
         # Clear scheduler state immediately so no new tasks are spawned
         self.scheduler._jobs.clear()
         self.scheduler._started = False
         self._scheduler_started = False
 
+        current = asyncio.current_task()
+        tasks_to_cancel = [t for t in tasks_to_cancel if t is not current]
         # Cancel everything, then wait briefly — the process is exiting anyway
         for t in tasks_to_cancel:
             t.cancel()
@@ -731,19 +911,27 @@ class MonitoringService:
             with suppress(Exception):
                 await asyncio.wait(tasks_to_cancel, timeout=0.5)
 
-        # Probes running in worker threads cannot be cancelled — give them up to
-        # 5 s to drain so a reload does not run two sweeps against the DB.
-        for _ in range(50):
-            if not self._inflight_probes:
-                break
-            await asyncio.sleep(0.1)
+        if not probing_only:
+            # Probes running in worker threads cannot be cancelled — give them up to
+            # 5 s to drain so a reload does not run two sweeps against the DB.
+            for _ in range(50):
+                if not self._inflight_probes:
+                    break
+                await asyncio.sleep(0.1)
 
-        # Release the shared HTTP client
+        # Release the shared HTTP client and the probe thread pools (recreated
+        # lazily when this instance probes again).
         with suppress(Exception):
             await self.http_client.aclose()
+        shutdown_probe_executors()
 
-        self._set_status("ready")
-        self.ctx.log.info("State Monitoring: stopped cleanly.")
+        if not probing_only or self._sweep_status_active:
+            self._sweep_status_active = False
+            self._set_status("ready")
+        self.ctx.log.info(
+            "State Monitoring: probing stopped on this instance." if probing_only
+            else "State Monitoring: stopped cleanly."
+        )
 
     def ensure_tables(self):
         from core.api import Base
@@ -751,6 +939,70 @@ class MonitoringService:
             Base.metadata.create_all(bind=db_instance.engine, checkfirst=True)
             self._ensure_schema(db_instance.engine)
             self._ensure_daily_aggregate_unique(db_instance.engine)
+            try:
+                scrubbed = self.scrub_monitor_metadata()
+            except Exception as exc:
+                # Reads stay filtered (``_serialize_monitor``); the next bootstrap retries.
+                self.ctx.log.warning(f"State Monitoring: metadata scrub failed: {type(exc).__name__}")
+            else:
+                if scrubbed:
+                    self.ctx.log.warning(
+                        f"State Monitoring: removed non-allowlisted metadata from {scrubbed} monitor row(s). "
+                        "Rotate any credential an inventory publish may have stored there."
+                    )
+
+    METADATA_SCRUB_CHUNK = 200
+
+    def scrub_monitor_metadata(self) -> int:
+        """Idempotent data migration (MO-01): rewrite every ``metadata_json`` to
+        its allowlisted subset. Rows written before the allowlist hold whole
+        ``terraform`` / ``config`` blocks with credentials.
+
+        Runs at bootstrap under the cross-instance lock (``_ensure_tables_locked``).
+        Keyset pagination in chunks of ``METADATA_SCRUB_CHUNK`` with one short
+        committed transaction per chunk keeps every statement far below the
+        statement cap; each chunk retries on 1020/1205/1213 because probe writers
+        touch the same rows. A clean table costs one narrow scan and no write.
+        Values are never logged. Returns the number of rewritten rows."""
+        session = self._rc_session()
+        if not session:
+            return 0
+        rewritten = 0
+        try:
+            last_id = ""
+            while True:
+                rows = (
+                    session.query(MonitorRecord.monitor_id, MonitorRecord.metadata_json)
+                    .filter(MonitorRecord.monitor_id > last_id)
+                    .order_by(MonitorRecord.monitor_id)
+                    .limit(self.METADATA_SCRUB_CHUNK)
+                    .all()
+                )
+                session.commit()  # end the read transaction before the writes
+                if not rows:
+                    return rewritten
+                last_id = rows[-1][0]
+                dirty = {}
+                for monitor_id, raw in rows:
+                    clean = sanitized_metadata_json(raw)
+                    if clean != (raw or ""):
+                        dirty[monitor_id] = clean
+                if not dirty:
+                    continue
+
+                def _write(dirty=dirty) -> None:
+                    for monitor_id, clean in dirty.items():
+                        # Core UPDATE of the one column: no ORM state, no
+                        # version of the probe-written columns is overwritten.
+                        session.query(MonitorRecord).filter(
+                            MonitorRecord.monitor_id == monitor_id
+                        ).update({MonitorRecord.metadata_json: clean}, synchronize_session=False)
+                    session.commit()
+
+                self._retrying(session, _write)
+                rewritten += len(dirty)
+        finally:
+            session.close()
 
     def _ensure_tables_locked(self):
         """``ensure_tables`` under the core's cross-instance bootstrap lock (core
@@ -955,9 +1207,17 @@ class MonitoringService:
             candidates.sort(key=lambda r: (self._probe_priority(r), r.updated_at or _utc_now()))
             if self._initial_probe_batch_limit > 0 and not force:
                 candidates = candidates[: self._initial_probe_batch_limit]
-            # A forced sweep re-probes known states → banner only, never a 503 window.
-            self._sweep_blocking = (not force) and any(
-                r.latest_state == MonitorState.UNKNOWN.value or _is_stale(r) for r in candidates
+            # The sweep blocks the plugin's routes (503 + warm-up panel) only when
+            # it is the genuine first one: there is nothing to show yet, no owned
+            # monitor has ever been probed (fresh install, first inventory import,
+            # after "reset states"). A lease handover, a shard change or an import
+            # that adds a few monitors re-probes on top of known states — banner
+            # only; the routes are plain DB reads that do not depend on it (MO-14).
+            owned = [r for r in records if (r.target or r.address) and self.owns(r.monitor_id)]
+            self._sweep_blocking = (
+                (not force)
+                and bool(candidates)
+                and all(r.latest_state == MonitorState.UNKNOWN.value and r.last_checked_at is None for r in owned)
             )
             return [r.monitor_id for r in candidates]
         finally:
@@ -984,6 +1244,7 @@ class MonitoringService:
         message = f"Initial probe sweep: {total} monitors"
         blocking = self._sweep_blocking
         done = 0
+        self._sweep_status_active = True
         self._set_status("starting", message=message, progress=(0, total), blocking=blocking, retry_after=15)
 
         async def worker():
@@ -999,6 +1260,7 @@ class MonitoringService:
         try:
             await asyncio.gather(*(worker() for _ in range(worker_count)), return_exceptions=True)
         finally:
+            self._sweep_status_active = False
             self._set_status("ready")
             self._view_cache.clear()
         self.ctx.log.info(f"State Monitoring: initial probe refresh finished ({done}/{total}).")
@@ -1055,6 +1317,11 @@ class MonitoringService:
         self._initial_probe_worker_limit = _int("initial_probe_workers", 8, 1, 64)
         self._overview_cache_seconds = _int("overview_cache_seconds", 10, 0, 300)
         self._probe_nodes = _int("probe_nodes", 1, 1, 64)
+        try:  # 0 is a valid value here ("never remove automatically") — _int treats it as unset
+            raw_pct = values.get("inventory_max_stale_percent")
+            self._inventory_max_stale_percent = max(0, min(100, int(raw_pct))) if raw_pct not in (None, "") else 30
+        except (TypeError, ValueError):
+            self._inventory_max_stale_percent = 30
         raw_roles = values.get("probe_roles") or ""
         if isinstance(raw_roles, (list, tuple, set)):
             raw_roles = ",".join(str(r) for r in raw_roles)
@@ -1078,11 +1345,27 @@ class MonitoringService:
         """Synchronous inventory import (``POST /inventory-sync``): ingest, then
         give the new monitors probe jobs and announce the change — the bulk
         upserts run with ``sync_scheduler=False`` and never notify on their own."""
-        stats = await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
+        stats = await self._ingest_inventory_quiesced(payload)
         try:
             await self.apply_monitor_set_change("inventory")
         except Exception as exc:
             self.ctx.log.error(f"State Monitoring: resync after inventory import failed: {exc}")
+        return stats
+
+    async def _ingest_inventory_quiesced(self, payload: InventorySyncPayload) -> Dict[str, Any]:
+        """Import on the loop-driven paths: upserts first, then the removal of
+        monitors that left the inventory with their probe writers stopped
+        (``quiesced``: jobs dropped, in-flight probes drained, peers asked to
+        pause) — a probe writing into rows that are being deleted is what turned
+        the old single-transaction delete into MariaDB 1020 rollbacks (MO-15)."""
+        stats = await asyncio.to_thread(self.ingest_inventory_snapshot, payload, False)
+        stale_ids = stats.pop("stale_ids", [])
+        if stale_ids:
+            async with self.quiesced(stale_ids):
+                result = await asyncio.to_thread(self.delete_monitor_ids, stale_ids)
+            stats["stale_deleted"] = result["monitors"]
+            for mid in stale_ids:
+                self._consec_failures.pop(mid, None)
         return stats
 
     async def _process_inventory_sync_queue(self):
@@ -1092,7 +1375,7 @@ class MonitoringService:
             self._pending_inventory_payload = None
             try:
                 async with self.maintenance_window("Importing inventory"):
-                    await asyncio.to_thread(self.ingest_inventory_snapshot, payload)
+                    await self._ingest_inventory_quiesced(payload)
                 await asyncio.sleep(0)
                 # The prober may be another instance (inventory arrives where the
                 # orchestrator runs) — this also tells it to reload its jobs.
@@ -1213,10 +1496,10 @@ class MonitoringService:
         updates.append(("updated_at", now))
         session.execute(stmt.on_duplicate_key_update(updates))
 
-    def _recompute_daily_aggregate(self, session, monitor: MonitorRecord):
-        """Full recompute of today's aggregate from heartbeats (daily rollup job —
-        self-heals the incremental counters)."""
-        day = _day_start(_utc_now())
+    def _recompute_daily_aggregate(self, session, monitor: MonitorRecord, days_back: int = 0):
+        """Full recompute of one day's aggregate from heartbeats (``days_back`` 0 =
+        today, 1 = yesterday) — self-heals the incremental counters."""
+        day = _day_start(_utc_now() - timedelta(days=days_back))
         next_day = day + timedelta(days=1)
         items = session.query(MonitorHeartbeat).filter(
             MonitorHeartbeat.monitor_id == monitor.monitor_id,
@@ -1308,6 +1591,68 @@ class MonitoringService:
         finally:
             session.close()
 
+    #: A monitor counts as stale when nothing was stored for it for this many
+    #: probe intervals (plus the longest circuit-breaker pause, during which a
+    #: service on a dead host is legitimately not probed).
+    STALE_PROBE_INTERVALS = 3
+    #: Share of stale monitors from which health() reports ``probes_stale``.
+    STALE_PROBE_SHARE = 0.2
+
+    def probe_freshness(self) -> Dict[str, Any]:
+        """Is anybody probing? Read from the shared monitor table, so every
+        instance — also a standby that never probes — sees it (MO-11): no prober
+        alive, ``probe_roles`` matching no instance or a wedged prober all leave
+        ``last_checked_at`` standing still while every state stays "UP".
+
+        One narrow query (three columns of the enabled monitors); cheap enough
+        for health(). Passive-only and paused monitors are not expected to move."""
+        result: Dict[str, Any] = {"probeable": 0, "stale": 0, "last_probe_at": None, "last_probe_age_s": None,
+                                  "probes_stale": False}
+        session = self._session()
+        if not session:
+            return result
+        try:
+            rows = (
+                session.query(
+                    MonitorRecord.interval_seconds, MonitorRecord.last_checked_at, MonitorRecord.created_at,
+                    MonitorRecord.target, MonitorRecord.address,
+                )
+                .filter(MonitorRecord.enabled.is_(True), MonitorRecord.latest_state != MonitorState.PAUSED.value)
+                .all()
+            )
+        finally:
+            session.close()
+
+        def _aware(value):
+            if value is None:
+                return None
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+        now = _utc_now()
+        slack = self._circuit_cap()
+        newest = None
+        for interval, last_checked, created, target, address in rows:
+            if not (target or address):
+                continue  # passive monitor: fed by reporters, not by us
+            result["probeable"] += 1
+            last_checked = _aware(last_checked)
+            if last_checked is not None and (newest is None or last_checked > newest):
+                newest = last_checked
+            # A monitor that was never probed is measured from its creation.
+            reference = last_checked or _aware(created) or now
+            limit = self.STALE_PROBE_INTERVALS * max(10, int(interval or 60)) + slack
+            if (now - reference).total_seconds() > limit:
+                result["stale"] += 1
+        if newest is not None:
+            result["last_probe_at"] = newest.isoformat()
+            result["last_probe_age_s"] = max(0, int((now - newest).total_seconds()))
+        if result["stale"]:
+            result["probes_stale"] = (
+                result["stale"] == result["probeable"]
+                or result["stale"] >= max(1.0, self.STALE_PROBE_SHARE * result["probeable"])
+            )
+        return result
+
     _STATE_COUNT_KEYS = {
         MonitorState.UP.value: "up_count",
         MonitorState.DOWN.value: "down_count",
@@ -1381,6 +1726,17 @@ class MonitoringService:
         finally:
             session.close()
 
+    @staticmethod
+    def _iso_utc(value) -> Optional[str]:
+        """ISO timestamp WITH the UTC offset. The DB hands heartbeat times back
+        as naive UTC; without an offset a client (``new Date()`` in a browser,
+        ``astimezone()`` in Python) reads them as local time (MO-19)."""
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+
     def get_history(self, monitor_id: str, limit_hours: int = 24) -> List[Dict[str, Any]]:
         session = self._session()
         if not session:
@@ -1397,7 +1753,7 @@ class MonitoringService:
                     "latency_ms": i.latency_ms,
                     "error_message": i.error_message,
                     "source": i.source,
-                    "timestamp": i.created_at.isoformat() if i.created_at else None,
+                    "timestamp": self._iso_utc(i.created_at),
                 }
                 for i in items
             ]
@@ -1424,7 +1780,7 @@ class MonitoringService:
                         "latency_ms": i.latency_ms,
                         "error_message": i.error_message,
                         "source": i.source,
-                        "timestamp": i.created_at.isoformat() if i.created_at else None,
+                        "timestamp": self._iso_utc(i.created_at),
                     }
                 )
             return grouped
@@ -1454,18 +1810,44 @@ class MonitoringService:
     # Computed views (React UI) — cached, single-flight
     # ------------------------------------------------------------------
 
+    # The timeline aggregate is the expensive part of a view (monitors × hours ×
+    # samples rows touched), so callers may only pick from a few spans. Anything
+    # else snaps UP to the next one: every distinct value used to be its own
+    # multi-million-row query (MO-13).
+    TIMELINE_HOURS = (24, 72, 168)
+
+    @classmethod
+    def normalize_timeline_hours(cls, hours: Any) -> int:
+        try:
+            wanted = int(hours)
+        except (TypeError, ValueError):
+            return cls.TIMELINE_HOURS[0]
+        return next((h for h in cls.TIMELINE_HOURS if wanted <= h), cls.TIMELINE_HOURS[-1])
+
+    async def timelines(self, monitor_ids: List[str], hours: int = 24) -> Dict[str, List[str]]:
+        """Cached ``get_timelines``. The key holds ``hours`` only — the buckets do
+        not depend on grouping or filters, so every ``group_by`` variant and
+        every UI shares one aggregate per span."""
+        hours = self.normalize_timeline_hours(hours)
+
+        async def _compute() -> Dict[str, List[str]]:
+            return await asyncio.to_thread(self.get_timelines, monitor_ids, hours)
+
+        return await self._cached(f"timelines|{hours}", _compute)
+
     async def overview(self, *, group_by: str = "site", hours: int = 24,
                        include_paused: bool = True, include_unknown: bool = True) -> Dict[str, Any]:
         """Grouped + flat overview for the React UI. Reuses the pure helpers the
         NiceGUI dashboard uses, with timelines bucketed in SQL."""
         from .helpers import build_grouped_overview, flatten_monitors
 
+        hours = self.normalize_timeline_hours(hours)
         key = f"overview|{group_by}|{hours}|{include_paused}|{include_unknown}"
 
         async def _compute() -> Dict[str, Any]:
             monitors = await asyncio.to_thread(self.list_monitors)
             ids = [m["monitor_id"] for m in monitors]
-            timelines = await asyncio.to_thread(self.get_timelines, ids, hours)
+            timelines = await self.timelines(ids, hours)
             groups = build_grouped_overview(
                 monitors, {}, group_by=group_by, include_paused=include_paused,
                 include_unknown=include_unknown, timelines=timelines,
@@ -1569,6 +1951,9 @@ class MonitoringService:
         same transaction; recovery events are queued on the session and emitted
         by the caller after ``commit()`` (``_flush_session_events``).
         """
+        # Single chokepoint for everything persisted or emitted from a result
+        # (heartbeat, latest_error, outage row, bus events), probe or passive.
+        error_message = redact_url_userinfo(error_message)
         current_time = timestamp or _utc_now()
         if current_time.tzinfo is None:
             current_time = current_time.replace(tzinfo=timezone.utc)
@@ -1600,7 +1985,7 @@ class MonitoringService:
 
     def _flush_session_events(self, session) -> int:
         """Emit the outage events queued during ``_store_heartbeat`` — after commit."""
-        return MaintenanceManager.flush_session_events(session, self._emit)
+        return self.maintenance.flush_session_events(session)
 
     # ------------------------------------------------------------------
     # Scheduler sync
@@ -1739,8 +2124,12 @@ class MonitoringService:
             # No DDL here: bootstrap creates the tables under the cluster lock.
             record = self._get_monitor(session, data.monitor_id)
             payload = data.model_dump(exclude={"force"}, mode="json")
+            # Only the allowlisted subset is stored (and hashed): whatever else a
+            # caller sends in ``metadata`` never reaches the table (MO-01).
+            metadata = sanitize_metadata(data.metadata)
+            payload["metadata"] = metadata
             desired_hash = data.source_hash or self._canonical_hash(payload)
-            metadata_json = json.dumps(data.metadata, sort_keys=True)
+            metadata_json = json.dumps(metadata, sort_keys=True)
 
             if record:
                 if record.owner_source != data.owner_source and not data.force:
@@ -1748,6 +2137,13 @@ class MonitoringService:
                 if record.is_admin_overridden and record.owner_source == data.owner_source:
                     record.is_admin_overridden = False
                 if record.config_hash == desired_hash and record.owner_source == data.owner_source:
+                    stored_clean = sanitized_metadata_json(record.metadata_json)
+                    if record.metadata_json != stored_clean:
+                        # Unchanged config, but the row was written before the
+                        # allowlist existed (or by an older peer during a rolling
+                        # upgrade): scrub it now, not only at the next bootstrap.
+                        record.metadata_json = stored_clean
+                        session.commit()
                     return _serialize_monitor(record)
                 record.name = data.name
                 record.monitor_type = data.monitor_type.value
@@ -1768,6 +2164,9 @@ class MonitoringService:
                 record.updated_at = _utc_now()
                 if not data.enabled:
                     record.latest_state = MonitorState.PAUSED.value
+                    # A disabled monitor is not probed: no outage clock, and a
+                    # reported outage is closed (nobody would ever recover it).
+                    self.maintenance.close_outages(session, [record.monitor_id], RECOVERY_PAUSED)
             else:
                 record = MonitorRecord(
                     monitor_id=data.monitor_id,
@@ -1793,6 +2192,7 @@ class MonitoringService:
                 )
                 session.add(record)
             session.commit()
+            self._flush_session_events(session)
             session.refresh(record)
             self.maintenance.cache.note_monitor(record)  # host → ci map for service fallbacks
             if sync_scheduler:
@@ -1817,8 +2217,9 @@ class MonitoringService:
                 record.enabled = False
                 record.latest_state = MonitorState.PAUSED.value
                 record.latest_error = None
-                # A paused monitor has no outage clock (nothing is probed).
-                MaintenanceStore.delete_outages_in(session, [record.monitor_id])
+                # A paused monitor has no outage clock (nothing is probed); a
+                # reported outage is closed with outage_recovered(reason=paused).
+                self.maintenance.close_outages(session, [record.monitor_id], RECOVERY_PAUSED)
                 self._emit_transition(record, previous_state, None)
             elif request.action == "resume":
                 record.enabled = True
@@ -1826,15 +2227,31 @@ class MonitoringService:
                     record.latest_state = MonitorState.UNKNOWN.value
             elif request.action == "update":
                 allowed = {"name", "target", "address", "host_name", "service_name", "logical_group", "interval_seconds", "timeout_seconds", "enabled"}
-                for key, value in request.patch.items():
-                    if key in allowed:
-                        setattr(record, key, value)
+                patch = {k: v for k, v in request.patch.items() if k in allowed}
+                # The patch gets the same bounds and types as an upsert: an interval
+                # of 1 s is a write storm, "60" as a string unschedules the monitor
+                # silently, a timeout of 0 is a permanent DOWN (MO-16).
+                try:
+                    # Only the patched keys are checked (and copied back): rows stored
+                    # before the bounds existed must stay patchable in other fields.
+                    checked = MonitorUpsert(**{
+                        "monitor_id": record.monitor_id, "name": record.name,
+                        "monitor_type": MonitorType(record.monitor_type), **patch,
+                    })
+                except ValidationError as exc:
+                    problems = "; ".join(
+                        f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}" for e in exc.errors()
+                    )
+                    raise ValueError(f"Invalid patch: {problems}") from None
+                for key in patch:
+                    setattr(record, key, getattr(checked, key))
                 metadata_patch = request.patch.get("metadata")
                 if isinstance(metadata_patch, dict):
                     merged = _safe_json_load(record.metadata_json)
                     merged.update(metadata_patch)
-                    record.metadata_json = json.dumps(merged, sort_keys=True)
+                    record.metadata_json = json.dumps(sanitize_metadata(merged), sort_keys=True)
             session.commit()
+            self._flush_session_events(session)
             session.refresh(record)
             self._sync_job_for_monitor(record)
             self._notify_monitors_changed("override", count=1)
@@ -1918,8 +2335,10 @@ class MonitoringService:
             deleted = self._delete_heartbeats_for(session, None)
 
             def _rest() -> None:
+                session.info.pop("monitoring_events", None)  # a retried attempt queues again
                 session.query(MonitorDailyAggregate).delete(synchronize_session=False)
-                MaintenanceStore.delete_outages_in(session, None)  # clocks restart with the states
+                # Clocks restart with the states; reported outages are closed.
+                self.maintenance.close_outages(session, None, RECOVERY_RESET)
                 session.query(MonitorRecord).update(
                     {
                         MonitorRecord.latest_state: MonitorState.UNKNOWN.value,
@@ -1934,6 +2353,7 @@ class MonitoringService:
                 session.commit()
 
             self._retrying(session, _rest)
+            self._flush_session_events(session)
             return deleted
         finally:
             session.close()
@@ -2041,7 +2461,14 @@ class MonitoringService:
         monitor. The caller resyncs the scheduler on the loop afterwards
         (``sync_scheduler_jobs_from``) and calls ``reset_probe_state``.
         """
-        ids = self.monitor_ids_for_scope(scope)
+        return self.delete_monitor_ids(self.monitor_ids_for_scope(scope))
+
+    def delete_monitor_ids(self, ids: List[str]) -> Dict[str, int]:
+        """Delete the given monitors with heartbeats, aggregates, outage clocks and
+        monitor-pinned windows: READ COMMITTED, ``DELETE_CHUNK`` monitors per
+        committed transaction, heartbeats in ``PRUNE_BATCH`` statements, every
+        batch retried on 1020/1205/1213 — no statement near the 60 s cap."""
+        ids = list(ids)
         result = {"monitors": 0, "heartbeats": 0, "aggregates": 0}
         session = self._maintenance_session()
         if not session:
@@ -2052,10 +2479,11 @@ class MonitoringService:
                 result["heartbeats"] += self._delete_heartbeats_for(session, chunk)
 
                 def _rest() -> int:
+                    session.info.pop("monitoring_events", None)  # a retried attempt queues again
                     n = session.query(MonitorDailyAggregate).filter(
                         MonitorDailyAggregate.monitor_id.in_(chunk)
                     ).delete(synchronize_session=False)
-                    MaintenanceStore.delete_outages_in(session, chunk)
+                    self.maintenance.close_outages(session, chunk, RECOVERY_REMOVED)
                     # Manual windows pinned to a deleted monitor go with it; CI-level
                     # windows stay (the CI may come back under a new monitor).
                     session.query(MaintenanceWindowRecord).filter(
@@ -2068,6 +2496,7 @@ class MonitoringService:
                     return n
 
                 result["aggregates"] += self._retrying(session, _rest)
+                self._flush_session_events(session)
             result["monitors"] = len(ids)
             return result
         finally:
@@ -2128,11 +2557,18 @@ class MonitoringService:
         self.request_full_probe()
         self._notify_monitors_changed("probe_all")
 
-    async def refresh_rollups(self):
-        await asyncio.to_thread(self._refresh_rollups_sync)
+    async def refresh_rollups(self, days_back: tuple = (0,)):
+        await asyncio.to_thread(self._refresh_rollups_sync, days_back)
 
-    def _refresh_rollups_sync(self):
-        """Recompute today's aggregates, ROLLUP_CHUNK monitors per committed READ
+    async def _nightly_rollup(self):
+        """The 00:05 job heals the day that just ENDED. Recomputing the brand-new
+        day (what it did before) healed nothing — and overwrote increments that
+        concurrent probes wrote between the read and the commit (MO-21). The
+        finished day takes no more writes, so its recompute cannot lose any."""
+        await self.refresh_rollups(days_back=(1,))
+
+    def _refresh_rollups_sync(self, days_back: tuple = (0,)):
+        """Recompute the aggregates of the given days (default: today), ROLLUP_CHUNK monitors per committed READ
         COMMITTED transaction (retried on 1020/1205/1213, and on 1062 when a
         concurrent writer inserted today's row first), then the uptime windows."""
         session = self._rc_session()
@@ -2146,7 +2582,8 @@ class MonitoringService:
 
                 def _write(chunk=chunk) -> None:
                     for record in session.query(MonitorRecord).filter(MonitorRecord.monitor_id.in_(chunk)).all():
-                        self._recompute_daily_aggregate(session, record)
+                        for back in days_back:
+                            self._recompute_daily_aggregate(session, record, back)
                     session.commit()
 
                 self._retrying(session, _write, extra_codes=(1062,))
@@ -2178,7 +2615,36 @@ class MonitoringService:
         parts = monitor_id.split(":")
         return parts[1] if len(parts) >= 2 and parts[1] else monitor_id
 
-    async def run_scheduled_probe(self, monitor_id: str):
+    def _circuit_cap(self) -> float:
+        """Longest pause of an open host circuit. Half the default outage delay
+        (``offline_minutes``), so a host that came back is probed again well
+        before its outage would be reported — the fixed 30 min cap left hosts
+        unprobed far beyond that (MO-03)."""
+        minutes = self.maintenance.settings.default_offline_minutes
+        if minutes <= 0:
+            return self._host_circuit_max
+        return min(self._host_circuit_max, max(60.0, minutes * 60.0 / 2))
+
+    def _circuit_bypass(self, record_data: Dict[str, Any], host_key: str) -> bool:
+        """Whether a probe runs although its host circuit is open.
+
+        * The host's own (``server``) monitor is the breaker's canary: it is
+          probed every interval, and its first success closes the circuit for
+          the dependent service monitors. Skipping it too meant nobody noticed
+          the host coming back for up to the whole backoff.
+        * A monitor still shown as MAINTENANCE whose maintenance is over: the
+          failures that opened the circuit happened inside the window. Close the
+          circuit and look again now, before the outage clock runs out."""
+        if record_data.get("monitor_type") == MonitorType.SERVER.value:
+            return True
+        if record_data.get("latest_state") == MonitorState.MAINTENANCE.value:
+            if not self.maintenance.cache.state_for(record_data, _utc_now()).active:
+                self._host_failures.pop(host_key, None)
+                self._host_circuit_until.pop(host_key, None)
+                return True
+        return False
+
+    async def run_scheduled_probe(self, monitor_id: str, force: bool = False) -> Optional[MonitorState]:
         """Run a single probe without blocking the event loop.
 
         Phase 1 – DB read  (thread): load record fields.
@@ -2189,25 +2655,29 @@ class MonitoringService:
         failing (so a broken backend can't flood the loop), and flap dampening
         suppresses a single transient failure (no DB write / no state_changed
         emit) until ``_flap_threshold`` consecutive failures are seen.
+
+        ``force`` (outage confirmation) ignores the circuit breaker. Returns the
+        probed state, or ``None`` when no probe ran or its result was not stored.
         """
         if monitor_id in self._inflight_probes or self.is_quiesced or not self.owns(monitor_id):
             # quiesced: a destructive maintenance job runs somewhere in the cluster;
             # not owned: sharded mode, another worker probes this monitor.
-            return
+            return None
         self._inflight_probes.add(monitor_id)
+        fence = self._probe_fence()
         try:
             # Phase 1: read from DB in a worker thread so the event loop stays free.
             record_data = await asyncio.to_thread(self._load_probe_record, monitor_id)
             if not record_data:
-                return
+                return None
 
             host_key = self._host_key_for(monitor_id, record_data.get("host_name"))
             now = time.monotonic()
 
-            # Circuit breaker: while a host is in backoff, skip the probe entirely.
+            # Circuit breaker: while a host is in backoff, skip its dependent probes.
             deadline = self._host_circuit_until.get(host_key, 0.0)
-            if deadline and now < deadline:
-                return
+            if deadline and now < deadline and not force and not self._circuit_bypass(record_data, host_key):
+                return None
 
             # Phase 2: async network probe (already non-blocking).
             state = MonitorState.UNKNOWN
@@ -2215,10 +2685,16 @@ class MonitoringService:
             error_message = None
             try:
                 async with self._probe_semaphore:
-                    state, latency_ms, error_message = await self._dispatch_probe(record_data)
+                    state, latency_ms, error_message = await asyncio.wait_for(
+                        self._dispatch_probe(record_data),
+                        timeout=self._probe_deadline(record_data.get("timeout_seconds")),
+                    )
+            except asyncio.TimeoutError:
+                state = MonitorState.DOWN
+                error_message = "Probe deadline exceeded"
             except Exception as exc:
                 state = MonitorState.DOWN
-                error_message = str(exc)
+                error_message = redact_url_userinfo(str(exc))
 
             if state != MonitorState.DOWN:
                 # Recovery: clear this monitor's and its host's failure state.
@@ -2234,7 +2710,7 @@ class MonitoringService:
                 host_fails = self._host_failures[host_key]
                 if host_fails >= self._host_circuit_threshold:
                     n = host_fails - self._host_circuit_threshold
-                    delay = min(self._host_circuit_max, self._host_circuit_base * (2 ** min(n, 16)))
+                    delay = min(self._circuit_cap(), self._host_circuit_base * (2 ** min(n, 16)))
                     self._host_circuit_until[host_key] = now + delay
 
                 # Flap dampening: suppress a transient DOWN until confirmed. Never
@@ -2243,7 +2719,15 @@ class MonitoringService:
                     self._consec_failures[monitor_id] < self._flap_threshold
                     and record_data.get("latest_state") in (MonitorState.UP.value, None)
                 ):
-                    return
+                    return None
+
+            if fence != self._probe_fence():
+                # This instance stopped probing (lease lost, plugin stopping) or the
+                # lease changed hands while the probe ran: the new prober owns the
+                # monitor now. A late write from here would flip states between two
+                # vantage points and double the samples.
+                self.ctx.log.debug(f"State Monitoring: stale probe result for '{monitor_id}' discarded.")
+                return None
 
             # Phase 3: write result + aggregates in a worker thread.
             try:
@@ -2257,6 +2741,8 @@ class MonitoringService:
                 if code not in (1020, 1205, 1213):
                     raise
                 self.ctx.log.debug(f"State Monitoring: probe write for '{monitor_id}' skipped (MariaDB {code}).")
+                return None
+            return state
         finally:
             self._inflight_probes.discard(monitor_id)
 
@@ -2264,11 +2750,92 @@ class MonitoringService:
     # Inventory sync
     # ------------------------------------------------------------------
 
-    def ingest_inventory_snapshot(self, payload: InventorySyncPayload) -> Dict[str, int]:
+    INVENTORY_OWNER_SOURCES = ("orchestrator_service", "iac_orchestrator")
+    #: Below this many removals the percentage says nothing (a fleet of 6 monitors
+    #: losing one host is 50 %) — small clean-ups always pass.
+    INVENTORY_GUARD_MIN_STALE = 5
+
+    def _managed_inventory_ids(self, owner_source: str) -> set:
+        """Ids of the monitors an inventory import of ``owner_source`` manages."""
+        session = self._session()
+        if not session:
+            return set()
+        try:
+            owners = {owner_source, *self.INVENTORY_OWNER_SOURCES}
+            rows = (
+                session.query(MonitorRecord.monitor_id)
+                .filter(
+                    MonitorRecord.owner_source.in_(owners),
+                    MonitorRecord.monitor_id.like("host:%") | MonitorRecord.monitor_id.like("service:%"),
+                )
+                .all()
+            )
+            return {r[0] for r in rows}
+        finally:
+            session.close()
+
+    def _inventory_guard_reason(self, payload: InventorySyncPayload, before: set, stale: set) -> Optional[str]:
+        """Why this import must NOT remove ``stale`` (None = removal is plausible).
+
+        An empty, truncated or half-generated inventory used to delete every
+        managed monitor with its history (MO-15). Removal now needs a plausible
+        payload or the publisher's explicit ``allow_mass_delete``."""
+        if not stale or payload.allow_mass_delete:
+            return None
+        if not payload.hosts and not payload.services:
+            return "the inventory is empty"
+        if not payload.hosts and any(mid.startswith("host:") for mid in before):
+            return "the inventory lists no hosts"
+        limit = self._inventory_max_stale_percent
+        share = 100.0 * len(stale) / max(1, len(before))
+        min_stale = 0 if limit == 0 else self.INVENTORY_GUARD_MIN_STALE
+        if len(stale) > min_stale and share > limit:
+            return f"it would remove {len(stale)} of {len(before)} managed monitors ({share:.0f} % > {limit} %)"
+        return None
+
+    def _report_inventory_guard(self, reason: str, stale: set, revision: Optional[str]) -> None:
+        """Log + operator notification instead of the delete."""
+        body = (
+            f"Inventory import{f' (revision {revision})' if revision else ''}: {reason}. "
+            f"{len(stale)} monitor(s) missing from it were kept. Publish a complete inventory, send "
+            "allow_mass_delete=true with the import, raise 'inventory_max_stale_percent', or use "
+            "'Delete IaC-managed monitors' in the plugin settings if the removal is intended."
+        )
+        self.ctx.log.warning(f"State Monitoring: {body}")
+        notify = getattr(self.ctx, "notify", None)
+        if not callable(notify):
+            return
+
+        def _do() -> None:
+            try:
+                notify(
+                    "inventory_guard",
+                    {"reason": reason, "kept": len(stale), "source_revision": revision},
+                    notification_id="monitoring:inventory_guard",
+                    title="State Monitoring: inventory import did not remove monitors",
+                    body=body,
+                    severity="warning",
+                )
+            except Exception as exc:  # undeclared endpoint on an old manifest, router down …
+                self.ctx.log.debug(f"State Monitoring: inventory guard notification failed: {exc}")
+
+        if not self._call_on_loop(_do):  # the router emits on the bus → loop thread
+            _do()
+
+    def ingest_inventory_snapshot(self, payload: InventorySyncPayload, delete_stale: bool = True) -> Dict[str, Any]:
+        """Upsert the inventory's monitors and remove the ones that left it.
+
+        ``delete_stale=False`` (the loop-driven import) only plans the removal and
+        returns the ids as ``stale_ids`` so the caller can stop the probe writers
+        first; the default deletes right away (sync callers, tests) — batched and
+        retried either way."""
         def _ci(value: Any) -> Optional[str]:
             text_value = str(value).strip() if value is not None else ""
             return text_value[:36] or None
 
+        # Taken before the upserts: the share that disappears is measured against
+        # what existed, not diluted by monitors this very import creates.
+        before_ids = self._managed_inventory_ids(payload.owner_source)
         upserts = 0
         for host in payload.hosts:
             host_name = host.get("host_name") or host.get("hostname")
@@ -2288,18 +2855,22 @@ class MonitoringService:
                     source_hash=payload.source_revision,
                     # Entity-Registry id attached by the orchestrator (>= 1.6.0); empty before.
                     ci_id=_ci(host.get("ci_id")),
-                    metadata={
+                    # The publisher may send whole ``terraform`` blocks (provider
+                    # passwords/tokens): reduced to the allowlist right here so the
+                    # secret never enters a model, a hash, a log line or the table.
+                    metadata=sanitize_metadata({
+                        "site": host.get("site"),
                         "stage": host.get("stage"),
                         "groups": host.get("groups") or host.get("ansible_groups") or [],
                         "baseline_roles": host.get("baseline_roles") or [],
                         "profiles": host.get("profiles") or [],
                         "terraform": host.get("terraform") or {},
-                    },
+                    }),
                 ), sync_scheduler=False)
                 upserts += 1
             except Exception as exc:
                 if self.ctx:
-                    self.ctx.log.warning(f"Inventory sync: skipping host {host_name!r}: {exc}")
+                    self.ctx.log.warning(f"Inventory sync: skipping host {host_name!r}: {safe_error_text(exc)}")
 
         for svc in payload.services:
             host_name = svc.get("host_name") or svc.get("hostname")
@@ -2323,21 +2894,23 @@ class MonitoringService:
                     enabled=bool(target),
                     ci_id=_ci(svc.get("ci_id")),
                     host_ci_id=_ci(svc.get("host_ci_id")),
-                    metadata={
+                    # The service ``config`` block (env + secrets) and ``git_repo``
+                    # (URL may embed a token) are not taken over — nothing reads them.
+                    metadata=sanitize_metadata({
                         "site": svc.get("site"),
                         "stage": svc.get("stage"),
                         "groups": svc.get("groups") or svc.get("ansible_groups") or [],
                         "deploy_type": svc.get("deploy_type"),
                         "desired_state": svc.get("desired_state") or svc.get("state"),
-                        "git_repo": svc.get("git_repo"),
                         "git_version": svc.get("git_version"),
-                        "config": svc.get("config") or {},
-                    },
+                    }),
                 ), sync_scheduler=False)
                 upserts += 1
             except Exception as exc:
                 if self.ctx:
-                    self.ctx.log.warning(f"Inventory sync: skipping service {host_name!r}:{service_name!r}: {exc}")
+                    self.ctx.log.warning(
+                        f"Inventory sync: skipping service {host_name!r}:{service_name!r}: {safe_error_text(exc)}"
+                    )
 
         # Delete monitors that were previously owned by this source but are no
         # longer present in the current payload (host/service removed upstream).
@@ -2352,38 +2925,20 @@ class MonitoringService:
             if hn and sn:
                 fresh_ids.add(f"service:{hn}:{sn}")
 
-        stale_deleted = 0
-        legacy_owner_sources = {payload.owner_source, "orchestrator_service", "iac_orchestrator"}
-        session_stale = self._session()
-        if session_stale:
-            try:
-                stale = (
-                    session_stale.query(MonitorRecord)
-                    .filter(
-                        MonitorRecord.owner_source.in_(legacy_owner_sources),
-                        MonitorRecord.monitor_id.like("host:%")
-                        | MonitorRecord.monitor_id.like("service:%"),
-                    )
-                    .all()
-                )
-                stale_ids = [rec.monitor_id for rec in stale if rec.monitor_id not in fresh_ids]
-                if stale_ids:
-                    session_stale.query(MonitorHeartbeat).filter(
-                        MonitorHeartbeat.monitor_id.in_(stale_ids)
-                    ).delete(synchronize_session=False)
-                    session_stale.query(MonitorDailyAggregate).filter(
-                        MonitorDailyAggregate.monitor_id.in_(stale_ids)
-                    ).delete(synchronize_session=False)
-                    MaintenanceStore.delete_outages_in(session_stale, stale_ids)
-                    session_stale.query(MaintenanceWindowRecord).filter(
-                        MaintenanceWindowRecord.monitor_id.in_(stale_ids)
-                    ).delete(synchronize_session=False)
-                    session_stale.query(MonitorRecord).filter(
-                        MonitorRecord.monitor_id.in_(stale_ids)
-                    ).delete(synchronize_session=False)
-                    stale_deleted = len(stale_ids)
-                    session_stale.commit()
-            finally:
-                session_stale.close()
-
-        return {"upserts": upserts, "stale_deleted": stale_deleted, "source_revision": payload.source_revision}
+        stale = before_ids - fresh_ids
+        stats: Dict[str, Any] = {
+            "upserts": upserts, "stale_deleted": 0, "stale_skipped": 0,
+            "source_revision": payload.source_revision,
+        }
+        reason = self._inventory_guard_reason(payload, before_ids, stale)
+        if reason:
+            self._report_inventory_guard(reason, stale, payload.source_revision)
+            stats["stale_skipped"] = len(stale)
+            stats["stale_guard"] = reason
+            return stats
+        stale_ids = sorted(stale)
+        if not delete_stale:
+            stats["stale_ids"] = stale_ids
+        elif stale_ids:
+            stats["stale_deleted"] = self.delete_monitor_ids(stale_ids)["monitors"]
+        return stats

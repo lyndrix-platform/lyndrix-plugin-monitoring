@@ -24,9 +24,9 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, overload
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, overload
 
 from sqlalchemy.exc import IntegrityError
 
@@ -38,6 +38,7 @@ from ..model.models import (
     MonitorRecord,
     MonitorState,
     MonitorType,
+    OutageEventRecord,
     OutageRecord,
     OverrideCreate,
     WindowCreate,
@@ -50,6 +51,8 @@ MANUAL_SOURCE = "monitoring"
 #: peers to reload their maintenance cache (``"maintenance"`` already means
 #: "destructive maintenance ran, reload your probe jobs").
 CHANGE_REASON = "maintenance_windows"
+# Floor for the cap on overrides that arrive over the bus (see on_override_started).
+BUS_OVERRIDE_MIN_CAP_MINUTES = 24 * 60
 #: Kinds with a dedicated on/off setting; every other kind is governed by
 #: ``outage_rules_disabled_kinds`` (kinds are open, decision A).
 SWITCHED_KINDS = ("hypervisor", "host", "service", "container")
@@ -57,6 +60,14 @@ SWITCHED_KINDS = ("hypervisor", "host", "service", "container")
 OUTAGE_OPEN = "open"
 OUTAGE_PERSISTED = "persisted"
 OUTAGE_RECOVERED = "recovered"
+
+#: ``reason`` of ``monitoring:outage_recovered`` (additive payload field): the
+#: monitor answered again, or the reported outage was dropped for another cause
+#: — a consumer must close its incident either way (MO-08).
+RECOVERY_RECOVERED = "recovered"
+RECOVERY_PAUSED = "paused"
+RECOVERY_REMOVED = "monitor_removed"
+RECOVERY_RESET = "reset"
 
 
 # --------------------------------------------------------------------------- #
@@ -797,6 +808,8 @@ class MaintenanceCache:
         self._host_ci: Dict[str, str] = {}
         self.loaded_at: float = 0.0
         self.generation = 0
+        # (monitor-level key, ci_id) → (computed_at, valid_until, state); see state_for.
+        self._state_memo: Dict[Tuple[Optional[str], Optional[str]], Tuple[datetime, datetime, mw.MaintenanceState]] = {}
 
     # -- loading -----------------------------------------------------------------
 
@@ -860,6 +873,7 @@ class MaintenanceCache:
         )
         self._rules_by_ci, self._kind_by_ci, self._name_by_ci = rules, kinds, names
         self._host_ci = dict(host_ci)
+        self._state_memo = {}  # everything below was computed from the old tables
         self.loaded_at = time.monotonic()
         self.generation += 1
 
@@ -920,19 +934,48 @@ class MaintenanceCache:
     def windows_for_ci(self, ci_id: Optional[str]) -> List[mw.Schedule]:
         return list(self._windows_by_ci.get(ci_id, [])) if ci_id else []
 
+    #: How long one evaluated state is reused. ``mw.effective_state`` walks every
+    #: window occurrence up to the horizon — 0.1 ms for a weekly window, ~200 ms
+    #: for a dense cron — and used to run per monitor on every dashboard read,
+    #: every DOWN heartbeat and every evaluator row (MO-12). Monitors sharing a
+    #: CI now share one evaluation per TTL.
+    STATE_TTL_SECONDS = 60
+
     def state_for(self, record: Any, now: datetime) -> mw.MaintenanceState:
         """Effective maintenance state of one monitor: its own manual windows and
-        overrides (by monitor_id) plus those of its (effective) CI."""
+        overrides (by monitor_id) plus those of its (effective) CI.
+
+        Memoised per CI (per monitor only when the monitor has windows/overrides
+        of its own). An entry is reused only for a later ``now`` that lies before
+        both the TTL and the next known transition (end of the running window,
+        start of the next one, start of a future override), so a reused state is
+        never stale; ``reload()`` drops the memo when the tables changed."""
         monitor_id, *_rest = _attrs(record)
         ci_id, _host_ci_id = self.resolve_ci(record)
-        schedules = list(self._windows_by_monitor.get(monitor_id, ()))
-        overrides = list(self._overrides_by_monitor.get(monitor_id, ()))
+        own_schedules = self._windows_by_monitor.get(monitor_id, ())
+        own_overrides = self._overrides_by_monitor.get(monitor_id, ())
+        schedules = list(own_schedules)
+        overrides = list(own_overrides)
         if ci_id:
             schedules.extend(self._windows_by_ci.get(ci_id, ()))
             overrides.extend(self._overrides_by_ci.get(ci_id, ()))
         if not schedules and not overrides:
             return mw.MaintenanceState(False, None, None, None, None)
-        return mw.effective_state(schedules, overrides, aware(now))
+        now = aware(now)
+        memo = self._state_memo
+        key = (monitor_id if (own_schedules or own_overrides) else None, ci_id)
+        hit = memo.get(key)
+        if hit is not None and hit[0] <= now < hit[1]:
+            return hit[2]
+        state = mw.effective_state(schedules, overrides, now)
+        valid_until = now + timedelta(seconds=self.STATE_TTL_SECONDS)
+        transitions = [state.until if state.active else state.next_start]
+        transitions.extend(o.started_at for o in overrides if o.started_at > now)
+        for moment in transitions:
+            if moment is not None and now < moment < valid_until:
+                valid_until = moment
+        memo[key] = (now, valid_until, state)
+        return state
 
     def rule_for(self, record: Any) -> Optional[mw.IncidentRule]:
         """Incident rule cascade: rule published for the service CI → rule of the
@@ -996,6 +1039,13 @@ class MaintenanceManager:
         """Something was written here: refresh the local cache and tell the peers
         (own cluster broadcast; the ``maintenance:*`` events themselves stay local)."""
         self.reload()
+        try:
+            # Windows/overrides just changed: bring the outage clocks in line now
+            # (an override that ended early must not keep suppressing until its
+            # original end — MO-02); the evaluator repeats this every minute.
+            self.refresh_suppression()
+        except Exception as exc:
+            self.log.debug(f"State Monitoring: outage clock refresh skipped: {exc}")
         self.svc._emit_cluster(
             "monitoring:monitors_changed",
             {
@@ -1019,7 +1069,10 @@ class MaintenanceManager:
             normalize_item(it, log=self.log) for it in (payload.get("items") or [])
         ]
         valid = [it for it in items if it is not None]
-        if payload.get("replaces", True):
+        # Replacing is opt-in: a publisher that forgets the flag (or a bug in an
+        # unrelated plugin using someone else's source name) must not wipe that
+        # source's earlier windows (MO-17).
+        if payload.get("replaces") is True:
             n = self.store.replace_windows(source, valid)
         else:
             n = self.store.upsert_items(source, valid)
@@ -1034,6 +1087,16 @@ class MaintenanceManager:
         if payload.get("source") == MANUAL_SOURCE:
             return False
         override = mw.override_from_payload(payload)
+        # Manual overrides are capped at override_max_minutes; bus overrides get a
+        # generous cap of their own so a publisher bug (no end, until=2099) cannot
+        # silence a CI's outages indefinitely (MO-17).
+        cap = timedelta(minutes=max(self.settings.override_max_minutes, BUS_OVERRIDE_MIN_CAP_MINUTES))
+        if override.until > override.started_at + cap:
+            self.log.warning(
+                f"State Monitoring: override '{override.override_id}' from "
+                f"'{override.source or '?'}' ends after {cap} — capped."
+            )
+            override = replace(override, until=override.started_at + cap)
         self.store.upsert_override(override)
         self.after_local_change()
         return True
@@ -1085,7 +1148,9 @@ class MaintenanceManager:
         errors = mw.validate_windows(data.windows, default_tz="UTC")
         if errors:
             raise ValueError("; ".join(errors))
-        windows = mw.to_dicts(mw.parse_windows(data.windows, default_tz="UTC"))
+        schedules = mw.parse_windows(data.windows, default_tz="UTC")
+        self._reject_endless_cron(schedules)
+        windows = mw.to_dicts(schedules)
         ci_id = data.ci_id.strip() if data.ci_id else None
         monitor_id = data.monitor_id.strip() if data.monitor_id else None
         host_ci_id = None
@@ -1112,6 +1177,35 @@ class MaintenanceManager:
         self.publish_manual_windows()
         self.after_local_change()
         return row
+
+    #: A cron window that is still running this far ahead has no gap at all.
+    ENDLESS_CRON_PROBE = timedelta(days=31)
+
+    @classmethod
+    def _reject_endless_cron(cls, schedules: Sequence[mw.Schedule]) -> None:
+        """A cron window whose duration reaches the next firing (``*/15`` for 30
+        minutes) never ends: it is a permanent pause that also makes every
+        evaluation walk thousands of occurrences and report a made-up end 30
+        days ahead (MO-12). Refused with a clear message; a pause is what the
+        monitor's pause action or an override is for."""
+        now = mw.utcnow()
+        for schedule in schedules:
+            if not isinstance(schedule, mw.CronSchedule):
+                continue
+            running = mw.next_window([schedule], now, horizon=cls.ENDLESS_CRON_PROBE)
+            endless = running is not None and running.start <= now and running.end >= now + cls.ENDLESS_CRON_PROBE
+            if not endless:
+                # Cores with ``MaintenanceState.open_ended`` (≥ 1.12) stop
+                # coalescing after a bounded chain, so ``running.end`` is only a
+                # lower bound there and never reaches the probe horizon. The
+                # flag is the authoritative "no gap" answer on those cores.
+                endless = bool(getattr(mw.effective_state([schedule], [], now), "open_ended", False))
+            if endless:
+                raise ValueError(
+                    f"cron window '{schedule.expr}' with duration_minutes={schedule.duration_minutes} never ends "
+                    "(the duration reaches the next firing) — shorten the duration, or pause the monitor / "
+                    "use an override instead"
+                )
 
     def delete_manual_window(self, window_id: int) -> str:
         status = self.store.delete_window(window_id)
@@ -1301,9 +1395,8 @@ class MaintenanceManager:
         now_naive = naive(aware(now))
         row = session.get(OutageRecord, record.monitor_id)
         if effective in (MonitorState.DOWN, MonitorState.MAINTENANCE):
-            suppressed = (
-                naive(ms.until) if (ms is not None and ms.active and ms.until) else None
-            )
+            in_maintenance = ms is not None and ms.active
+            suppressed = self.suppression_mark(ms, aware(now)) if in_maintenance else None
             if row is None or row.state == OUTAGE_RECOVERED:
                 if row is not None:
                     session.delete(row)
@@ -1321,10 +1414,15 @@ class MaintenanceManager:
                     )
                 )
                 return
-            if suppressed is not None and (
-                row.suppressed_until is None or naive(row.suppressed_until) < suppressed
-            ):
-                row.suppressed_until = suppressed
+            if row.state == OUTAGE_OPEN:
+                if in_maintenance:
+                    # Always the CURRENT bound — it may move back when an override
+                    # ended early or a window was shortened (MO-02).
+                    row.suppressed_until = suppressed
+                elif row.suppressed_until is not None and naive(row.suppressed_until) > now_naive:
+                    # DOWN outside maintenance although the stored bound is still
+                    # ahead: that maintenance is over, the clock counts from now.
+                    row.suppressed_until = now_naive
             row.error = error_message
             row.updated_at = now_naive
             return
@@ -1349,30 +1447,183 @@ class MaintenanceManager:
                 )
             )
             if n == 1 and row.outage_id and row.ci_id:
-                since = aware(row.down_since)
-                session.info.setdefault("monitoring_events", []).append(
-                    (
-                        mw.TOPIC_OUTAGE_RECOVERED,
-                        {
-                            "outage_id": row.outage_id,
-                            "ci_id": row.ci_id,
-                            "since": mw.iso(since),
-                            "recovered_at": mw.iso(aware(now)),
-                            "duration_s": int((aware(now) - since).total_seconds()),
-                        },
-                    )
+                self.queue_event(
+                    session,
+                    mw.TOPIC_OUTAGE_RECOVERED,
+                    self.recovered_payload(row, aware(now), RECOVERY_RECOVERED),
                 )
         session.query(OutageRecord).filter(
             OutageRecord.monitor_id == record.monitor_id
         ).delete(synchronize_session=False)
 
     @staticmethod
-    def flush_session_events(session, emit) -> int:
-        """Emit the events queued by ``track_outage`` — call after ``commit()``."""
+    def recovered_payload(row: OutageRecord, now: datetime, reason: str) -> Dict[str, Any]:
+        since = aware(row.down_since)
+        return {
+            "outage_id": row.outage_id,
+            "ci_id": row.ci_id,
+            "since": mw.iso(since),
+            "recovered_at": mw.iso(now),
+            "duration_s": max(0, int((now - since).total_seconds())),
+            "reason": reason,
+        }
+
+    @staticmethod
+    def queue_event(session, topic: str, payload: Dict[str, Any]) -> None:
+        """Write an outage event to the outbox inside the caller's transaction
+        (it exists exactly when the state change committed) and remember it on
+        the session; ``flush_session_events`` delivers it right after the commit."""
+        session.add(
+            OutageEventRecord(
+                topic=topic,
+                outage_id=str(payload.get("outage_id") or "")[:128],
+                payload_json=json.dumps(payload, sort_keys=True),
+                attempts=0,
+                created_at=naive(mw.utcnow()),
+            )
+        )
+        session.info.setdefault("monitoring_events", []).append((topic, payload))
+
+    def close_outages(
+        self,
+        session,
+        monitor_ids: Optional[Sequence[str]],
+        reason: str,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Drop the outage clocks of ``monitor_ids`` (``None`` = all) inside the
+        caller's transaction. A REPORTED outage is closed with
+        ``monitoring:outage_recovered`` (``reason`` says why) — pausing, deleting
+        or resetting a monitor used to delete the row silently and the ITSM
+        incident stayed open forever (MO-08). Returns the rows removed."""
+        if monitor_ids is not None and not monitor_ids:
+            return 0
+        now_aware = aware(now) if now is not None else mw.utcnow()
+        q = session.query(OutageRecord).filter(OutageRecord.state == OUTAGE_PERSISTED)
+        if monitor_ids is not None:
+            q = q.filter(OutageRecord.monitor_id.in_(list(monitor_ids)))
+        for row in q.all():
+            if row.outage_id and row.ci_id:
+                self.queue_event(
+                    session, mw.TOPIC_OUTAGE_RECOVERED, self.recovered_payload(row, now_aware, reason)
+                )
+        return self.store.delete_outages_in(session, monitor_ids)
+
+    def flush_session_events(self, session, now: Optional[datetime] = None) -> int:
+        """Deliver the events queued on ``session`` — call after ``commit()``.
+        Whatever cannot be emitted now stays in the outbox for the evaluator."""
         events = session.info.pop("monitoring_events", None) or []
-        for topic, payload in events:
-            emit(topic, payload)
-        return len(events)
+        if not events:
+            return 0
+        outage_ids = sorted({str(payload.get("outage_id") or "") for _topic, payload in events})
+        try:
+            return self.deliver_outbox(outage_ids=outage_ids, now=now)
+        except Exception as exc:  # the state change is committed; delivery is retried
+            self.log.warning(f"State Monitoring: outage event delivery deferred: {type(exc).__name__}: {exc}")
+            return 0
+
+    # -- outbox delivery ------------------------------------------------------------------
+
+    #: How long a delivery attempt owns a row; a crashed or failed attempt is
+    #: retried by the evaluator once this has passed.
+    OUTBOX_CLAIM_SECONDS = 60
+    OUTBOX_BATCH = 200
+    #: An event that could not be emitted this often is dropped with an error
+    #: log (a permanent fault, e.g. an undeclared topic) instead of looping forever.
+    OUTBOX_MAX_ATTEMPTS = 60
+
+    def deliver_outbox(self, outage_ids: Optional[Sequence[str]] = None, now: Optional[datetime] = None) -> int:
+        """Emit pending outage events in the order they were written; returns the
+        number delivered. Sync — call off the loop.
+
+        Each row is claimed with a conditional UPDATE (one deliverer at a time),
+        emitted, and deleted only after the emit succeeded. A row that cannot be
+        claimed or emitted blocks the later events of the same outage in this
+        run, so ``outage_recovered`` never overtakes its ``outage_persisted``."""
+        now_naive = naive(aware(now) if now is not None else mw.utcnow())
+        session = self.svc._rc_session()
+        if session is None:
+            return 0
+        delivered = 0
+        try:
+            q = session.query(
+                OutageEventRecord.id, OutageEventRecord.topic, OutageEventRecord.outage_id,
+                OutageEventRecord.payload_json, OutageEventRecord.attempts,
+            )
+            if outage_ids is not None:
+                if not outage_ids:
+                    return 0
+                q = q.filter(OutageEventRecord.outage_id.in_(list(outage_ids)))
+            pending = q.order_by(OutageEventRecord.id).limit(self.OUTBOX_BATCH).all()
+            session.commit()
+            blocked: Set[str] = set()
+            for event_id, topic, outage_id, payload_json, attempts in pending:
+                if outage_id in blocked:
+                    continue
+
+                def _claim(event_id=event_id) -> int:
+                    n = (
+                        session.query(OutageEventRecord)
+                        .filter(
+                            OutageEventRecord.id == event_id,
+                            OutageEventRecord.claimed_until.is_(None)
+                            | (OutageEventRecord.claimed_until <= now_naive),
+                        )
+                        .update(
+                            {
+                                OutageEventRecord.claimed_until: now_naive
+                                + timedelta(seconds=self.OUTBOX_CLAIM_SECONDS),
+                                OutageEventRecord.attempts: OutageEventRecord.attempts + 1,
+                            },
+                            synchronize_session=False,
+                        )
+                    )
+                    session.commit()
+                    return int(n or 0)
+
+                def _done(event_id=event_id) -> None:
+                    session.query(OutageEventRecord).filter(OutageEventRecord.id == event_id).delete(
+                        synchronize_session=False
+                    )
+                    session.commit()
+
+                if self.svc._retrying(session, _claim) != 1:
+                    blocked.add(outage_id)  # another instance delivers it right now
+                    continue
+                payload = _loads(payload_json, None)
+                if not isinstance(payload, dict):
+                    self.log.error(f"State Monitoring: outage event {event_id} unreadable — dropped.")
+                    self.svc._retrying(session, _done)
+                    continue
+                if self.svc._emit_checked(topic, payload):
+                    self.svc._retrying(session, _done)
+                    delivered += 1
+                elif int(attempts or 0) + 1 >= self.OUTBOX_MAX_ATTEMPTS:
+                    self.log.error(
+                        f"State Monitoring: {topic} for outage {outage_id} could not be emitted "
+                        f"after {self.OUTBOX_MAX_ATTEMPTS} attempts — dropped."
+                    )
+                    self.svc._retrying(session, _done)
+                else:
+                    blocked.add(outage_id)  # keeps its claim as back-off; retried later
+            return delivered
+        finally:
+            session.close()
+
+    def outage_housekeeping(self, now: Optional[datetime] = None) -> None:
+        """Once per evaluator pass on the housekeeping instance: deliver what is
+        left in the outbox and purge long-expired overrides. Never raises."""
+        if not self.svc.housekeeping_here():
+            return
+        now_aware = aware(now) if now is not None else mw.utcnow()
+        try:
+            self.deliver_outbox(now=now_aware)
+        except Exception as exc:
+            self.log.warning(f"State Monitoring: outbox delivery failed: {type(exc).__name__}: {exc}")
+        try:
+            self.store.purge_expired(now_aware)
+        except Exception as exc:  # housekeeping only — never fail the evaluation
+            self.log.debug(f"State Monitoring: override purge skipped: {exc}")
 
     # -- outage evaluator (60 s job on the probing instance) ----------------------------
 
@@ -1387,14 +1638,131 @@ class MaintenanceManager:
             return svc.housekeeping_here()
         return False
 
-    def evaluate_outages(self, now: Optional[datetime] = None) -> Dict[str, int]:
+    #: Fallback for cores without ``MaintenanceState.open_ended`` (≤ 1.11.1): an
+    #: end further ahead than this is not stored as the suppression bound. Those
+    #: cores report ``now + 30 d`` for a window without a gap — an invented end.
+    #: No stored bound is needed for correctness: while the maintenance is active
+    #: the clock is simply re-marked on every evaluation.
+    SUPPRESS_STORE_HORIZON = timedelta(days=7)
+
+    @classmethod
+    def suppression_mark(cls, ms: mw.MaintenanceState, now: datetime) -> datetime:
+        """Value of ``suppressed_until`` (naive UTC) while maintenance is active:
+        its end when that is known and plausible, otherwise ``now`` — "still in
+        maintenance at this instant, look again on the next evaluation".
+
+        Newer cores flag a window that never pauses with ``open_ended`` (its
+        ``until`` is then only a lower bound); never store such an end."""
+        until = ms.until
+        if (
+            until is None
+            or getattr(ms, "open_ended", False)
+            or until - now > cls.SUPPRESS_STORE_HORIZON
+        ):
+            return naive(now)
+        return naive(until)
+
+    def _sync_suppression(
+        self,
+        session,
+        monitor_id: str,
+        ms: mw.MaintenanceState,
+        suppressed_until: Optional[datetime],
+        now_aware: datetime,
+    ) -> Optional[datetime]:
+        """Recompute ``suppressed_until`` of an OPEN outage from the CURRENT
+        maintenance state and store it when it changed (it can shrink). Returns
+        the value to use (aware UTC)."""
+        if ms.active:
+            target: Optional[datetime] = self.suppression_mark(ms, now_aware)
+        elif suppressed_until is not None and suppressed_until > now_aware:
+            # Not in maintenance, yet the stored bound lies ahead: the override
+            # ended early or the window was shortened/deleted. Count from now.
+            target = naive(now_aware)
+        else:
+            return suppressed_until
+        return self._store_suppressed(session, monitor_id, target, suppressed_until, now_aware)
+
+    def _store_suppressed(
+        self,
+        session,
+        monitor_id: str,
+        target: datetime,
+        suppressed_until: Optional[datetime],
+        now_aware: datetime,
+    ) -> datetime:
+        """Write ``suppressed_until = target`` (naive UTC) on an OPEN outage
+        unless it already holds that value; returns it as aware UTC."""
+        if suppressed_until is not None and naive(suppressed_until) == target:
+            return suppressed_until
+
+        def _write() -> None:
+            session.query(OutageRecord).filter(
+                OutageRecord.monitor_id == monitor_id,
+                OutageRecord.state == OUTAGE_OPEN,
+            ).update(
+                {
+                    OutageRecord.suppressed_until: target,
+                    OutageRecord.updated_at: naive(now_aware),
+                },
+                synchronize_session=False,
+            )
+            session.commit()
+
+        self.svc._retrying(session, _write)
+        return aware(target)
+
+    def refresh_suppression(self, now: Optional[datetime] = None) -> int:
+        """Sync: re-derive ``suppressed_until`` of every open outage from the
+        current windows/overrides. Called right after they changed (any
+        instance) — idempotent, so it does not matter who else does it too."""
+        now_aware = aware(now) if now is not None else mw.utcnow()
+        session = self.svc._rc_session()
+        if session is None:
+            return 0
+        changed = 0
+        try:
+            pending = [
+                (r.monitor_id, aware(r.suppressed_until))
+                for r in session.query(OutageRecord).filter(OutageRecord.state == OUTAGE_OPEN).all()
+            ]
+            session.expunge_all()
+            for monitor_id, suppressed_until in pending:
+                record = self.svc._get_monitor(session, monitor_id)
+                if record is None:
+                    continue
+                ms = self.cache.state_for(record, now_aware)
+                session.expunge(record)  # the write below commits; keep nothing to refresh
+                if self._sync_suppression(session, monitor_id, ms, suppressed_until, now_aware) != suppressed_until:
+                    changed += 1
+            return changed
+        finally:
+            session.close()
+
+    def evaluate_outages(
+        self,
+        now: Optional[datetime] = None,
+        *,
+        confirmed: Optional[Set[str]] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
         """Sync (run off the loop). For every open outage outside maintenance whose
         effective downtime reached the rule's ``offline_minutes``: mark it
         ``persisted`` with a conditional UPDATE and emit ``monitoring:outage_persisted``
-        exactly once (``rowcount == 1`` wins, also across a lease handover)."""
+        exactly once (``rowcount == 1`` wins, also across a lease handover).
+
+        ``dry_run`` reports the outages that are due as ``stats["due"]`` =
+        ``[(monitor_id, probeable)]`` without reporting anything. ``confirmed``
+        (the scheduled job passes it) restricts reporting to monitors whose DOWN
+        was just confirmed by a fresh probe — the stored state may be stale when
+        the host circuit breaker skipped probes (MO-03); ``None`` = no restriction
+        (direct callers that know the state is current)."""
         now_aware = aware(now) if now is not None else mw.utcnow()
         self.cache.reload_if_stale(self.CACHE_MAX_AGE_SECONDS)
-        stats = {"checked": 0, "persisted": 0, "suppressed": 0, "skipped": 0}
+        stats: Dict[str, Any] = {
+            "checked": 0, "persisted": 0, "suppressed": 0, "skipped": 0, "unconfirmed": 0, "held": 0,
+        }
+        due: List[Tuple[str, bool]] = []
         session = self.svc._rc_session()
         if session is None:
             return stats
@@ -1408,6 +1776,7 @@ class MaintenanceManager:
                 .all()
             ]
             session.expunge_all()
+            down_hosts, open_children = self._outage_topology(session, {p[0] for p in pending})
             for monitor_id, down_since, suppressed_until, error in pending:
                 if not self._evaluates(monitor_id):
                     continue
@@ -1419,28 +1788,21 @@ class MaintenanceManager:
                     ).delete(synchronize_session=False)
                     session.commit()
                     continue
+                # Detached snapshot: the writes below commit and would expire it.
+                session.expunge(record)
                 ms = self.cache.state_for(record, now_aware)
+                suppressed_until = self._sync_suppression(
+                    session, monitor_id, ms, suppressed_until, now_aware
+                )
                 if ms.active:
                     stats["suppressed"] += 1
-                    if ms.until is not None and (
-                        suppressed_until is None or suppressed_until < ms.until
-                    ):
-                        until = naive(ms.until)
-
-                        def _extend(until=until) -> None:
-                            session.query(OutageRecord).filter(
-                                OutageRecord.monitor_id == monitor_id,
-                                OutageRecord.state == OUTAGE_OPEN,
-                            ).update(
-                                {
-                                    OutageRecord.suppressed_until: until,
-                                    OutageRecord.updated_at: naive(now_aware),
-                                },
-                                synchronize_session=False,
-                            )
-                            session.commit()
-
-                        self.svc._retrying(session, _extend)
+                    continue
+                if self._held_by_host(record, down_hosts, now_aware):
+                    # Parent down (MO-10): the host outage covers this service.
+                    # Its own clock is re-marked like inside a maintenance window,
+                    # so it only starts counting once the host is back.
+                    stats["held"] += 1
+                    self._store_suppressed(session, monitor_id, naive(now_aware), suppressed_until, now_aware)
                     continue
                 rule = self.cache.rule_for(record)
                 if rule is None:
@@ -1460,6 +1822,18 @@ class MaintenanceManager:
                         )
                     stats["skipped"] += 1
                     continue
+                if record.latest_state not in (MonitorState.DOWN.value, MonitorState.MAINTENANCE.value):
+                    # The monitor is not known to be down right now (UNKNOWN: this
+                    # instance cannot probe it; PAUSED) — an outage is only ever
+                    # reported for a confirmed DOWN.
+                    stats["unconfirmed"] += 1
+                    continue
+                if dry_run:
+                    due.append((monitor_id, bool(record.enabled and (record.target or record.address))))
+                    continue
+                if confirmed is not None and monitor_id not in confirmed:
+                    stats["unconfirmed"] += 1
+                    continue
                 outage_id = mw.make_outage_id(ci_id, down_since)
                 rule_dict = mw.rule_to_dict(rule)
                 persisted_at = naive(now_aware)
@@ -1470,6 +1844,7 @@ class MaintenanceManager:
                     ci_id=ci_id,
                     rule_dict=rule_dict,
                 ) -> int:
+                    session.info.pop("monitoring_events", None)  # a retried attempt queues again
                     n = (
                         session.query(OutageRecord)
                         .filter(
@@ -1490,13 +1865,13 @@ class MaintenanceManager:
                             synchronize_session=False,
                         )
                     )
+                    if n == 1:
+                        # Same transaction as the claim: the event exists exactly
+                        # when this instance won it (MO-09).
+                        self.queue_event(session, mw.TOPIC_OUTAGE_PERSISTED, payload)
                     session.commit()
                     return int(n or 0)
 
-                if self.svc._retrying(session, _claim) != 1:
-                    continue  # another instance reported it first
-                stats["persisted"] += 1
-                self._warned_no_ci.discard(monitor_id)
                 payload: Dict[str, Any] = {
                     "outage_id": outage_id,
                     "ci_id": ci_id,
@@ -1513,18 +1888,84 @@ class MaintenanceManager:
                         "auto_resolve": rule.auto_resolve,
                     },
                     "error": error or record.latest_error,
+                    # Additive (MO-10): services of this host that are down with it
+                    # and therefore get no outage of their own while it lasts.
+                    "affected": (
+                        open_children.get(record.host_name or "", [])
+                        if record.monitor_type == MonitorType.SERVER.value
+                        else []
+                    ),
                 }
-                self.svc._emit(mw.TOPIC_OUTAGE_PERSISTED, payload)
+                session.info.pop("monitoring_events", None)
+                if self.svc._retrying(session, _claim) != 1:
+                    session.info.pop("monitoring_events", None)
+                    continue  # another instance reported it first
+                stats["persisted"] += 1
+                self._warned_no_ci.discard(monitor_id)
+                self.flush_session_events(session, now=now_aware)
         finally:
             session.close()
-        if self.svc.housekeeping_here():
-            try:
-                self.store.purge_expired(now_aware)
-            except Exception as exc:  # housekeeping only — never fail the evaluation
-                self.log.debug(f"State Monitoring: override purge skipped: {exc}")
+        if dry_run:
+            stats["due"] = due
+            return stats
+        self.outage_housekeeping(now_aware)
         if stats["persisted"]:
             self.svc._view_cache.clear()
         return stats
+
+    def _outage_topology(
+        self, session, open_ids: Set[str]
+    ) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
+        """For parent-down suppression: ``(down_hosts, open_children)``.
+
+        ``down_hosts``: host_name → detached host (``server``) monitor that has an
+        outage row (open or reported). ``open_children``: host_name → the
+        non-host monitors on that host with an OPEN outage, as
+        ``{monitor_id, name, ci_id}`` for the host event's ``affected`` list."""
+        down_hosts: Dict[str, Any] = {}
+        open_children: Dict[str, List[Dict[str, Any]]] = {}
+        outage_states = dict(
+            session.query(OutageRecord.monitor_id, OutageRecord.state)
+            .filter(OutageRecord.state.in_([OUTAGE_OPEN, OUTAGE_PERSISTED]))
+            .all()
+        )
+        if not outage_states:
+            return down_hosts, open_children
+        ids = list(outage_states)
+        for start in range(0, len(ids), 500):
+            rows = (
+                session.query(MonitorRecord)
+                .filter(MonitorRecord.monitor_id.in_(ids[start:start + 500]), MonitorRecord.host_name.isnot(None))
+                .all()
+            )
+            for row in rows:
+                session.expunge(row)
+                if row.monitor_type == MonitorType.SERVER.value:
+                    row.outage_state = outage_states[row.monitor_id]  # plain attribute on the detached copy
+                    down_hosts[row.host_name] = row
+                elif row.monitor_id in open_ids:
+                    open_children.setdefault(row.host_name, []).append(
+                        {"monitor_id": row.monitor_id, "name": row.name, "ci_id": self.cache.resolve_ci(row)[0]}
+                    )
+        for children in open_children.values():
+            children.sort(key=lambda c: c["monitor_id"])
+        return down_hosts, open_children
+
+    def _held_by_host(self, record: MonitorRecord, down_hosts: Dict[str, Any], now_aware: datetime) -> bool:
+        """True when ``record`` is a service whose host is down and that host
+        outage is (or will be) the one reported: already reported, inside the
+        host's maintenance, or covered by an enabled host rule. With host outages
+        switched off the service keeps reporting on its own."""
+        if record.monitor_type == MonitorType.SERVER.value or not record.host_name:
+            return False
+        host = down_hosts.get(record.host_name)
+        if host is None or host.monitor_id == record.monitor_id:
+            return False
+        if getattr(host, "outage_state", None) == OUTAGE_PERSISTED:
+            return True
+        if self.cache.state_for(host, now_aware).active:
+            return True
+        return self.cache.rule_for(host) is not None and bool(self.cache.resolve_ci(host)[0])
 
     def list_outages(self) -> List[Dict[str, Any]]:
         now = mw.utcnow()

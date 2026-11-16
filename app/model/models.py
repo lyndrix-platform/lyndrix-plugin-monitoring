@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -180,6 +181,28 @@ class OutageRecord(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class OutageEventRecord(Base):
+    """Outbox of ``monitoring:outage_persisted`` / ``outage_recovered`` (MO-09).
+
+    The row is written in the SAME transaction as the outage state change and
+    deleted once the event was emitted. A process that dies between commit and
+    emit, or an emit that fails, leaves the row behind and the probing instance
+    delivers it on its next evaluator pass. Delivery is at-least-once; consumers
+    dedupe on ``outage_id`` (ITSM: ``external_id``)."""
+
+    __tablename__ = "monitoring_outage_events"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    topic = Column(String(64), nullable=False)
+    outage_id = Column(String(128), nullable=False, index=True)
+    payload_json = Column(Text, nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    # Delivery claim: another instance leaves the row alone until this passes.
+    claimed_until = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 # ---------------------------------------------------------------------------
 # Pydantic schemas
 # ---------------------------------------------------------------------------
@@ -252,6 +275,9 @@ class InventorySyncPayload(BaseModel):
     source_revision: Optional[str] = None
     hosts: List[Dict[str, Any]] = Field(default_factory=list)
     services: List[Dict[str, Any]] = Field(default_factory=list)
+    # Explicit confirmation that this import may remove more managed monitors
+    # than the plausibility guard allows (empty inventory, large shrink).
+    allow_mass_delete: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +297,137 @@ def _safe_json_load(raw: Optional[str]) -> Dict[str, Any]:
     if not raw:
         return {}
     try:
-        return json.loads(raw)
+        value = json.loads(raw)
     except Exception:
         return {}
+    return value if isinstance(value, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# Monitor metadata allowlist (MO-01)
+#
+# ``metadata_json`` is served to every ``api:read`` holder and ends up in DB
+# dumps, so it may only ever hold descriptive, non-secret values. The inventory
+# publisher used to send whole ``terraform`` / service ``config`` blocks (with
+# passwords and tokens); nothing in this plugin reads them. The allowlist is
+# what the grouping helpers (``controller/helpers.py``) and the probe logic
+# (``is_docker_host``, ``deploy_type``) actually read, plus a few plain
+# descriptive values. It is applied on EVERY write and again on every read, so
+# even a row written by an older version never leaves the API unfiltered.
+# ---------------------------------------------------------------------------
+
+#: Top-level keys kept; each value must be a scalar or a flat list of scalars.
+#: ``git_repo`` is deliberately absent — repository URLs can embed credentials.
+METADATA_ALLOWED_KEYS = (
+    "site",
+    "stage",
+    "location",
+    "groups",
+    "baseline_roles",
+    "profiles",
+    "deploy_type",
+    "desired_state",
+    "git_version",
+)
+#: Nested blocks kept only with these (scalar) sub-keys.
+METADATA_ALLOWED_NESTED = {"terraform": ("node_name", "vm_id")}
+_METADATA_MAX_TEXT = 255
+_METADATA_MAX_ITEMS = 200
+
+
+def _metadata_scalar(value: Any) -> Any:
+    """A JSON scalar that is safe to keep, else ``None`` (dicts/objects never pass)."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:_METADATA_MAX_TEXT]
+    return None
+
+
+def sanitize_metadata(raw: Any) -> Dict[str, Any]:
+    """Reduce arbitrary metadata to the allowlisted, non-secret subset.
+
+    Unknown keys, nested objects and oversized values are dropped silently —
+    never logged, the dropped part is exactly what may hold credentials."""
+    if not isinstance(raw, dict):
+        return {}
+    clean: Dict[str, Any] = {}
+    for key in METADATA_ALLOWED_KEYS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, (list, tuple)):
+            clean[key] = [
+                item for item in (_metadata_scalar(v) for v in list(value)[:_METADATA_MAX_ITEMS])
+                if item is not None
+            ]
+        elif not isinstance(value, dict):
+            clean[key] = _metadata_scalar(value)
+    for key, sub_keys in METADATA_ALLOWED_NESTED.items():
+        block = raw.get(key)
+        if not isinstance(block, dict):
+            continue
+        kept = {
+            sub: _metadata_scalar(block[sub])
+            for sub in sub_keys
+            if sub in block and not isinstance(block[sub], (dict, list, tuple))
+        }
+        kept = {k: v for k, v in kept.items() if v is not None}
+        if kept:
+            clean[key] = kept
+    return clean
+
+
+def sanitized_metadata_json(raw_json: Optional[str]) -> str:
+    """Canonical JSON of the allowlisted subset of a stored ``metadata_json``."""
+    return json.dumps(sanitize_metadata(_safe_json_load(raw_json)), sort_keys=True)
+
+
+def safe_error_text(exc: BaseException) -> str:
+    """Error text for logs that never echoes request input: a pydantic
+    ``ValidationError`` prints the offending input value, which for a monitor
+    payload may be a secret-bearing block."""
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            return "; ".join(
+                f"{'.'.join(str(p) for p in e.get('loc', ()))}: {e.get('msg', '')}"
+                for e in errors(include_input=False, include_url=False)
+            ) or type(exc).__name__
+        except Exception:
+            return type(exc).__name__
+    return str(exc)
+
+
+def strip_url_userinfo(value: Optional[str]) -> Optional[str]:
+    """``https://user:pw@host/x`` → ``https://host/x``. The plugin has no
+    credential fields, so basic-auth credentials can only sit in the URL; the
+    probe still uses the stored value, viewers never see it (MO-22)."""
+    if not value or "@" not in value or "://" not in value:
+        return value
+    scheme, rest = value.split("://", 1)
+    # The authority ends at the first "/", "?" or "#" — an "@" after that is part
+    # of the path or query, not userinfo.
+    end = next((i for i, ch in enumerate(rest) if ch in "/?#"), len(rest))
+    authority, tail = rest[:end], rest[end:]
+    if "@" not in authority:
+        return value
+    return f"{scheme}://{authority.rsplit('@', 1)[1]}{tail}"
+
+
+_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/?#]*@")
+
+
+def redact_url_userinfo(text: Optional[str]) -> Optional[str]:
+    """Drop ``user:pw@`` from every URL inside free text (error messages).
+
+    ``strip_url_userinfo`` handles a bare URL field; probe failures echo the
+    probe URL inside a sentence (httpx/OS errors, "target '…'"), and that text
+    is persisted, logged and emitted — it must never carry credentials (MO-22).
+    """
+    if not text or "@" not in text:
+        return text
+    return _URL_USERINFO_RE.sub(r"\1", str(text))
 
 
 def _serialize_monitor(record: MonitorRecord) -> Dict[str, Any]:
@@ -282,8 +436,8 @@ def _serialize_monitor(record: MonitorRecord) -> Dict[str, Any]:
         "name": record.name,
         "monitor_type": record.monitor_type,
         "owner_source": record.owner_source,
-        "target": record.target,
-        "address": record.address,
+        "target": strip_url_userinfo(record.target),
+        "address": strip_url_userinfo(record.address),
         "host_name": record.host_name,
         "service_name": record.service_name,
         "logical_group": record.logical_group,
@@ -291,12 +445,14 @@ def _serialize_monitor(record: MonitorRecord) -> Dict[str, Any]:
         "timeout_seconds": record.timeout_seconds,
         "enabled": record.enabled,
         "source_hash": record.source_hash,
-        "metadata": _safe_json_load(record.metadata_json),
+        # Filtered again at read time: defence in depth for rows written before
+        # the allowlist existed (the startup scrub may not have run yet).
+        "metadata": sanitize_metadata(_safe_json_load(record.metadata_json)),
         "ci_id": record.ci_id,
         "host_ci_id": record.host_ci_id,
         "latest_state": record.latest_state,
         "latest_latency_ms": record.latest_latency_ms,
-        "latest_error": record.latest_error,
+        "latest_error": redact_url_userinfo(record.latest_error),
         "last_checked_at": record.last_checked_at.isoformat() if record.last_checked_at else None,
         "is_admin_overridden": record.is_admin_overridden,
         "uptime_24h": round(record.uptime_24h or 0.0, 2),
@@ -358,6 +514,10 @@ def _uptime_from_aggregates(session, monitor_ids: List[str], days: int = 30) -> 
     return percentages
 
 
+# TODO(agent): MO-13 — make ix_monitoring_heartbeats_monitor_created covering
+# (monitor_id, created_at, state) and drop the redundant single-column monitor_id
+# index. Needs a guarded online migration (create_all never alters existing
+# tables), so it is not part of this change.
 def _hourly_state_counts(session, monitor_ids: List[str], hours: int = 24) -> Dict[str, List[Dict[str, int]]]:
     """Per monitor, ``hours`` buckets (oldest first) of heartbeat counts by state,
     bucketed by the database: ``{monitor_id: [{"UP": n, "DOWN": n, ...}, ...]}``.

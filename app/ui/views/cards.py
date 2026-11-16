@@ -7,7 +7,7 @@ viewport edge-to-edge so 4k monitors are no longer wasted.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from nicegui import ui
 from core.api import UIStyles
@@ -24,6 +24,7 @@ def render_cards_view(
     monitors: List[Dict[str, Any]],
     histories: Dict[str, List[Dict[str, Any]]],
     prefs: MonitoringPrefs,
+    timelines: Optional[Dict[str, List[str]]] = None,
 ) -> None:
     groups = build_grouped_overview(
         monitors,
@@ -31,6 +32,7 @@ def render_cards_view(
         group_by=prefs.group_by,
         include_paused=prefs.show_paused,
         include_unknown=prefs.show_unknown,
+        timelines=timelines,
     )
     if not groups:
         with ui.card().classes(UIStyles.CARD_BASE + " w-full p-6 sm:p-8 text-center"):

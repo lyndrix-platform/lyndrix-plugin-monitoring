@@ -239,7 +239,7 @@ def test_maintenance_window_wraps_clear_states(svc):
     asyncio.run(run2())
 
 
-def test_sweep_blocks_only_for_unknown_or_stale_monitors(svc):
+def test_sweep_blocks_only_when_nothing_has_ever_been_probed(svc):
     from app.model.models import MonitorRecord, MonitorState, _utc_now
     a = _monitor(svc, "host:a")
     b = _monitor(svc, "host:b")
@@ -253,10 +253,17 @@ def test_sweep_blocks_only_for_unknown_or_stale_monitors(svc):
     assert sorted(svc._load_probe_candidates()) == [a, b]
     assert svc._sweep_blocking is False  # re-probing known-down monitors is no warm-up
     with svc._session() as s:
-        s.get(MonitorRecord, b).latest_state = MonitorState.UNKNOWN.value
+        rb = s.get(MonitorRecord, b)
+        rb.latest_state, rb.last_checked_at = MonitorState.UNKNOWN.value, None
         s.commit()
     svc._load_probe_candidates()
-    assert svc._sweep_blocking is True   # something we know nothing about → block
+    assert svc._sweep_blocking is False  # one new monitor next to known states → banner only (MO-14)
+    with svc._session() as s:
+        ra = s.get(MonitorRecord, a)
+        ra.latest_state, ra.last_checked_at = MonitorState.UNKNOWN.value, None
+        s.commit()
+    svc._load_probe_candidates()
+    assert svc._sweep_blocking is True   # the genuine first sweep: nothing to show yet → block
 
 
 def test_view_cache_is_bounded(svc, monkeypatch):

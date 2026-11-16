@@ -159,6 +159,7 @@ def test_persists_after_offline_minutes_outside_any_window(svc, clock):
         "duration_s",
         "rule",
         "error",
+        "affected",  # additive (MO-10)
     }
     assert p["outage_id"] == f"{HOST_CI}:2026-10-20T12:00:00Z" and p["ci_id"] == HOST_CI
     assert (
@@ -430,6 +431,7 @@ def test_recovery_emits_after_commit_with_duration(svc, clock):
         "since": "2026-10-20T12:00:00Z",
         "recovered_at": "2026-10-20T12:25:00Z",
         "duration_s": 25 * 60,
+        "reason": "recovered",  # additive since the audit fixes (MO-08)
     }
     assert [c for t, _, c in svc.ctx.emits if t == "monitoring:outage_recovered"] == [
         False

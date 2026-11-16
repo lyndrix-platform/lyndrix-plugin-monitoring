@@ -15,7 +15,7 @@ from nicegui import ui
 from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.controller.api import build_plugin_router
-from .app.model.models import AdminOverride, MonitorUpsert, PassiveResult
+from .app.model.models import AdminOverride, MonitorUpsert, PassiveResult, safe_error_text
 from .app.controller.service import MonitoringService
 from .app.ui.overview import render_overview_ui as _render_overview_ui
 from .app.ui.settings import render_settings_ui as _render_settings_ui
@@ -46,7 +46,7 @@ except ImportError:
 manifest = ModuleManifest(
     id="lyndrix.plugin.state_monitoring",
     name="State Monitoring",
-    version="1.7.0",
+    version="1.8.0",
     description="Native infrastructure and service monitoring for Lyndrix.",
     author="Lyndrix",
     icon="monitor_heart",
@@ -84,6 +84,9 @@ manifest = ModuleManifest(
         {"key": "probe_nodes", "label": "Probe nodes", "kind": "int",
          "category": "Probing", "default": "1",
          "description": "Cluster only (core API >= 1.8): number of instances that share the probing (rendezvous sharding, each monitor has one owner). 1 = single prober via lease. Changing between 1 and >1 takes effect after a plugin reload; other changes apply at once."},
+        {"key": "inventory_max_stale_percent", "label": "Inventory: max. removed monitors (%)", "kind": "int",
+         "category": "Inventory", "default": "30",
+         "description": "An inventory import that would remove more than this share of the IaC-managed monitors (or that arrives empty) removes nothing; it is logged and raises a notification instead. The publisher can confirm an intended mass removal with allow_mass_delete=true. 0 = never remove without that confirmation, 100 = only an empty inventory is refused."},
         # Outage rule (1.7.0): a monitor DOWN for offline_minutes outside any
         # maintenance window/override emits monitoring:outage_persisted (→ ITSM).
         # Kinds are the Entity-Registry kinds and open — the known ones get a
@@ -143,6 +146,11 @@ manifest = ModuleManifest(
         {"key": "action_delete_all", "label": "Delete ALL monitors", "kind": "action",
          "action": "/maintenance/delete-monitors/all", "category": "Maintenance", "confirm": True, "danger": True,
          "description": "Removes every monitor including manually created ones, with all history."},
+    ],
+    notification_endpoints=[
+        {"name": "inventory_guard",
+         "description": "An inventory import was implausible (empty or shrank beyond the limit) and removed no monitors",
+         "default_active": True, "internal_toast": True, "internal_persist": True},
     ],
     permissions={
         "subscribe": [
@@ -306,7 +314,8 @@ async def health(ctx) -> PluginHealthStatus:
         )
 
     try:
-        counts = await asyncio.to_thread(svc.status_counts)
+        # Both are single narrow reads of the monitor table (never heartbeats).
+        counts, freshness = await asyncio.to_thread(lambda: (svc.status_counts(), svc.probe_freshness()))
     except Exception as exc:
         return PluginHealthStatus(
             status="error",
@@ -328,12 +337,34 @@ async def health(ctx) -> PluginHealthStatus:
         "monitors_up": counts.get("up_count", 0),
         "monitors_down": counts.get("down_count", 0),
         "monitors_maintenance": counts.get("maintenance_count", 0),
+        "last_probe_at": freshness.get("last_probe_at"),
+        "last_probe_age_s": freshness.get("last_probe_age_s"),
+        "monitors_stale": freshness.get("stale", 0),
     }
     # Loop alive + DB reachable, but nothing is being watched yet.
     if not counts.get("monitor_count"):
         return PluginHealthStatus(
             status="degraded",
             details={**details, "reason": "no_monitors_configured"},
+            latency_ms=latency,
+        )
+    if freshness.get("probes_stale"):
+        # Read from the shared DB, so a standby reports it too: nobody (or not
+        # everybody) is probing — no live prober, probe_roles matching no
+        # instance, a dead shard owner or a wedged prober. States shown are old.
+        return PluginHealthStatus(
+            status="degraded",
+            details={**details, "reason": "probes_stale",
+                     "hint": "no recent probe results — check the prober instance / probe_roles"},
+            latency_ms=latency,
+        )
+    if getattr(svc, "icmp_unavailable", False):
+        # The prober cannot ping: host monitors run on the TCP fallback, ping
+        # monitors read UNKNOWN. Working, but with reduced function.
+        return PluginHealthStatus(
+            status="degraded",
+            details={**details, "reason": "icmp_unavailable",
+                     "hint": "allow unprivileged ICMP on this instance or set probe_roles"},
             latency_ms=latency,
         )
     return PluginHealthStatus(status="ok", details=details, latency_ms=latency)
@@ -403,21 +434,21 @@ def setup(ctx):
         try:
             await asyncio.to_thread(service.upsert_monitor, MonitorUpsert(**payload))
         except Exception as exc:
-            ctx.log.error(f"State Monitoring: config upsert failed: {exc}")
+            ctx.log.error(f"State Monitoring: config upsert failed: {safe_error_text(exc)}")
 
     @ctx.subscribe("monitoring:passive_result")
     async def on_passive_result(payload):
         try:
             await asyncio.to_thread(service.ingest_passive_result, PassiveResult(**payload))
         except Exception as exc:
-            ctx.log.error(f"State Monitoring: passive result failed: {exc}")
+            ctx.log.error(f"State Monitoring: passive result failed: {safe_error_text(exc)}")
 
     @ctx.subscribe("monitoring:admin_override")
     async def on_admin_override(payload):
         try:
             await asyncio.to_thread(service.apply_admin_override, AdminOverride(**payload))
         except Exception as exc:
-            ctx.log.error(f"State Monitoring: admin override failed: {exc}")
+            ctx.log.error(f"State Monitoring: admin override failed: {safe_error_text(exc)}")
 
     # Maintenance windows (core API >= 1.13). Emitted LOCALLY by the publisher, so
     # exactly one instance stores them; our own source ("monitoring") is skipped

@@ -11,7 +11,7 @@ helper instead of dumping everything client-side.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from nicegui import ui
 from core.api import UIStyles
@@ -52,12 +52,14 @@ def render_table_view(
     monitors: List[Dict[str, Any]],
     histories: Dict[str, List[Dict[str, Any]]],
     prefs: MonitoringPrefs,
+    timelines: Optional[Dict[str, List[str]]] = None,
 ) -> None:
     rows = flatten_monitors(
         monitors,
         histories,
         include_paused=prefs.show_paused,
         include_unknown=prefs.show_unknown,
+        timelines=timelines,
     )
     if not rows:
         with ui.card().classes(UIStyles.CARD_BASE + " w-full p-6 text-center"):
