@@ -66,7 +66,7 @@ Die Wartungsaktionen unter `/maintenance/*` (Prune, Rebuild, Delete …) sind di
 GET /overview?group_by=site&hours=24&include_paused=true&include_unknown=true
 ```
 
-Liefert dieselben gruppierten und gefilterten Daten, die auch das NiceGUI-Dashboard anzeigt — die Geschäftslogik ist identisch, weil der React-Client `controller/helpers.py` über diesen Endpunkt nutzt, nicht über eigene Frontend-Logik. Die Antwort enthält `generated_at`; `hours` ist auf 1–168 begrenzt.
+Liefert dieselben gruppierten und gefilterten Daten, die auch das NiceGUI-Dashboard anzeigt — die Geschäftslogik ist identisch, weil der React-Client `controller/helpers.py` über diesen Endpunkt nutzt, nicht über eigene Frontend-Logik. Die Antwort enthält `generated_at`; `hours` wird (seit 1.8.0) auf 24, 72 oder 168 aufgerundet (Werte darüber auf 168); die tatsächlich verwendete Spanne steht in `hours` der Antwort. Das Timeline-Aggregat wird je Spanne einmal berechnet, nicht je Anfrage.
 
 Während der Startsequenz (s. u.) beantwortet der **Core** jede Route des Plugins mit `503` und
 `Retry-After` — der Client muss das nicht selbst abfangen, der React-Client zeigt den Fortschritt an
@@ -87,7 +87,7 @@ Core `health()` bei jedem Dashboard-Aufruf dieselbe Aggregation anstieß. Seit v
 | `uptime_24h` / `7d` / `30d` | stündlicher Job (`monitoring:uptime_hourly`) in einem Durchlauf für alle Monitore, nicht mehr pro Heartbeat |
 | Timeline (24 h-Balken) | von der Datenbank in Stunden-Buckets gezählt (`_hourly_state_counts`, ≤ 24 × Monitore Zeilen) statt alle Heartbeats des Tages als ORM-Objekte zu laden; Ergebnis identisch zu `timeline_from_history` |
 | `/overview`, `/dashboard` | Single-Flight-Cache: gleichzeitige Aufrufer teilen sich eine Berechnung, Ergebnis gilt `overview_cache_seconds` (Standard 10 s); ein Statuswechsel invalidiert |
-| `health()` | nur `status_counts()` (ein `GROUP BY` auf der Monitor-Tabelle) |
+| `health()` | `status_counts()` (ein `GROUP BY`) und `probe_freshness()` (eine schmale Abfrage der Monitor-Tabelle, nie der Heartbeats); meldet `degraded` mit `probes_stale`, wenn der Prober nichts mehr schreibt, und mit `icmp_unavailable`, wenn nicht gepingt werden kann (1.8.0) |
 
 Schreibpfad: pro Heartbeat wird der Tagesaggregat-Datensatz **inkrementell** fortgeschrieben
 (Zähler + laufender Latenz-Mittelwert über `latency_samples`); der tägliche Rollup-Job rechnet
@@ -209,15 +209,17 @@ lehnt nicht deklarierte Emits mit `PermissionError` ab).
 | subscribe | `monitoring:config_upsert` | `MonitorUpsert` über den Bus (wie `POST /monitors`) |
 | subscribe | `monitoring:passive_result` | `PassiveResult` über den Bus (wie `POST /passive`) |
 | subscribe | `monitoring:admin_override` | `AdminOverride` über den Bus (wie `POST /admin-override`) |
-| subscribe | `maintenance:windows_published` | Core-API ≥ 1.13: Fenster eines Publishers (Orchestrator, künftig weitere). `replaces: true` ersetzt alle Zeilen dieser `source` in einer Transaktion; Items ohne `ci_id`, mit ungültigem Kind oder ungültigem Fenster werden einzeln übersprungen. `source: "monitoring"` (eigene Fenster) wird ignoriert |
-| subscribe | `maintenance:override_started` / `override_ended` | Override eines Publishers (laufender Deploy); Upsert je `override_id`, Ende mit `ended_at` + `linger_minutes`. Eigene (`source: "monitoring"`) werden ignoriert |
+| subscribe | `maintenance:windows_published` | Core-API ≥ 1.13: Fenster eines Publishers (Orchestrator, künftig weitere). `replaces: true` ersetzt alle Zeilen dieser `source` in einer Transaktion — ohne ausdrückliches `"replaces": true` (seit 1.8.0, vorher Standard) bleiben frühere Fenster der Quelle bestehen; Items ohne `ci_id`, mit ungültigem Kind oder ungültigem Fenster werden einzeln übersprungen. `source: "monitoring"` (eigene Fenster) wird ignoriert |
+| subscribe | `maintenance:override_started` / `override_ended` | Override eines Publishers (laufender Deploy); Upsert je `override_id`, Ende mit `ended_at` + `linger_minutes`. Eigene (`source: "monitoring"`) werden ignoriert. Seit 1.8.0 wird das Ende auf Start + max(`override_max_minutes`, 24 h) gekappt |
 | subscribe / emit | `monitoring:monitors_changed` | Monitor-Satz geändert (Inventar, Upsert, Admin-Override, Wartung) — mit `cluster=True` an alle Instanzen; der Prober lädt seine Jobs neu, bei `reason: probe_all` startet er einen vollständigen Sweep; **`reason: maintenance_windows`** lädt nur den Wartungs-Cache neu (jede Instanz, kein Job-Resync) |
-| subscribe / emit | `monitoring:quiesce` | `{"on": bool, "ttl"}` mit `cluster=True` — destruktive Wartung auf einer anderen Instanz, der Prober pausiert alle Probes |
+| subscribe / emit | `monitoring:quiesce` | `{"on": bool, "ttl"}` mit `cluster=True` — destruktive Wartung auf einer anderen Instanz, der Prober pausiert alle Probes; der Marker wird alle TTL/2 erneuert, die Herkunft der Anfrage wird geloggt (1.8.0) |
 | emit | `monitoring:state_changed` | Zustandswechsel eines Monitors `{monitor_id, previous_state, new_state, timestamp, error_message, ci_id, maintenance}` — lokal, vor dem Commit (nur Cache-/UI-Signal) |
 | emit | `maintenance:windows_published` | Manuelle Fenster dieses Plugins `{source: "monitoring", published_at, replaces: true, items}` — **lokal**, nach jedem Anlegen/Löschen; nur Zeilen mit `ci_id` |
 | emit | `maintenance:override_started` / `override_ended` | Manuelle Overrides aus der UI/API, `source: "monitoring"` — **lokal** |
 | emit | `monitoring:outage_persisted` | Einmal je Ausfall, nach `offline_minutes` außerhalb jeder Wartung — **lokal**, nur von der probenden Instanz (Payload siehe unten) |
-| emit | `monitoring:outage_recovered` | `{outage_id, ci_id, since, recovered_at, duration_s}` — **lokal**, nach dem Commit des Heartbeats, der den Monitor wieder `UP` setzt |
+| emit | `monitoring:outage_recovered` | `{outage_id, ci_id, since, recovered_at, duration_s}` — **lokal**, nach dem Commit des Heartbeats, der den Monitor wieder `UP` setzt; seit 1.8.0 auch auf jedem anderen Weg, der einen Ausfall verwirft |
+
+Seit 1.8.0 laufen die Outage-Events über eine Outbox (`monitoring_outage_events`): ein Neustart zwischen Zustandswechsel und Emit verliert sie nicht. Ein DOWN wird vor dem Persistieren durch eine frische Probe bestätigt; ein Monitor, dessen Parent DOWN ist, wird unterdrückt statt einen eigenen Ausfall zu öffnen.
 
 Transportregel (Vertrag `00-ergebnis-p0.md` §3): `maintenance:*` und `monitoring:outage_*` werden
 **ohne** `cluster=True` emittiert — Plugins mit `placement: any` laufen auf jeder Instanz, der
@@ -237,6 +239,27 @@ Der IaC Orchestrator **postet** sein Inventar mit dem System-API-Key an `POST /i
 Quelle, die im Payload fehlen, werden samt Historie, Outage-Uhr und daran gepinnten manuellen
 Fenstern gelöscht. Ein Service-Monitor ohne eigene `ci_id` übernimmt für Fenster, Overrides und
 Outage-Meldungen die `ci_id` seines Host-Monitors.
+
+Seit 1.8.0 (Audit MO-01) wird nur eine Allowlist von Platzierungsfakten in `metadata_json` übernommen
+(u. a. `site`, `stage`, `location`, `groups`, `baseline_roles`, `profiles`, `deploy_type`, `desired_state`,
+`terraform.node_name`, `terraform.vm_id`); die rohen `terraform`-/`config`-Blöcke werden nicht mehr
+gespeichert, vorhandene Zeilen beim Start bereinigt. Der Stale-Delete hat eine Plausibilitätsprüfung: Ein
+Import, der mehr als `inventory_max_stale_percent` der IaC-Monitore entfernen würde (oder leer ankommt),
+löscht nichts, wird geloggt und löst die Benachrichtigung `inventory_guard` aus. Der Publisher kann eine
+gewollte Massenlöschung mit `allow_mass_delete=true` bestätigen. Gelöscht wird in Batches, der Prober wird
+vorher pausiert. Orchestrator-Releases, die keine rohen `terraform`/`config`-Blöcke mehr senden, sollten
+zusammen mit 1.8.0 ausgerollt werden.
+
+### Sicherheit der Probes (1.8.0)
+
+- Der SSRF-Schutz gilt auch für ICMP- und TCP-Monitore; ICMP pingt die validierte Adresse. Ziele auf
+  Loopback, Link-Local oder Metadaten-Adressen sind `DOWN` („blocked address“).
+- API-Antworten zeigen `target`/`address` ohne `user:pw@`; Fehlertexte (`latest_error`, Heartbeats, Outages,
+  Logs, Bus-Events) ebenfalls.
+- `POST /admin-override` (`update`) validiert wie ein Upsert: Intervall < 10 s, Timeout 0 oder falscher Typ
+  ergibt HTTP 400.
+- Probes haben ein hartes Zeitlimit, die DNS-Auflösung läuft außerhalb des Event-Loops, die Probe-Arten
+  nutzen eigene Pools. Ein nicht verfügbarer ICMP-Socket ergibt `UNKNOWN` statt `DOWN`.
 
 ---
 
@@ -351,6 +374,7 @@ Alle Modelle verwenden `extend_existing=True`, um `InvalidRequestError` beim Plu
 | `monitoring_maintenance_windows` | Wartungsfenster je `(source, ci_id, monitor_id)` (eindeutig), publiziert oder manuell — siehe *Wartungsfenster* |
 | `monitoring_overrides` | Overrides je `override_id` |
 | `monitoring_outages` | Outage-Uhr je Monitor (`open` → `persisted`, bei Recovery gelöscht) |
+| `monitoring_outage_events` | Outbox für `outage_persisted`/`outage_recovered` (1.8.0), übersteht Neustarts |
 
 Schemaänderungen (Index, neue Spalte) werden in `MonitoringService._ensure_schema` idempotent
 nachgezogen (`CREATE INDEX IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS`; 1.7.0:
@@ -385,6 +409,7 @@ Plugin-Einstellungen (Settings-Dialog des Cores, in Vault gespeichert, angewende
 | `outage_default_auto_resolve` | `true` | darf der Konsument (ITSM) bei `outage_recovered` automatisch lösen (Default-Regel) |
 | `override_default_minutes` | `60` | Kategorie *Maintenance windows*: Vorauswahl der Dauer eines manuellen Overrides |
 | `override_max_minutes` | `240` | Obergrenze eines manuellen Overrides (längere Anfragen werden gekappt) |
+| `inventory_max_stale_percent` | `30` | Kategorie *Inventory* (1.8.0): max. Anteil IaC-verwalteter Monitore, den ein Import entfernen darf; `0` = nie ohne `allow_mass_delete=true`, `100` = nur ein leeres Inventar wird abgelehnt |
 | `override_linger_minutes` | `15` | Nachlauf nach dem Ende eines eigenen Overrides, bevor `DOWN` wieder zählt |
 
 Die Einstellungen werden beim Laden des Plugins, nach `vault:ready_for_data` und bei
